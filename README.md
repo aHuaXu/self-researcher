@@ -18,6 +18,8 @@ DeepResearcher is the first comprehensive framework for end-to-end training of L
 - [Model](#-Model)
 - [Performance](#-performance)
 - [Get started](#-get-started)
+- [Acknowledgement](#-Acknowledgement)
+- [Citation](#✍️-citation)
 
 
 
@@ -98,3 +100,27 @@ Using the following command to generate rollout:
 ```
 You can find the rollout file in: ```./outputs/{project_name}/{experiment_name}/rollout/rollout_step_0.json```
 You can rename and copy it into ```./evaluate/{experiment_name}_result.json```
+
+Then, run the following command:
+```bash
+    python ./evaluate/cacluate_metrics.py {experiment_name}
+```
+You can check the score in ```./evaluate/{experiment_name}_score.json```
+
+## 🙏 Acknowledgement
+
+DeepResearcher is inspired by [Deepseek-R1](https://github.com/deepseek-ai/DeepSeek-R1) with its implementation based on [veRL](https://github.com/volcengine/verl) and [Search-r1](https://github.com/PeterGriffinJin/Search-R1). We deeply appreciate the contributions of these teams to open-source research and development. 
+
+## ✍️ Citation
+
+Please cite the repo if the model/code/conclusion in this repo are helpful to you.
+```
+@misc{deepresearch,
+  author = {Zheng, Yuxiang and Fu, Dayuan and Hu, Xiangkun and Cai, Xiaojie and Ye, Lyumanshan and Lu, Pengrui and Liu, Pengfei},
+  title = {DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments},
+  year = {2025},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/GAIR-NLP/DeepResearcher}},
+}
+```
