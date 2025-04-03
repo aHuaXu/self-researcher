@@ -37,6 +37,7 @@ Extensive experiments on open-domain research tasks demonstrate that DeepResearc
 
 <p align="center"> <img src="images/performance.png" id="performance-icon">       </p>
 
+<p align="center"> <img src="images/scaling.png" id="performance-icon">       </p>
 
 
 ## 🚀 Get Started
@@ -69,7 +70,7 @@ ray start --head
 ### Run backend handler
 
 Running the following command to launch the server handler:
-1. Modify ```serper_api_key``` or ```azure_bing_search_subscription_key``` in ```./scrl/handler/config.yaml```
+1. Modify ```serper_api_key``` or ```azure_bing_search_subscription_key``` & ```search_engine``` in ```./scrl/handler/config.yaml```
 2. Add  ```qwen-plus``` api key in ```./scrl/handler/server_handler.py```
 ```python
 client = OpenAI(
@@ -96,14 +97,14 @@ Using the following command to train the model:
 ### Evaluate
 Using the following command to generate rollout:
 ```bash
- bash evaluate.sh
+    bash evaluate.sh
 ```
 You can find the rollout file in: ```./outputs/{project_name}/{experiment_name}/rollout/rollout_step_0.json```
 You can rename and copy it into ```./evaluate/{experiment_name}_result.json```
 
 Then, run the following command:
 ```bash
-    python ./evaluate/cacluate_metrics.py {experiment_name}
+ python ./evaluate/cacluate_metrics.py {experiment_name}
 ```
 You can check the score in ```./evaluate/{experiment_name}_score.json```
 
