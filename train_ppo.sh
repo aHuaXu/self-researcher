@@ -47,8 +47,5 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     agent_grpo.n=16 \
     max_turns=10 \
     search_engine=online_search \
-<<<<<<< Updated upstream
     trainer.total_epochs=1 2>&1 | tee ./${project_name}_${experiment_name}.log
-=======
-    trainer.total_epochs=1 2>&1 | tee ./${project_name}_${experiment_name}_${i}.log
->>>>>>> Stashed changes
+
