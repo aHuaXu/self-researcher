@@ -116,12 +116,13 @@ DeepResearcher is inspired by [Deepseek-R1](https://github.com/deepseek-ai/DeepS
 
 Please cite the repo if the model/code/conclusion in this repo are helpful to you.
 ```
-@misc{deepresearch,
-  author = {Zheng, Yuxiang and Fu, Dayuan and Hu, Xiangkun and Cai, Xiaojie and Ye, Lyumanshan and Lu, Pengrui and Liu, Pengfei},
-  title = {DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments},
-  year = {2025},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/GAIR-NLP/DeepResearcher}},
+@misc{zheng2025deepresearcherscalingdeepresearch,
+      title={DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments}, 
+      author={Yuxiang Zheng and Dayuan Fu and Xiangkun Hu and Xiaojie Cai and Lyumanshan Ye and Pengrui Lu and Pengfei Liu},
+      year={2025},
+      eprint={2504.03160},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2504.03160}, 
 }
 ```
