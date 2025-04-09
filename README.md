@@ -54,9 +54,7 @@ conda activate deepresearcher
 cd DeepResearcher
 pip3 install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
 pip3 install flash-attn --no-build-isolation
-cd verl
 pip3 install -e .
-cd ../
 pip3 install -r requirements.txt
 ```
 
