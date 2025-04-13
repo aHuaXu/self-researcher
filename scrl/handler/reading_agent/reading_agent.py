@@ -92,7 +92,7 @@ class ReadingAgent:
                         used=False,
                     )
                 )
-                useful_info += extracted_info + "\n\n"
+                cur_useful_info += extracted_info + "\n\n"
 
             if page_down:
                 cur_webpage.browser.page_down()
