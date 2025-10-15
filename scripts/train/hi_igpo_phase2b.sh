@@ -1,14 +1,15 @@
 #!/bin/bash
-# Hi-IGPO Phase 2b on DR-Venus: interleaved Planner(LoRA, trained) <-> frozen Executor.
-# base = DR-Venus-4B-RL (Qwen3-4B-Thinking-2507) for BOTH planner & executor LoRA (single base +
-# dual LoRA); search_engine=drvenus + enable_think=true => DR-Venus native format end to end:
-#   - Planner: thinking + <subtask>/<answer>; belief GT wrapper closes </think>.
-#   - Executor (FROZEN): DR-Venus deep-research prompt + search/visit (mapped to web_search/browse).
+# Hi-IGPO Phase 2b: interleaved Planner(LoRA, trained) <-> frozen Executor.
+# base = SFT'd Qwen3-4B-Thinking-2507 for BOTH planner & executor LoRA (single base +
+# dual LoRA); search_engine=drvenus + enable_think=true => search/visit native format end to end.
+#   - Planner: thinking + <subtask>/<answer>; belief GT wrapper closes think.
+#   - Executor (FROZEN): the single-agent trained model (Phase 0 IGPO output), search/visit
+#     (mapped to web_search/browse).
 # See docs/design/hi_igpo_design.md §13.6.
 #
 # STAGE 1: VAL_BEFORE_TRAIN=false + test_freq=-1; observe training rollout dumps
 #   (planner_rollout_step_N.json: planner single <subtask>/think ok, executor multi-turn, belief IG).
-# Prereqs: models/DR-Venus-4B-RL, SearXNG up, 4 idle GPUs.
+# Prereqs: models/Qwen3-4B-Thinking-2507-SFT (single-agent trained ckpt), SearXNG up, 4 idle GPUs.
 set -euo pipefail
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -20,7 +21,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export project_name="deepresearcher"
-export experiment_name="qwen3_4b_drvenus_phase2b_browsefix_full"
+export experiment_name="qwen3_4b_hi_igpo_phase2b"
 IFS=',' read -ra _D <<< "${CUDA_VISIBLE_DEVICES}"; NGPU=${#_D[@]}
 
 BASE=/home/zjx/self_llm/self-researcher
@@ -50,12 +51,12 @@ export RAY_memory_monitor_refresh_ms=0
 ray start --head
 sleep 2
 
-DRV=${BASE}/models/DR-Venus-4B-RL
+BASE_MODEL=${BASE_MODEL:-${BASE}/models/Qwen3-4B-Thinking-2507-SFT}
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=${BASE}/data/deepresearch_phase1.parquet \
     data.val_files=${BASE}/data/deepresearch_phase1_val.parquet \
-    data.train_batch_size=4 \
+    data.train_batch_size=16 \
     data.max_prompt_length=3096 \
     data.max_response_length=1536 \
     max_seq_len_for_training=7168 \
@@ -67,11 +68,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +algorithm.format_penalty=1.0 \
     +algorithm.enable_think=true \
     algorithm.gamma=1.0 \
-    actor_rollout_ref.model.path=${DRV} \
+    actor_rollout_ref.model.path=${BASE_MODEL} \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.optim.lr=5e-7 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=7168 \
@@ -107,8 +108,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     multi_agent.max_planner_turns=4 \
     multi_agent.freeze_executor=true \
     multi_agent.planner_findings_max_chars=1000 \
-    multi_agent.base_model=${DRV} \
-    multi_agent.lora_save_dir=${BASE}/tmp_lora_adapters_drvenus_browsefix_full \
+    multi_agent.base_model=${BASE_MODEL} \
+    multi_agent.lora_save_dir=${BASE}/tmp_lora_adapters_hi_igpo_phase2b \
     multi_agent.lora.rank=64 \
     multi_agent.lora.alpha=128 \
     multi_agent.lora.dropout=0.05 \

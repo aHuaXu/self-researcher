@@ -52,7 +52,7 @@ sleep 2
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=${BASE}/data/deepresearch_phase1.parquet \
     data.val_files=${BASE}/data/deepresearch_phase1_val.parquet \
-    data.train_batch_size=4 \
+    data.train_batch_size=16 \
     data.max_prompt_length=3096 \
     data.max_response_length=1000 \
     max_seq_len_for_training=5000 \
@@ -66,7 +66,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=5120 \

@@ -218,11 +218,14 @@ SEARXNG_ENGINE_PRIORITY = google,bing,duckduckgo,brave
 
 ### 7.1 Executor Cold-Start
 
-Executor 需要先具备基本 search/visit/finding 能力。可选来源:
+Executor 需要先具备基本 search/visit/finding 能力。本项目主线采用:
 
-- 单 Agent SFT/RL checkpoint。
+- **单 agent IGPO 训练后的模型** (Phase 0 输出): 从 SFT 后的 `Qwen3-4B-Thinking-2507` 出发, 经单 agent IGPO RL (L1+L2) 训练得到, 冻结后作为 Executor。
+
+备选来源 (非主线):
+
 - Teacher rollout 生成的 multi-turn SFT。
-- DR-Venus 风格 agentic SFT warm-start。
+- 其他 agentic SFT warm-start checkpoint。
 
 目标不是最优, 而是稳定执行子任务并返回可用 finding。
 
@@ -237,14 +240,14 @@ question + previous executor findings
    <answer>short final answer</answer>
 ```
 
-Planner 不调用 search/visit, 不输出 `<tool_call>`, 不把自己的搜索过程写进 `<subtask>` 或 `<answer>`。当前 DR-Venus-RL 基座已经强化出单 Agent 自主检索行为, 直接拿它当 Planner 容易复发 `Search for ...`、`Open result`、`</think>` 等单 Agent 轨迹残留。因此 Planner SFT **不能**用 `Qwen3-4B-Instruct` (非 thinking) 做 base, 必须用与 RL 一致的 thinking base (`DR-Venus-4B-RL` / `Qwen3-4B-Thinking-2507`), 再训练 Planner LoRA; Executor 仍使用冻结的 `DR-Venus-4B-RL`。原因见下 §7.1.1.1。
+Planner 不调用 search/visit, 不输出 `<tool_call>`, 不把自己的搜索过程写进 `<subtask>` 或 `<answer>`。当前单 agent 训练后的模型已经强化出自主检索行为, 直接拿它当 Planner 容易复发 `Search for ...`、`Open result`、`</think>` 等单 Agent 轨迹残留。因此 Planner SFT **不能**用 `Qwen3-4B-Instruct` (非 thinking) 做 base, 必须用与 RL 一致的 thinking base (SFT 后的 `Qwen3-4B-Thinking-2507`), 再训练 Planner LoRA; Executor 仍使用冻结的单 agent 训练后模型。原因见下 §7.1.1.1。
 
 #### 7.1.1.1 Base 一致性与空 think 蒸馏 (路径 2)
 
-Planner SFT 的 base 必须与 RL rollout 时的 Planner base **完全一致**。当前 Phase 2b RL 配置 (`scripts/train/hi_igpo_phase2b_drvenus.sh`) 是 single thinking base + dual LoRA:
+Planner SFT 的 base 必须与 RL rollout 时的 Planner base **完全一致**。当前 Phase 2b RL 配置 (`scripts/train/hi_igpo_phase2b.sh`) 是 single thinking base + dual LoRA:
 
 ```text
-multi_agent.base_model = models/DR-Venus-4B-RL   # Qwen3-4B-Thinking-2507, thinking-only
+multi_agent.base_model = models/Qwen3-4B-Thinking-2507-SFT   # SFT 后的 Qwen3-4B-Thinking-2507, thinking-only
 +algorithm.enable_think = true
 ```
 
@@ -284,7 +287,7 @@ SFT target 的精确格式 (空 think 前缀 + tag) 必须用项目实际 tokeni
 4. 空 think 每 turn ~13-29 loss token, 2-subtask 样本总 153 token / 42 loss token, 远低于 `max_response_length=1536`。
 5. 良性副作用: `_build_sequence` 的 per-turn concat tokens 与 full-render tokens 在 think 包裹上不一致 (per-turn 每 turn 包, full-render 只最后 turn 包), 会触发 `Token mismatch in MultiTurnSFTDataset` warning。训练使用 per-turn tokens (与 RL `assemble_planner_sequence` 一致), warning 为 false alarm, 暂不处理。
 
-基于此, `build_planner_sft_from_rollouts.py` 现有 message 构造无需修改; `planner_sft_deepresearch.sh` 的 `MODEL_PATH` 已从 `Qwen3-4B-Instruct` 改回 `models/DR-Venus-4B-RL`。
+基于此, `build_planner_sft_from_rollouts.py` 现有 message 构造无需修改; `planner_sft_deepresearch.sh` 的 `MODEL_PATH` 已从 `Qwen3-4B-Instruct` 改回 SFT 后的 `Qwen3-4B-Thinking-2507`。
 
 第一版先只做 L3 500 条:
 
@@ -313,12 +316,12 @@ scripts/generate_planner_sft_rollouts.py
     本项目 web_search + browse_webpage, 输出 raw rollout JSON 供人工审计和清洗。
 
 scripts/train/planner_sft_deepresearch.sh
-    从 thinking base (DR-Venus-4B-RL) 训练 Planner LoRA, 使用 data.multiturn.enable=true。
+    从 SFT 后的 Qwen3-4B-Thinking-2507 训练 Planner LoRA, 使用 data.multiturn.enable=true。
     空 think 蒸馏: SFT target 教 Planner 立刻闭 think 并输出 tag (路径 2)。
 ```
 
-注意不要复用 `scripts/train/igpo_drvenus_sft.sh` 做 Planner SFT。该脚本的语义是
-`DR-Venus-4B-SFT -> single-agent IGPO/RL`, 不是监督微调入口。
+注意不要复用 `scripts/train/igpo_single_sft.sh` 做 Planner SFT。该脚本的语义是
+`SFT base -> single-agent IGPO/RL` (单 agent 训练入口), 不是监督微调入口。
 
 数据生成流程:
 
@@ -386,7 +389,7 @@ final_answer_f1         明显高于未 SFT Planner rollout
 
 冻结 Executor, 只训练 Planner。
 
-Planner 初始化应优先使用 7.1.1 的 Planner SFT LoRA。若直接使用 `DR-Venus-4B-RL` 作为 Planner, 必须先通过 rollout 健康检查; 一旦出现大量 malformed subtask / malformed answer, 应停止 RL, 回到 Planner SFT 或 parser/finding 清洗。
+Planner 初始化应优先使用 7.1.1 的 Planner SFT LoRA。若直接使用单 agent 训练后模型作为 Planner, 必须先通过 rollout 健康检查; 一旦出现大量 malformed subtask / malformed answer, 应停止 RL, 回到 Planner SFT 或 parser/finding 清洗。
 
 奖励:
 
@@ -410,20 +413,20 @@ final answer tokens -> G_final
 - 何时停止。
 - 如何利用已有 findings 改写下一步目标。
 
-### 7.2.1 DR-Venus Phase 2b 正式小跑
+### 7.2.1 Phase 2b 正式小跑
 
-当前正式小跑以 `scripts/train/hi_igpo_phase2b_drvenus.sh` 为入口, 目标是验证 DR-Venus-RL 基座上的 Planner-first 训练能稳定产生:
+当前正式小跑以 `scripts/train/hi_igpo_phase2b.sh` 为入口, 目标是验证 Planner-first 训练 (冻结的单 agent 训练后模型作 Executor) 能稳定产生:
 
 - 正常的交替式 Planner/Executor rollout。
 - 非空且可解释的 belief / IG。
 - 合理的 turn-level advantage。
 - 可恢复的中间 checkpoint。
 
-当前 browsefix full run 配置:
+当前 full run 配置:
 
 ```text
-data.train_batch_size = 4
-actor_rollout_ref.actor.ppo_mini_batch_size = 4
+data.train_batch_size = 16
+actor_rollout_ref.actor.ppo_mini_batch_size = 16
 agent_grpo.n = 8
 multi_agent.max_planner_turns = 4
 multi_agent.agents.executor.max_turns = 6
@@ -460,10 +463,10 @@ Planner 训练序列当前拼接方式:
 有效 rollout 数约为:
 
 ```text
-effective_rollouts_per_step = train_batch_size * agent_grpo.n = 32
+effective_rollouts_per_step = train_batch_size * agent_grpo.n = 128
 ```
 
-本轮保持 `train_batch_size=4` 和 `agent_grpo.n=8`, 暂不继续放大有效 batch。原因是当前瓶颈主要在 search/browse/summary LLM 工具调用, 不是 GPU 显存。`max_planner_turns=4` 用于允许更像正式任务的多轮规划; 最后一轮会 force answer, 因此实际通常是 2 到 3 个子任务机会加最终回答。`executor.max_turns=6` 用于给冻结 Executor 多一轮检索/访问空间。
+本轮 `train_batch_size=16` 和 `agent_grpo.n=8`, effective batch 128。之前曾用 `train_batch_size=4` (effective 32), 已上调到 16 以提升梯度估计质量; 显存上因 `use_dynamic_bsz=true` + `ppo_max_token_len_per_gpu=7168` token 预算封顶, 不会 OOM (设计文档此前判断瓶颈在 search/browse/summary LLM 工具调用, 不是 GPU 显存), 主要代价是每步 tool 调用变多、step 时间变长。`max_planner_turns=4` 用于允许更像正式任务的多轮规划; 最后一轮会 force answer, 因此实际通常是 2 到 3 个子任务机会加最终回答。`executor.max_turns=6` 用于给冻结 Executor 多一轮检索/访问空间。
 
 checkpoint 策略:
 
@@ -476,24 +479,27 @@ checkpoint 策略:
 若出现 OOM、搜索服务压力过大或 step time 明显不可接受, 首先回退到:
 
 ```text
+data.train_batch_size = 8        # 从 16 降回 8 (effective 64), 仍大于原 4
 multi_agent.max_planner_turns = 3
 multi_agent.agents.executor.max_turns = 5
 agent_grpo.n = 4
 ```
 
+若仍 OOM, 再降 `train_batch_size = 4` (effective 32)。
+
 运行前必须检查:
 
-- 远程 `models/DR-Venus-4B-RL` 存在。
+- 远程 `models/Qwen3-4B-Thinking-2507-SFT` (单 agent 训练后 ckpt) 存在。
 - SearXNG / search 服务可用。
 - `CUDA_VISIBLE_DEVICES` 对应 GPU 空闲。
 - `.env` 中 judge / search 相关配置有效。
 
 训练中每 30s 监控:
 
-- 主日志: `deepresearcher_qwen3_4b_drvenus_phase2b.log`。
-- Rollout dump: `outputs/deepresearcher/qwen3_4b_drvenus_phase2b/rollout/planner_rollout_step_*.json`。
-- Advantage audit: `outputs/deepresearcher/qwen3_4b_drvenus_phase2b/advantage_audit_step_*.json`。
-- Checkpoint: `ckpts/deepresearcher/qwen3_4b_drvenus_phase2b_browsefix_full/global_step_*/actor`, 预期只保留一个最新 `global_step_*`。
+- 主日志: `deepresearcher_qwen3_4b_hi_igpo_phase2b.log`。
+- Rollout dump: `outputs/deepresearcher/qwen3_4b_hi_igpo_phase2b/rollout/planner_rollout_step_*.json`。
+- Advantage audit: `outputs/deepresearcher/qwen3_4b_hi_igpo_phase2b/advantage_audit_step_*.json`。
+- Checkpoint: `ckpts/deepresearcher/qwen3_4b_hi_igpo_phase2b/global_step_*/actor`, 预期只保留一个最新 `global_step_*`。
 
 F1 日志拆分:
 
@@ -506,16 +512,16 @@ planner/format_error_rate      = format-penalized F1 < 0 的样本比例
 
 训练 reward 仍使用 `planner/f1_format`。`planner/f1_semantic` 只用于诊断, 用来区分“答案内容错”和“答案内容可能相关但标签格式坏”。
 
-### 7.2.2 DR-Venus Visit/Browse 兼容策略
+### 7.2.2 Visit/Browse 兼容策略
 
-DR-Venus 原生工具语义:
+search/visit 工具语义:
 
 ```text
 search(query) -> 返回 URL 文本
 visit(url, goal) -> 直接访问给定 URL, 使用 Jina Reader 抓取正文, 再按 goal 摘要
 ```
 
-模型策略上应主要从上一轮 `search` 的结果里选择 URL 调用 `visit`; 但 DR-Venus 的 `visit` 工具本身不校验 URL 是否来自上一轮 `search`, 也不依赖 search cache。当前项目的 `browse_webpage` 复用 `web_search` 产生的 `WebPageInfo`/browser 对象, 因此历史实现会在 URL 未精确命中最近 search 结果时直接返回 `[]`, 与 DR-Venus 原生语义不完全一致。
+模型策略上应主要从上一轮 `search` 的结果里选择 URL 调用 `visit`; 但 `visit` 工具本身不校验 URL 是否来自上一轮 `search`, 也不依赖 search cache。当前项目的 `browse_webpage` 复用 `web_search` 产生的 `WebPageInfo`/browser 对象, 因此历史实现会在 URL 未精确命中最近 search 结果时直接返回 `[]`, 与 search/visit 原生语义不完全一致。
 
 Phase 2b 采用兼容实现:
 
@@ -537,14 +543,14 @@ for url in url_list:
 
 抓取失败判断不能只看 browser 对象是否存在。若页面正文实际是 `## Error`、`HTTPSConnectionPool`、`ConnectTimeoutError`、`Max retries exceeded` 等网络错误文本, 应直接标记为 `browser="error"` 并计入 `fetch_fail`, 不再送入 visit extractor。
 
-`visit(url, goal)` 的 goal-directed extraction 必须与普通 `browse_webpage(url_list)` 区分处理。普通 browse 可继续使用本项目分页式 `EXTRACT_NEW_INFO_PROMPT` 和 `<extracted_info>` 解析; 但 DR-Venus 原生 visit 是“整页内容 + 用户 goal -> JSON evidence/summary”, 不应复用分页 prompt 直接把 `goal` 塞成 `sub_question`。否则 thinking 模型容易格式漂移, 产生空 `extracted_info` 或无效片段, 污染 finding 与后续 IG/advantage。
+`visit(url, goal)` 的 goal-directed extraction 必须与普通 `browse_webpage(url_list)` 区分处理。普通 browse 可继续使用本项目分页式 `EXTRACT_NEW_INFO_PROMPT` 和 `<extracted_info>` 解析; 但原生 visit 是“整页内容 + 用户 goal -> JSON evidence/summary”, 不应复用分页 prompt 直接把 `goal` 塞成 `sub_question`。否则 thinking 模型容易格式漂移, 产生空 `extracted_info` 或无效片段, 污染 finding 与后续 IG/advantage。
 
 Phase 2b 的 `goal` 路径修复为:
 
 ```text
 if goal:
     1. 抓取 URL 正文, 转 markdown, 截断到 WEBCONTENT_MAXLENGTH;
-    2. 使用 DR-Venus 风格 EXTRACTOR_PROMPT(webpage_content, goal);
+    2. 使用 goal-directed EXTRACTOR_PROMPT(webpage_content, goal);
     3. 要求 LLM 输出 JSON: {"rational": ..., "evidence": ..., "summary": ...};
     4. 从 raw response 中抽取 JSON 对象, 支持 ```json fence 和 thinking 前后缀;
     5. JSON 解析失败或 evidence/summary 过短时, 缩短正文后重试;

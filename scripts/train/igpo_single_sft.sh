@@ -1,15 +1,15 @@
 #!/bin/bash
-# Hi-IGPO warm-start: single-agent IGPO on DR-Venus-4B-SFT (inclusionAI), V100 32GB.
-# DR-Venus backbone = Qwen3-4B-Thinking-2507 (thinking-only). Uses search_engine=drvenus:
-#   - DR-Venus native system prompt + tools (search/visit, mapped to web_search/browse_webpage)
+# Hi-IGPO warm-start: single-agent IGPO on SFT like Qwen3-4B-Thinking-2507, V100 32GB.
+# Backbone = Qwen3-4B-Thinking-2507 (thinking-only, SFT). Uses search_engine=drvenus (search/visit protocol):
+#   - search/visit native system prompt + tools (mapped to web_search/browse_webpage)
 #   - <think> kept in rollout; tool results injected as USER-role <tool_response>
 #   - belief GT wrapper closes </think> before <answer>
 # See docs/design/hi_igpo_design.md §13.
 #
 # STAGE 1 (this script): training-path probe. val path (generation.py) is NOT yet wired to
-# DR-Venus format, so run with VAL_BEFORE_TRAIN=false and observe training rollout dumps.
+# search/visit format, so run with VAL_BEFORE_TRAIN=false and observe training rollout dumps.
 #
-# Prereqs: models/DR-Venus-4B-SFT, .env (SEARXNG running; browse fix before relying on visit).
+# Prereqs: models/Qwen3-4B-Thinking-2507-SFT, .env (SEARXNG running; browse fix before relying on visit).
 # Pick idle GPUs (check nvidia-smi first!).
 set -euo pipefail
 
@@ -24,7 +24,7 @@ export NCCL_P2P_DISABLE=1
 export project_name="deepresearcher"
 IFS=',' read -ra _CUDA_DEVICES_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 NGPU=${#_CUDA_DEVICES_ARR[@]}
-export experiment_name="qwen3_4b_drvenus_sft"
+export experiment_name="qwen3_4b_single_sft"
 
 BASE=/home/zjx/self_llm/self-researcher
 cd ${BASE}
@@ -47,13 +47,13 @@ export RAY_memory_monitor_refresh_ms=0
 ray start --head
 sleep 2
 
-# DR-Venus knobs: search_engine=drvenus (native prompt/tools/user-role tool_response),
+# search/visit knobs: search_engine=drvenus (native prompt/tools/user-role tool_response),
 #   +algorithm.enable_think=true (thinking backbone; <think> in rollout, belief closes </think>).
 # Longer length budget than the Instruct config: thinking responses are longer.
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=${BASE}/data/deepresearch_phase1.parquet \
     data.val_files=${BASE}/data/deepresearch_phase1_val.parquet \
-    data.train_batch_size=4 \
+    data.train_batch_size=16 \
     data.max_prompt_length=3096 \
     data.max_response_length=2048 \
     max_seq_len_for_training=7168 \
@@ -64,11 +64,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +algorithm.format_penalty=1.0 \
     +algorithm.enable_think=true \
     algorithm.gamma=1.0 \
-    actor_rollout_ref.model.path=${BASE}/models/DR-Venus-4B-SFT \
+    actor_rollout_ref.model.path=${BASE}/models/Qwen3-4B-Thinking-2507-SFT \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=7168 \

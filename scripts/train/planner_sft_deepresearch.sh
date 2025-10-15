@@ -1,8 +1,8 @@
 #!/bin/bash
 # Planner-only cold-start SFT for Hi-IGPO.
 #
-# This is separate from scripts/train/igpo_drvenus_sft.sh:
-#   - igpo_drvenus_sft.sh: DR-Venus-4B-SFT -> single-agent IGPO/RL.
+# This is separate from scripts/train/igpo_single_sft.sh:
+#   - igpo_single_sft.sh: SFT base -> single-agent IGPO/RL.
 #   - this script: base/instruct model -> Planner LoRA using multi-turn planner messages.
 #
 # Expected data schema:
@@ -23,10 +23,10 @@ IFS=',' read -ra _CUDA_DEVICES_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 NGPU=${#_CUDA_DEVICES_ARR[@]}
 
 # Planner SFT base MUST match the RL Planner base (single thinking base + dual LoRA in
-# hi_igpo_phase2b_drvenus.sh). DR-Venus-4B-RL is Qwen3-4B-Thinking-2507 (thinking-only).
+# hi_igpo_phase2b.sh). Base is SFT'd Qwen3-4B-Thinking-2507 (thinking-only).
 # Using Qwen3-4B-Instruct here would break LoRA transfer (different base weights) and
 # mismatch the chat template (Instruct does not auto-open think). See design §7.1.1.1.
-MODEL_PATH=${MODEL_PATH:-${BASE}/models/DR-Venus-4B-RL}
+MODEL_PATH=${MODEL_PATH:-${BASE}/models/Qwen3-4B-Thinking-2507-SFT}
 TRAIN_FILE=${TRAIN_FILE:-${BASE}/data/planner_sft/train.parquet}
 VAL_FILE=${VAL_FILE:-${BASE}/data/planner_sft/val.parquet}
 SAVE_DIR=${SAVE_DIR:-${BASE}/ckpts/deepresearcher/planner_sft_deepresearch}
