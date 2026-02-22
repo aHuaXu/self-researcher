@@ -260,28 +260,34 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
     def execute_predictions(self, 
         tool_call_list: List[Tuple[int, str, str, str]], total_number: int = 4096
     ) :
-        query_contents = [{"idx": tool_call[0], "question": tool_call[1], "think": tool_call[2], "tool_call": tool_call[3], "total_number":total_number} for tool_call in tool_call_list]
-        with open(self.config.signal_writing_file, 'r') as f:
-            signal_contents = json.load(f)
-        assert signal_contents['signal'] == self.config.RESPONSE_SIGNAL
-        with open(self.config.data_writing_file, 'w', encoding='utf-8') as f:
-            json.dump(query_contents, f, indent=4, ensure_ascii=False)
-        with open(self.config.data_writing_file, 'r', encoding='utf-8') as f:
-            query_contents_check = json.load(f)
-        assert query_contents == query_contents_check
-        with open(self.config.signal_writing_file, 'w', encoding='utf-8') as f:
-            json.dump({'signal': self.config.QUERY_SIGNAL}, f, indent=4, ensure_ascii=False)
-        response_finish = False
-        while not response_finish:
-            with open(self.config.signal_writing_file, 'r', encoding='utf-8') as f:
-                signal_contents = json.load(f)
-            if signal_contents['signal'] == self.config.RESPONSE_SIGNAL:
-                response_finish = True
+        """直接调用工具（无需文件 IPC）"""
+        from research_agent.tools import web_search, browse_webpage
+        from research_agent.tools._state import get_tool_state
+
+        tool_state = get_tool_state()
+        tool_state.ensure_initialized()
+
+        results = []
+        for tool_call in tool_call_list:
+            idx, question, think, tool = tool_call
+            tool_name = tool.get("name", "")
+            args = tool.get("arguments", {})
+
+            if tool_name == "web_search":
+                result = web_search.invoke(args)
+            elif tool_name == "browse_webpage":
+                result = browse_webpage.invoke(args)
             else:
-                time.sleep(10)
-        with open(self.config.data_writing_file, 'r', encoding='utf-8') as f:
-            query_contents = json.load(f)
-        return query_contents
+                result = f'{{"error": "Unknown tool: {tool_name}"}}'
+
+            results.append({
+                "idx": idx,
+                "question": question,
+                "think": think,
+                "content": result,
+            })
+
+        return results
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """

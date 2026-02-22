@@ -1,8 +1,13 @@
 """Configuration for the Research Agent system."""
 
 import os
+from dotenv import load_dotenv
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+# 自动加载根目录的 .env 文件
+# config.py 在 research_agent/config.py，所以根目录是 ../../.env
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 
 @dataclass

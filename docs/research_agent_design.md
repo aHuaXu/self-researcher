@@ -145,6 +145,39 @@ class ToolState:
 1. 更新 `research_agent/graph.py` 初始化 ToolState
 2. 运行 `run_example.py` 端到端验证
 
+### Phase 4: 统一工具调用（训练和研究助手）
+1. 修改 `scrl/llm_agent/generation.py` 的 `execute_predictions` → 直接调用 ToolState
+2. 训练前初始化 ToolState（无需启动 server_handler/handler 进程）
+3. 工具行为完全一致
+
+---
+
+## 训练工具调用：从文件 IPC 改为直接调用
+
+### 旧流程（文件 IPC）
+```
+python -m scrl.handler.server_handler  # Flask :5000
+python -m scrl.handler.handler     # polling
+
+generation.py:
+  write data.json → signal.json=1 → sleep 10s 轮询 → 读结果
+```
+
+### 新流程（直接调用）
+```
+训练前只需初始化:
+  tool_state.initialize(config, client)
+
+generation.py:
+  web_search.invoke({"query": [...]})  → 毫秒级返回
+```
+
+### 优势
+- 去掉文件 IPC（无 signal/data.json）
+- 去掉 10 秒 sleep 轮询
+- 无需手动启动 server_handler/handler 进程
+- 多 GPU 训练时工具在主进程直接调用，无跨进程开销
+
 ---
 
 ## 与原始 DeepResearcher 的关系
