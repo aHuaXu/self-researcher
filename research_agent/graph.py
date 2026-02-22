@@ -3,8 +3,10 @@
 from typing import List, Dict, Any, TypedDict, Literal, Optional
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import BaseMessage
+from openai import OpenAI
 
 from research_agent.agents import create_planner_agent, create_executor_agent, create_writer_agent
+from research_agent.tools._state import get_tool_state, build_handler_config
 from research_agent.config import get_config
 
 
@@ -30,6 +32,9 @@ def create_research_graph():
         """Run the planner to break down the question."""
         question = state["question"]
         todos = planner.plan(question)
+        print(f"  [Planner] 生成 {len(todos)} 个子任务:")
+        for i, todo in enumerate(todos):
+            print(f"    {i+1}. [{todo.get('priority', '?')}] {todo.get('sub_topic', '?')}")
         return {
             "question": question,
             "todos": todos,
@@ -39,22 +44,44 @@ def create_research_graph():
         }
 
     def executing_node(state: ResearchState) -> ResearchState:
-        """Run the executor to perform research."""
+        """Run the executor on each TODO item."""
         question = state["question"]
         todos = state.get("todos", [])
-        findings = state.get("findings", [])
+        findings = []
 
-        answer, trajectory = executor.execute(question, "", todos)
+        # Initialize shared tool state
+        config = get_config()
+        handler_config = build_handler_config(config)
+        client = OpenAI(
+            base_url=config.llm.base_url,
+            api_key=config.llm.api_key,
+        )
+        tool_state = get_tool_state()
+        tool_state.initialize(handler_config, client)
+        tool_state.reset_for_question(question)
 
-        # Add trajectory to findings
-        findings = findings + trajectory
+        for todo in todos:
+            sub_topic = todo.get("sub_topic", question)
+            search_query = todo.get("search_query", sub_topic)
+            print(f"  [Executor] Researching: {sub_topic}")
+
+            answer, trajectory = executor.execute(
+                question=sub_topic,
+                context=f"Original question: {question}\nSearch query hint: {search_query}",
+            )
+
+            findings.append({
+                "sub_topic": sub_topic,
+                "answer": answer,
+                "trajectory": trajectory,
+            })
 
         return {
             "question": question,
             "todos": todos,
             "findings": findings,
             "report": "",
-            "status": "writing"
+            "status": "writing" if findings else "error",
         }
 
     def writing_node(state: ResearchState) -> ResearchState:

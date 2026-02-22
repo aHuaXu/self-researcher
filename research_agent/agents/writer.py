@@ -58,12 +58,20 @@ class ReportWriter:
 
         formatted = []
         for i, finding in enumerate(findings):
-            tool = finding.get("tool", "unknown")
-            result = finding.get("result", "")
+            sub_topic = finding.get("sub_topic", "Unknown topic")
+            answer = finding.get("answer", "No answer")
+            trajectory = finding.get("trajectory", [])
 
-            formatted.append(f"--- Finding {i+1} ---")
-            formatted.append(f"Tool: {tool}")
-            formatted.append(f"Result: {result[:2000]}")  # Truncate long results
+            formatted.append(f"=== Sub-topic {i+1}: {sub_topic} ===")
+            formatted.append(f"Answer: {answer}")
+
+            if trajectory:
+                formatted.append(f"Research steps ({len(trajectory)}):")
+                for step in trajectory[:5]:
+                    tool = step.get("tool", "unknown")
+                    result = str(step.get("result", ""))[:500]
+                    formatted.append(f"  - [{tool}] {result}")
+
             formatted.append("")
 
         return "\n".join(formatted)

@@ -1,10 +1,10 @@
 from typing import List, Dict, Any
-from utils import (
+from scrl.handler.utils import (
     get_content_from_tag,
     get_response_from_llm
 )
 from .prompts import *
-from webpage import *
+from scrl.handler.webpage import *
 import time
 import random
 import html2text

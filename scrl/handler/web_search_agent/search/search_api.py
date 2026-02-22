@@ -78,7 +78,7 @@ def serper_google_search(
             raise Exception(f"No results found for query: '{query}'. Use a less specific query.")
         else:
             results = data["organic"]
-            print("search success")
+            print(f"search success for {query}")
             return results
     except Exception as e:
         # print(f"Serper search API error: {e}")

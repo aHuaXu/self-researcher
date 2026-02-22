@@ -20,21 +20,10 @@ class SearchConfig:
 
 @dataclass
 class LLMConfig:
-    """LLM configuration for different agents."""
-    # Executor uses DeepResearcher model (the one being RL trained)
-    executor_model: str = "deep-researcher"
-    executor_base_url: str = "http://localhost:8000/v1"
-    executor_api_key: str = "token-xxx"
-
-    # Planner and Writer use small 3B model
-    small_model: str = "qwen2.5-3b"
-    small_base_url: str = "http://localhost:8000/v1"
-    small_api_key: str = "token-xxx"
-
-    # Quick summary model (for webpage content summarization)
-    summary_model: str = "qwen-plus"
-    summary_base_url: str = "http://localhost:8000/v1"
-    summary_api_key: str = "token-xxx"
+    """LLM configuration."""
+    model: str = "qwen2.5-7b"
+    base_url: str = "http://localhost:8000/v1"
+    api_key: str = "token-xxx"
 
 
 @dataclass
@@ -60,18 +49,10 @@ def load_config() -> AgentConfig:
     config.search.serper_api_key = os.getenv("SERPER_API_KEY", "")
     config.search.azure_subscription_key = os.getenv("AZURE_BING_KEY", "")
 
-    # LLM config from env
-    config.llm.executor_model = os.getenv("EXECUTOR_MODEL", "deep-researcher")
-    config.llm.executor_base_url = os.getenv("EXECUTOR_BASE_URL", "http://localhost:8000/v1")
-    config.llm.executor_api_key = os.getenv("EXECUTOR_API_KEY", "token-xxx")
-
-    config.llm.small_model = os.getenv("SMALL_MODEL", "qwen2.5-3b")
-    config.llm.small_base_url = os.getenv("SMALL_BASE_URL", "http://localhost:8000/v1")
-    config.llm.small_api_key = os.getenv("SMALL_API_KEY", "token-xxx")
-
-    config.llm.summary_model = os.getenv("SUMMARY_MODEL", "qwen-plus")
-    config.llm.summary_base_url = os.getenv("SUMMARY_BASE_URL", "http://localhost:8000/v1")
-    config.llm.summary_api_key = os.getenv("SUMMARY_API_KEY", "token-xxx")
+    # LLM config: single model for all agents
+    config.llm.model = os.getenv("LLM_MODEL", "qwen2.5-7b")
+    config.llm.base_url = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
+    config.llm.api_key = os.getenv("LLM_API_KEY", "token-xxx")
 
     # Cache paths
     config.query_save_path = os.getenv("QUERY_SAVE_PATH", "./research_agent/cache/search_result.json")
