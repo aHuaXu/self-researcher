@@ -60,16 +60,19 @@ def get_response_from_llm(
         client: OpenAI,
         model: str,
         stream: Optional[bool] = False,
-        temperature: Optional[float] = 0.6,
+        temperature: Optional[float] = None,
         depth: int = 0
 ):
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            stream=stream
-        )
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = client.chat.completions.create(**kwargs)
+        content = ""
         if hasattr(response.choices[0].message, 'content') and response.choices[0].message.content:
             content = response.choices[0].message.content
         return {
@@ -85,7 +88,7 @@ def get_response_from_llm(
             return {
                 "content": ""
             }
-        if depth < 512:
+        if depth < 3:
             time.sleep(1)
             return get_response_from_llm(messages=messages, client=client, model=model, stream=stream, temperature=temperature, depth=depth+1)
-        raise e
+        return {"content": ""}

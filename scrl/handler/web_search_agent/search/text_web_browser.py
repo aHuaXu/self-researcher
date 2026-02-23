@@ -343,9 +343,12 @@ class SimpleTextBrowser:
                 # If the error was rendered in HTML we might as well render it
                 content_type = response.headers.get("content-type", "")
                 if content_type is not None and "text/html" in content_type.lower():
-                    res = self._mdconvert.convert(response)
+                    try:
+                        res = self._mdconvert.convert(response)
+                        self._set_page_content(f"## Error {response.status_code}\n\n{res.text_content}")
+                    except Exception:
+                        self._set_page_content(f"## Error {response.status_code}\n\nFailed to fetch {url}")
                     self.page_title = f"Error {response.status_code}"
-                    self._set_page_content(f"## Error {response.status_code}\n\n{res.text_content}")
                 else:
                     text = ""
                     for chunk in response.iter_content(chunk_size=512, decode_unicode=True):

@@ -12,11 +12,9 @@ class LLMClient:
         model: str,
         base_url: str,
         api_key: str,
-        temperature: float = 0.7,
         max_tokens: int = 4096,
     ):
         self.model = model
-        self.temperature = temperature
         self.max_tokens = max_tokens
         self.client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -31,7 +29,6 @@ class LLMClient:
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "stream": stream,
         }

@@ -10,9 +10,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
-from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-
 from research_agent.config import load_config, set_config
 
 config = load_config()
@@ -25,7 +22,7 @@ print()
 
 from research_agent.graph import research
 
-question = "总结下今日A股行情？"
+question = "总结下今日上午A股行情？"
 
 print(f"研究问题: {question}")
 print("=" * 60)
