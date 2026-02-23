@@ -25,7 +25,7 @@ DeepResearcher-7B (冻结基座)
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  1. 数据加载                                             │
-│     RLHFDataset 从 research_queries.parquet 读取         │
+│     RLHFDataset 从 multi-research.parquet 读取         │
 │     一个 batch = N 条研究问题                             │
 │                                                         │
 │  2. Rollout (每条 query × 16 条)                        │
@@ -88,15 +88,12 @@ multi_agent:
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
     dropout: 0.05
 
-  agents:
+  agents:                                 # system_prompt 复用 research_agent/prompts/
     planner:
-      system_prompt: "..."
       max_tokens: 1024                   # plan 不需要太长
     executor:
-      system_prompt: "..."
       max_turns: 10                      # 多轮工具调用
     writer:
-      system_prompt: "..."
       max_tokens: 4096                   # 报告需要较长输出
 
   reward:
@@ -138,11 +135,11 @@ multi_agent:
 ### 文件位置
 
 ```
-data/research_queries.parquet       # 训练集
-data/research_queries_dev.parquet   # 验证集
+data/multi-research.parquet           # 训练集
+data/multi-research_dev.parquet       # 验证集
 ```
 
-`train_multi_agent.sh` 里指定：`data.train_files=./data/research_queries.parquet`
+`train_multi_agent.sh` 里指定：`data.train_files=./data/multi-research.parquet`
 
 ---
 
@@ -162,16 +159,19 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         plan_outputs = self._generate_with_gpu_padding(
             prompts, lora_request=self.lora_planner
         )
-        # 解析 TODO list
+        # 解析 TODO list → 每条 prompt 得到 N 个子任务
 
-        # Stage 2 — Executor（多轮工具调用，复用父类 run_llm_loop）
-        exec_prompts = build_executor_prompts(prompts, plan_outputs)
+        # Stage 2 — Executor（每个 TODO 独立执行，组成 batch 并行）
+        # 例: 2 条 prompt × 各 5 个 TODO = 10 条 executor prompt
+        exec_prompts = build_executor_prompts(prompts, plan_outputs)  # 展开为子任务 batch
         exec_outputs = self.run_llm_loop(
             exec_prompts, lora_request=self.lora_executor
         )
+        # 按原始 prompt 聚合各子任务的 findings
+        grouped_findings = group_findings_by_prompt(exec_outputs, plan_outputs)
 
-        # Stage 3 — Writer（单轮生成）
-        writer_prompts = build_writer_prompts(prompts, plan_outputs, exec_outputs)
+        # Stage 3 — Writer（单轮生成，汇总所有 findings）
+        writer_prompts = build_writer_prompts(prompts, plan_outputs, grouped_findings)
         writer_outputs = self._generate_with_gpu_padding(
             writer_prompts, lora_request=self.lora_writer
         )
@@ -357,20 +357,17 @@ def update_policy(self, trajectory, advantage, old_log_probs, lora_name):
     # 1. 切换到目标 adapter
     self.model.set_adapter(lora_name)
 
-    # 2. 只对目标 LoRA 开启梯度
+    # 2. 只开启目标 LoRA 的梯度（基座始终冻结）
     for name, param in self.model.named_parameters():
-        param.requires_grad = (lora_name in name)
+        if "lora_" in name:
+            param.requires_grad = (lora_name in name)
+        # 基座参数始终 requires_grad=False，不动
 
     # 3. PPO clip loss → backward → step
     loss = ppo_clip_loss(trajectory, advantage, old_log_probs)
     loss.backward()
     self.optimizer.step()
     self.optimizer.zero_grad()
-
-    # 4. 恢复所有 LoRA 梯度
-    for name, param in self.model.named_parameters():
-        if "lora_" in name:
-            param.requires_grad = True
 ```
 
 ### 训练主循环
@@ -419,7 +416,7 @@ ckpts/{experiment_name}/global_step_N/
 | `verl/workers/reward_manager/multi_agent.py` | `MultiAgentRewardManager` |
 | `verl/utils/reward_score/llm_judge.py` | `LLMJudge`（异步外部 API） |
 | `verl/utils/reward_score/rule_reward.py` | `planner_rules()` + `executor_rules()` |
-| `data/research_queries.parquet` | 训练数据（研究问题） |
+| `data/multi-research.parquet` | 训练数据（研究问题） |
 
 ### 改动文件（小改，加配置开关或参数透传）
 
