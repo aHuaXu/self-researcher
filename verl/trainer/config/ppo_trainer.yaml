@@ -187,3 +187,34 @@ do_search: true
 agent_grpo:
   n: 2
 search_engine: rag
+
+# Multi-agent LoRA GRPO training (disabled by default)
+multi_agent:
+  enable: false
+  base_model: GAIR/DeepResearcher-7b
+
+  lora:
+    rank: 64
+    alpha: 128
+    target_modules:
+      - q_proj
+      - v_proj
+      - k_proj
+      - o_proj
+    dropout: 0.05
+
+  agents:
+    planner:
+      max_tokens: 1024
+    executor:
+      max_turns: 10
+    writer:
+      max_tokens: 4096
+
+  reward:
+    judge_model: ""
+    judge_base_url: ""
+    judge_api_key: ""
+    judge_max_concurrent: 50
+    alpha: 0.2
+    beta: 0.3
