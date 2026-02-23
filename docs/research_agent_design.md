@@ -196,53 +196,26 @@ generation.py:
 
 ### 整体思路
 
-三模型串行生成一个完整 rollout，分别计算三个 Agent 的 reward，独立进行梯度更新。
+共享基座模型（DeepResearcher-7B）+ 3 个 LoRA adapter，串行生成完整 rollout，分别计算 reward，独立更新各自的 LoRA 参数。
 
 ```
-Query → Planner → Executor → Writer → Final Answer
-          ↓           ↓          ↓
-       reward_p   reward_e   reward_w
-          ↓           ↓          ↓
-      update_θp  update_θe  update_θw
+DeepResearcher-7B (冻结基座)
+  ├── LoRA_planner
+  ├── LoRA_executor
+  └── LoRA_writer
+
+Query → Planner(LoRA_p) → Executor(LoRA_e) → Writer(LoRA_w) → Report
+              ↓                  ↓                  ↓
+          reward_p           reward_e           reward_w
+              ↓                  ↓                  ↓
+        update LoRA_p      update LoRA_e      update LoRA_w
 ```
 
-### 技术方案
+### 模型架构
 
-基于 verl 框架扩展，自定义 MultiAgentTrainer：
-
-```python
-class MultiAgentTrainer:
-    def __init__(self, planner_model, executor_model, writer_model):
-        self.planner = planner_model      # 3B 模型
-        self.executor = executor_model    # 7B 模型（待训练）
-        self.writer = writer_model        # 3B 模型
-
-    def rollout(self, queries):
-        """串行生成完整轨迹"""
-        # Step 1: Planner 生成计划
-        plan_outputs = self.planner.generate(queries)
-
-        # Step 2: Executor 执行计划（调用工具）
-        exec_outputs = self.executor.generate(queries, plan_outputs)
-
-        # Step 3: Writer 生成最终报告
-        writer_outputs = self.writer.generate(queries, plan_outputs, exec_outputs)
-
-        return combined_trajectories
-
-    def compute_rewards(self, trajectories):
-        """分别计算三个 Agent 的 reward"""
-        reward_p = reward_fn_planner(trajectories['planner'])
-        reward_e = reward_fn_executor(trajectories['executor'])
-        reward_w = reward_fn_writer(trajectories['writer'])
-        return {'planner': reward_p, 'executor': reward_e, 'writer': reward_w}
-
-    def update(self, trajectories, rewards):
-        """三次 GRPO 更新"""
-        self.planner.update(trajectories['planner'], rewards['planner'])
-        self.executor.update(trajectories['executor'], rewards['executor'])
-        self.writer.update(trajectories['writer'], rewards['writer'])
-```
+- **基座模型**：DeepResearcher-7B（GRPO 训练后的 Qwen2.5-7B），冻结不更新
+- **LoRA adapter**：每个 Agent 一个独立的 LoRA 模块（r=16~64），只训练 LoRA 参数
+- **推理**：一个 vLLM 实例，通过 `--enable-lora` 支持多 LoRA 切换，基座内存只占一份
 
 ### Rollout 流程
 
@@ -250,66 +223,132 @@ class MultiAgentTrainer:
 ┌─────────────────────────────────────────────────────────────┐
 │                     Multi-Agent Rollout                      │
 ├─────────────────────────────────────────────────────────────┤
-│  Query                                                      │
+│  Query (研究问题)                                            │
+│    │                                                        │
+│    ▼  切换 LoRA_planner                                     │
+│  ┌─────────────────┐                                       │
+│  │    Planner      │ ──→ TODO list (子主题 + 优先级)        │
+│  │ (base + LoRA_p) │                                       │
+│  └─────────────────┘                                       │
+│    │                                                        │
+│    ▼  切换 LoRA_executor                                    │
+│  ┌─────────────────┐                                       │
+│  │   Executor      │ ──→ 多轮 web_search + browse          │
+│  │ (base + LoRA_e) │     → findings (研究发现)              │
+│  └─────────────────┘                                       │
+│    │                                                        │
+│    ▼  切换 LoRA_writer                                      │
+│  ┌─────────────────┐                                       │
+│  │    Writer       │ ──→ 结构化研究报告                     │
+│  │ (base + LoRA_w) │                                       │
+│  └─────────────────┘                                       │
 │    │                                                        │
 │    ▼                                                        │
-│  ┌─────────────┐                                           │
-│  │   Planner   │ ──→ plan_1, plan_2, ...                  │
-│  │  (3B model) │                                           │
-│  └─────────────┘                                           │
-│    │                                                        │
-│    ▼                                                        │
-│  ┌─────────────┐                                           │
-│  │  Executor   │ ──→ tool_calls, tool_results, answer     │
-│  │ (7B model)  │     (多轮工具调用)                         │
-│  └─────────────┘                                           │
-│    │                                                        │
-│    ▼                                                        │
-│  ┌─────────────┐                                           │
-│  │   Writer    │ ──→ final_report                         │
-│  │  (3B model) │                                           │
-│  └─────────────┘                                           │
-│    │                                                        │
-│    ▼                                                        │
-│  ┌─────────────────────────────────────┐                   │
-│  │        Combined Trajectory          │                   │
-│  │  [plan] [exec] [writer] [final]     │                   │
-│  └─────────────────────────────────────┘                   │
+│  LLM Judge → final_reward (1-10 分)                        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Reward 设计
 
-| Agent | Reward 来源 | 说明 |
-|-------|-------------|------|
-| **Planner** | 计划合理性 | Plan 是否清晰、可执行？是否遗漏关键步骤？ |
-| **Executor** | 执行质量 | 工具调用是否正确？是否找到有效信息？答案是否准确？ |
-| **Writer** | 报告质量 | 报告是否完整、准确、结构清晰、可读性强？ |
+#### final_reward
 
-**分层 Reward 方案**：
-- 主 reward：最终答案/报告质量（三个 Agent 共享）
-- 辅助 reward：每个 Agent 的过程质量
+由冻结的 LLM Judge（如 Qwen2.5-72B）对最终报告打分（1-10），评估维度：
+- 准确性：信息是否正确
+- 完整性：是否覆盖了问题的核心方面
+- 结构性：报告是否有清晰的逻辑结构
+- 可读性：语言是否流畅
 
-### 实现要点
+#### 各 Agent 的 reward 计算
 
-1. **自定义 generation.py**
-   - 实现三模型串行 rollout
-   - 拼接完整的 [plan][exec][writer] 轨迹
+```
+reward_writer   = final_reward_normalized
+reward_executor = β · rule_e + (1 - β) · final_reward_normalized
+reward_planner  = α · rule_p + (1 - α) · final_reward_normalized
+```
 
-2. **扩展 trainer**
-   - 支持多模型独立更新
-   - 分别记录三个模型的 log_prob
+- α = 0.2, β = 0.3（初始值，可随训练 anneal 到 0）
+- final_reward_normalized = final_reward / 10（归一化到 0-1）
 
-3. **关键挑战**
-   - 训练时间：三模型串行生成，耗时长
-   - Reward 分配：如何合理分配 credit
-   - 显存：三模型同时加载，需要多卡或模型并行
+#### Planner 规则 reward (rule_p)
 
-### 替代方案
+| 规则 | 分值 | 说明 |
+|------|------|------|
+| 子任务数量在 3-7 之间 | +1 / 0 | 太少覆盖不全，太多发散 |
+| 子任务之间无明显重复（关键词重合率 < 阈值） | +1 / 0 | 避免浪费 Executor 轮次 |
+| 优先级分布合理（不全是同一个级别） | +0.5 / 0 | 有主次区分 |
 
-**只训练 Executor**（简化版）：
-- Planner 和 Writer 固定用小模型
-- 只对 Executor 做 RL 更新
-- 实现简单，效果稳定
+归一化：rule_p = 得分 / 2.5
 
-适合初期验证，等流程跑通后再扩展到三模型联合训练。
+#### Executor 规则 reward (rule_e)
+
+| 规则 | 分值 | 说明 |
+|------|------|------|
+| 成功调用了搜索工具（返回非空结果） | +1 / 0 | 基本搜索能力 |
+| 调用了 browse（深入阅读网页） | +1 / 0 | 不只看摘要 |
+| 返回内容非空且长度合理 | +1 / 0 | 确实找到了有效信息 |
+| 没有触发 max_turns 限制 | +1 / 0 | 能在限制内完成任务 |
+
+归一化：rule_e = 得分 / 4
+
+### 训练数据
+
+不复用 DeepResearcher 的 QA 数据（只有问-答对，无法训练报告生成）。
+
+需要构造**研究类问题**数据集，不需要标准答案（reward 来自 LLM Judge）：
+
+```json
+{"query": "分析2024年全球AI芯片市场格局", "domain": "tech"}
+{"query": "比较中美新能源汽车产业链差异", "domain": "industry"}
+{"query": "总结最近一周加密货币市场走势", "domain": "finance"}
+```
+
+数据来源：
+- LLM 批量生成不同领域的研究问题
+- 知乎/Reddit 等平台的研究类问题
+- 学术论文的 research question
+- 金融/行业研究报告的标题
+
+### GRPO 训练细节
+
+```python
+# 对同一个 query 的 n=16 条 rollout:
+# 每条 rollout 包含完整的 Planner → Executor → Writer 过程
+# 分别对三个 LoRA 做 GRPO 更新
+
+for query in batch:
+    rollouts = [run_full_pipeline(query) for _ in range(16)]
+    
+    # 每条 rollout 得到三个 reward
+    rewards_p = [r.reward_planner for r in rollouts]
+    rewards_e = [r.reward_executor for r in rollouts]
+    rewards_w = [r.reward_writer for r in rollouts]
+    
+    # GRPO 组内归一化
+    adv_p = normalize(rewards_p)  # 好的 plan → 正 advantage → 强化 LoRA_p
+    adv_e = normalize(rewards_e)
+    adv_w = normalize(rewards_w)
+    
+    # 分别更新三个 LoRA
+    update_lora(planner_lora, trajectories_p, adv_p)
+    update_lora(executor_lora, trajectories_e, adv_e)
+    update_lora(writer_lora, trajectories_w, adv_w)
+```
+
+### 对 verl 框架的改动
+
+| 模块 | 改动 |
+|------|------|
+| `LLMGenerationManager` | 三阶段串行 rollout，每阶段切换 LoRA |
+| `core_algos.py` | 分别对三个 Agent 的 trajectory 计算 GRPO advantage |
+| `fsdp_workers.py` | Actor update 只更新对应的 LoRA 参数 |
+| `vllm_rollout/` | 启用 `--enable-lora`，支持多 LoRA 切换 |
+| `reward_score/` | 新增 LLM Judge reward + 规则 reward |
+| `RLHFDataset` | 适配新的训练数据格式（研究问题，无 ground_truth） |
+
+### 资源估算
+
+- 基座 7B 模型：~14GB 显存（FP16）
+- 3 个 LoRA（r=64）：每个 ~200MB，共 ~600MB
+- vLLM rollout 引擎：~14GB（KV cache）
+- LLM Judge（本地 72B）：需要额外 GPU
+- 总计：8×A100 80GB 应该足够（基座 + LoRA 训练 + Judge 推理）
