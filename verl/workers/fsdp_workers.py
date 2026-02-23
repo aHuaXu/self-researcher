@@ -227,6 +227,23 @@ class ActorRolloutRefWorker(Worker):
 
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
+        # Multi-agent LoRA initialization
+        _multi_agent_enabled = hasattr(self.config, 'multi_agent') and getattr(self.config.multi_agent, 'enable', False)
+        if _multi_agent_enabled:
+            from peft import get_peft_model, LoraConfig as PeftLoraConfig
+
+            lora_cfg = self.config.multi_agent.lora
+            peft_config = PeftLoraConfig(
+                r=lora_cfg.rank,
+                lora_alpha=lora_cfg.alpha,
+                target_modules=list(lora_cfg.target_modules),
+                lora_dropout=lora_cfg.dropout,
+            )
+            actor_module = get_peft_model(actor_module, peft_config, adapter_name="planner")
+            actor_module.add_adapter("executor", peft_config)
+            actor_module.add_adapter("writer", peft_config)
+            log_gpu_memory_usage('After multi-agent LoRA init', logger=logger)
+
         # We wrap FSDP for rollout as well
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
         if mixed_precision_config is not None:
@@ -240,7 +257,8 @@ class ActorRolloutRefWorker(Worker):
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None))
+        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None),
+                                                is_lora=_multi_agent_enabled)
 
         if self._is_rollout and self.config.rollout.name == 'hf':
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
