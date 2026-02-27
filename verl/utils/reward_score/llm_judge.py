@@ -28,6 +28,7 @@ def parse_score(text: str) -> float:
     """
     match = re.search(r"\d+\.?\d*", text)
     if match is None:
+        print(f"[LLMJudge] WARNING: parse_score found no number in: {text[:100]!r}", flush=True)
         return 0.0
     value = float(match.group())
     return min(value, 10.0)
@@ -75,7 +76,10 @@ class LLMJudge:
                         }
                     ],
                 )
-                text = response.choices[0].message.content
+                text = response.choices[0].message.content if response.choices else ""
+                if not text:
+                    print(f"[LLMJudge] WARNING: empty response from judge API", flush=True)
+                    return 0.0
                 return parse_score(text) / 10.0
         except Exception as e:
             print(f"LLMJudge error: {e}")

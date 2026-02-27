@@ -117,7 +117,11 @@ class MultiAgentGenerationManager(LLMGenerationManager):
                 lora_request=self.lora_requests.get("executor"),
             )
         else:
-            # Edge case: no TODOs produced at all
+            print(
+                "[MultiAgent] WARNING: executor batch is empty — "
+                "planner produced no TODOs",
+                flush=True,
+            )
             exec_msg_strings = []
             exec_outputs = DataProto.from_dict({
                 'input_ids': torch.zeros((0, 1), dtype=torch.long),
@@ -206,12 +210,7 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         ):
             for todo in todos:
                 sub_topic = todo.get("sub_topic", question)
-                search_query = todo.get("search_query", sub_topic)
-                context = (
-                    f"Sub-topic: {sub_topic}\n"
-                    f"Suggested search query: {search_query}"
-                )
-                messages = get_executor_prompt(sub_topic, context)
+                messages = get_executor_prompt(sub_topic)
                 messages_list.append(messages)
                 todo_mapping.append(q_idx)
 
@@ -324,7 +323,11 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         generated token IDs.
         """
         if 'responses' not in outputs.batch.keys():
-            # Fallback: try to extract from input_ids if responses not present
+            print(
+                "[MultiAgent] WARNING: _decode_outputs found no 'responses' "
+                "key in batch, returning empty list",
+                flush=True,
+            )
             return []
 
         responses = outputs.batch['responses']
@@ -345,60 +348,28 @@ class MultiAgentGenerationManager(LLMGenerationManager):
     def _parse_todos(self, plan_text: str) -> List[Dict[str, Any]]:
         """Parse planner output into a list of TODO dicts.
 
-        Each dict has keys: index, priority, sub_topic, search_query.
-
-        Uses regex patterns compatible with the planner prompt format
-        (same approach as research_agent/agents/planner.py).
+        Each dict has keys: index, priority, sub_topic.
+        The planner only produces sub-topics; the executor decides
+        what to search for on its own.
         """
         todos = []
 
-        # Try strict format first:
-        # 1. [HIGH] Sub-topic: XXX\n   Search Query: XXX
-        pattern = (
-            r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*Sub-topic:\s*(.+?)\n'
-            r'\s*Search Query:\s*(.+?)(?=\n\d+\.|\n\n|</todos>|$)'
-        )
+        # Primary pattern: "1. [HIGH] The sub-topic description"
+        pattern = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*(.+?)(?=\n\d+\.\s*\[|</todos>|$)'
         matches = re.findall(pattern, plan_text, re.IGNORECASE | re.DOTALL)
         for match in matches:
-            search_query = match[3].strip().rstrip('</todos>')
-            todos.append({
-                "index": int(match[0]),
-                "priority": match[1].lower(),
-                "sub_topic": match[2].strip(),
-                "search_query": search_query,
-            })
-
-        if todos:
-            return todos
-
-        # Fallback: match numbered items with brackets like "1. [HIGH] ..."
-        pattern2 = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*(.+?)(?=\n\d+\.\s*\[|$)'
-        matches2 = re.findall(pattern2, plan_text, re.IGNORECASE | re.DOTALL)
-        for match in matches2:
-            text = match[2].strip()
-            # Try to split sub_topic and search_query
-            sq_match = re.search(
-                r'(?:Search\s*Query|搜索|查询)[：:]\s*(.+)',
-                text,
-                re.IGNORECASE,
-            )
-            if sq_match:
-                sub_topic = text[: sq_match.start()].strip().rstrip('\n')
-                search_query = sq_match.group(1).strip()
-            else:
-                sub_topic = text.split('\n')[0].strip()
-                search_query = sub_topic
+            sub_topic = match[2].strip()
             sub_topic = re.sub(
                 r'^(?:Sub-topic|子主题|主题)[：:]\s*',
                 '',
                 sub_topic,
                 flags=re.IGNORECASE,
             )
+            sub_topic = sub_topic.rstrip('</todos>').strip()
             todos.append({
                 "index": int(match[0]),
                 "priority": match[1].lower(),
                 "sub_topic": sub_topic,
-                "search_query": search_query,
             })
 
         if todos:
@@ -407,11 +378,15 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         # Last-resort fallback: treat the whole text as a single TODO
         clean_text = plan_text.strip()
         if clean_text:
+            print(
+                f"[MultiAgent] WARNING: _parse_todos regex failed, "
+                f"falling back to raw text: {clean_text[:80]!r}",
+                flush=True,
+            )
             todos.append({
                 "index": 1,
                 "priority": "high",
                 "sub_topic": clean_text[:200],
-                "search_query": clean_text[:200],
             })
 
         return todos

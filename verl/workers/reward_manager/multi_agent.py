@@ -68,9 +68,17 @@ class MultiAgentRewardManager:
         batch_size = len(queries)
 
         # --- LLM Judge scores (async) ---
-        final_rewards = asyncio.run(
-            self.judge.score_batch(list(queries), list(final_reports))
-        )
+        try:
+            final_rewards = asyncio.run(
+                self.judge.score_batch(list(queries), list(final_reports))
+            )
+        except Exception as e:
+            print(
+                f"[MultiAgentReward] ERROR: judge.score_batch failed: {e}, "
+                f"using 0.0 for all {batch_size} samples",
+                flush=True,
+            )
+            final_rewards = [0.0] * batch_size
 
         # --- Rule-based scores ---
         rule_p_scores = [planner_rules(plan_texts[i]) for i in range(batch_size)]
