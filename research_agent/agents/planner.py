@@ -41,53 +41,47 @@ class TodoPlanner:
             print(f"  [Planner] 解析失败，LLM 原始输出:\n{content[:500]}")
 
         if not todos:
-            # Fallback: create a simple todo from the question
             todos = [{
                 "sub_topic": question,
-                "search_query": question,
                 "priority": "high"
             }]
 
         return todos
 
     def _parse_todos(self, content: str) -> List[Dict[str, Any]]:
-        """Parse TODO items from LLM response."""
+        """Parse TODO items from LLM response.
+
+        Aligned with training-time parsing in multi_agent_generation.py.
+        Output: {index, priority, sub_topic} — no search_query.
+        """
         todos = []
 
-        # Try strict format first: 1. [HIGH] Sub-topic: XXX\n   Search Query: XXX
-        pattern = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*Sub-topic:\s*(.+?)\n\s*Search Query:\s*(.+?)(?=\n\d+\.|\n\n|</todos>|$)'
+        pattern = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*(.+?)(?=\n\d+\.\s*\[|</todos>|$)'
         matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
         for match in matches:
-            search_query = match[3].strip().rstrip('</todos>')
+            sub_topic = match[2].strip()
+            sub_topic = re.sub(
+                r'^(?:Sub-topic|子主题|主题)[：:]\s*',
+                '',
+                sub_topic,
+                flags=re.IGNORECASE,
+            )
+            sub_topic = sub_topic.rstrip('</todos>').strip()
             todos.append({
                 "index": int(match[0]),
                 "priority": match[1].lower(),
-                "sub_topic": match[2].strip(),
-                "search_query": search_query,
+                "sub_topic": sub_topic,
             })
 
         if todos:
             return todos
 
-        # Fallback: match numbered items with brackets like "1. [HIGH] ..."
-        pattern2 = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*(.+?)(?=\n\d+\.\s*\[|$)'
-        matches2 = re.findall(pattern2, content, re.IGNORECASE | re.DOTALL)
-        for match in matches2:
-            text = match[2].strip()
-            # Try to split sub_topic and search_query
-            sq_match = re.search(r'(?:Search\s*Query|搜索|查询)[：:]\s*(.+)', text, re.IGNORECASE)
-            if sq_match:
-                sub_topic = text[:sq_match.start()].strip().rstrip('\n')
-                search_query = sq_match.group(1).strip()
-            else:
-                sub_topic = text.split('\n')[0].strip()
-                search_query = sub_topic
-            sub_topic = re.sub(r'^(?:Sub-topic|子主题|主题)[：:]\s*', '', sub_topic, flags=re.IGNORECASE)
+        clean_text = content.strip()
+        if clean_text:
             todos.append({
-                "index": int(match[0]),
-                "priority": match[1].lower(),
-                "sub_topic": sub_topic,
-                "search_query": search_query,
+                "index": 1,
+                "priority": "high",
+                "sub_topic": clean_text[:200],
             })
 
         return todos

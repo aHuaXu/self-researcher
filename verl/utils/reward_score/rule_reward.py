@@ -3,16 +3,22 @@ from typing import Dict, List
 
 
 def _parse_tasks(plan_text: str) -> List[Dict[str, str]]:
-    """Parse planner output into structured tasks."""
+    """Parse planner output into structured tasks.
+
+    Supports both formats:
+      - "1. [HIGH] Sub-topic: description"
+      - "1. [HIGH] description"  (no prefix)
+    """
     pattern = re.compile(
-        r'^\d+\.\s*\[(\w+)\]\s*(?:Sub-topic|子主题)\s*[:：]\s*(.+?)$',
+        r'^\d+\.\s*\[(\w+)\]\s*(?:(?:Sub-topic|子主题)\s*[:：]\s*)?(.+?)$',
         re.MULTILINE
     )
     tasks = []
     for match in pattern.finditer(plan_text):
         priority = match.group(1).upper()
         subtopic = match.group(2).strip()
-        tasks.append({"priority": priority, "subtopic": subtopic})
+        if subtopic:
+            tasks.append({"priority": priority, "subtopic": subtopic})
     return tasks
 
 

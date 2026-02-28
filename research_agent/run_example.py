@@ -22,7 +22,7 @@ print()
 
 from research_agent.graph import research
 
-question = "总结下今日上午A股行情？"
+question = "总结下今日A股算力板块的行情"
 
 print(f"研究问题: {question}")
 print("=" * 60)

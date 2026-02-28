@@ -335,27 +335,47 @@ class ActorRolloutRefWorker(Worker):
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
             log_gpu_memory_usage('Before building vllm rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
+            _multi_agent_enabled = hasattr(self.config, 'multi_agent') and getattr(self.config.multi_agent, 'enable', False)
+            lora_rollout_kwargs = {}
+            if _multi_agent_enabled:
+                lora_rollout_kwargs['enable_lora'] = True
+                lora_rollout_kwargs['max_lora_rank'] = self.config.multi_agent.lora.rank
+
             if vllm_mode == 'customized':
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
-                                      model_hf_config=self.actor_model_config)
+                                      model_hf_config=self.actor_model_config,
+                                      **lora_rollout_kwargs)
             elif vllm_mode == 'spmd':
                 rollout = vLLMRollout(model_path=local_path,
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
                                       model_hf_config=self.actor_model_config,
-                                      device_mesh=rollout_device_mesh)
+                                      device_mesh=rollout_device_mesh,
+                                      **lora_rollout_kwargs)
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
             log_gpu_memory_usage('After building vllm rollout', logger=None)
             if torch.distributed.get_world_size() == 1:
                 self.config.rollout.load_format = 'dummy_hf'
+
+            lora_config = None
+            if _multi_agent_enabled:
+                lora_cfg = self.config.multi_agent.lora
+                lora_config = {
+                    'rank': lora_cfg.rank,
+                    'alpha': lora_cfg.alpha,
+                    'adapter_names': ['planner', 'executor', 'writer'],
+                    'save_dir': './tmp_lora_adapters',
+                    'target_modules': list(lora_cfg.target_modules),
+                }
             rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
                                                                inference_engine=rollout.inference_engine,
                                                                model_config=self.actor_model_config,
                                                                full_params='hf' in self.config.rollout.load_format,
-                                                               device_mesh=rollout_device_mesh)
+                                                               device_mesh=rollout_device_mesh,
+                                                               lora_config=lora_config)
             log_gpu_memory_usage('After building sharding manager', logger=None)
 
         return rollout, rollout_sharding_manager
@@ -495,6 +515,10 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        lora_adapter_path = prompts.meta_info.pop('lora_adapter_path', None)
+        lora_adapter_name = prompts.meta_info.pop('lora_adapter_name', None)
+        lora_adapter_id = prompts.meta_info.pop('lora_adapter_id', None)
+
         with self.rollout_sharding_manager:
 
             # after parameters sync with rollout, offload actor model to CPU
@@ -506,7 +530,17 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+
+            rollout_kwargs = {}
+            if lora_adapter_path is not None:
+                from vllm.lora.request import LoRARequest
+                lora_req = LoRARequest(
+                    lora_adapter_name or 'default',
+                    lora_adapter_id or 1,
+                    lora_adapter_path,
+                )
+                rollout_kwargs['lora_request'] = lora_req
+            output = self.rollout.generate_sequences(prompts=prompts, **rollout_kwargs)
 
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
@@ -531,9 +565,10 @@ class ActorRolloutRefWorker(Worker):
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info['temperature'] = self.config.rollout.temperature
         # perform recompute log_prob
+        lora_name = data.meta_info.get('lora_name', None)
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.actor.compute_log_prob(data=data)
+            output = self.actor.compute_log_prob(data=data, lora_name=lora_name)
             output = DataProto.from_dict(tensors={'old_log_probs': output},
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
