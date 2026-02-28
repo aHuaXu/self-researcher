@@ -1,66 +1,76 @@
 # requirements.txt records the full set of dependencies for development
+
+# Core training dependencies (from pyproject.toml)
 accelerate
 codetiming
 datasets
 dill
-flash-attn
 hydra-core
-liger-kernel
 numpy
 pandas
 peft
 pyarrow>=15.0.0
 pybind11
 pylatexenc
-# ray[data,train,tune,serve]
+ray>=2.10
 tensordict<0.6
 torchdata
 transformers
-# vllm<=0.6.3
 wandb
-pathvalidate
-smolagents
-mammoth
-pdfminer
-python-pptx
-puremagic
-pydub
-SpeechRecognition
-PyPDF2
-youtube_transcript_api
+
+# Optional GPU dependencies
+flash-attn
+liger-kernel
+
+# vllm is pinned in pyproject.toml but may need separate install
+# vllm<=0.6.3
+
+# Web/API dependencies
+flask
+requests
+beautifulsoup4
+html2text
 serpapi
-tqdm
-pubchempy
-Bio
-scikit-learn
 google_search_results
-markdownify
-numexpr
+pymongo
+psutil
+
+# Data processing
 openai
 openpyxl
-python-dotenv
-chess
-sympy
 xlrd
-huggingface_hub
-Requests
-beautifulsoup4
-Pillow
-modelscope
-html2text
-pathvalidate
-smolagents
+numexpr
+
+# ML/科学计算
+scikit-learn
+Bio
+pubchempy
+
+# 文件处理
 pdfminer
 mammoth
-pdfminer.six
 python-pptx
-pydub
 puremagic
+PyPDF2
+
+# 音频处理
+pydub
 SpeechRecognition
+
+# 视频处理
 youtube_transcript_api
-html2text
-flask
-psutil
-pymongo
+
+# Document conversion
+markdownify
+
+# 其他工具
+pathvalidate
+python-dotenv
+tqdm
+chess
+sympy
+huggingface_hub
+modelscope
+smolagents
 langchain-core
 langgraph
