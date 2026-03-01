@@ -152,7 +152,11 @@ class ActorRolloutRefWorker(Worker):
                                role='actor'):
         from verl.utils.model import print_model_size, update_model_config, get_generation_config
         from verl.utils.torch_dtypes import PrecisionType
-        from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq
+        from transformers import AutoModelForCausalLM, AutoConfig
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            AutoModelForVision2Seq = None
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
         from torch import optim
 
@@ -200,7 +204,7 @@ class ActorRolloutRefWorker(Worker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            if AutoModelForVision2Seq is not None and type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
                 actor_module_class = AutoModelForVision2Seq
             else:
                 actor_module_class = AutoModelForCausalLM
@@ -208,7 +212,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
-                                                              attn_implementation='flash_attention_2',
+                                                              attn_implementation='sdpa',
                                                               trust_remote_code=trust_remote_code)
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -743,7 +747,7 @@ class CriticWorker(Worker):
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation='sdpa',
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -999,7 +1003,7 @@ class RewardModelWorker(Worker):
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation='sdpa',
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
