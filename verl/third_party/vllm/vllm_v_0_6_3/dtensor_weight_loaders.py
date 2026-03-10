@@ -163,6 +163,9 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             continue
         if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
             continue
+        # Skip keys already containing qkv_proj - they were already transformed by FSDP sharding manager
+        if "qkv_proj" in name:
+            continue
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name not in name:
                 continue
@@ -170,16 +173,37 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
+            # If the fused param name doesn't exist, skip and let the else branch handle it
+            if name not in params_dict:
+                continue
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
             param = params_dict[name]
             weight_loader = param.weight_loader
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
             break
         else:
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
+            # Try multiple name formats for non-stacked params
+            lookup_name = name
+            # First check: if name is already in params_dict, use it directly
+            if lookup_name in params_dict:
+                pass  # keep lookup_name as name
+            elif lookup_name not in params_dict:
+                # Try stripping "model." prefix
+                if lookup_name.startswith("model."):
+                    lookup_name = lookup_name[len("model."):]  # layers.0.self_attn.o_proj.weight
+            if lookup_name not in params_dict and "model.layers." in name:
+                # Try stripping "model.layers.x." to get self_attn.o_proj.weight
+                parts = name.split(".")
+                lookup_name = ".".join(parts[3:])  # self_attn.o_proj.weight
+            if lookup_name not in params_dict:
+                # Last resort: use original name as-is
+                lookup_name = name
+            if lookup_name.endswith(".bias") and lookup_name not in params_dict:
                 continue
-            param = params_dict[name]
+            if lookup_name not in params_dict:
+                # Key not found, skip
+                continue
+            param = params_dict[lookup_name]
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
@@ -188,17 +212,20 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
 def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
-        ("qkv_proj", "q_proj", "q"),
-        ("qkv_proj", "k_proj", "k"),
-        ("qkv_proj", "v_proj", "v"),
-        ("gate_up_proj", "gate_proj", 0),
-        ("gate_up_proj", "up_proj", 1),
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+        (".gate_up_proj", ".gate_proj", 0),
+        (".gate_up_proj", ".up_proj", 1),
     ]
     params_dict = dict(vllm_model.named_parameters(remove_duplicate=False))
     for name, loaded_weight in actor_weights.items():
         if "rotary_emb.inv_freq" in name:
             continue
         if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
+            continue
+        # Skip keys already containing qkv_proj - they were already transformed by FSDP sharding manager
+        if "qkv_proj" in name:
             continue
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name not in name:
@@ -213,10 +240,28 @@ def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) ->
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
             break
         else:
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
+            # Try multiple name formats for non-stacked params
+            lookup_name = name
+            # First check: if name is already in params_dict, use it directly
+            if lookup_name in params_dict:
+                pass  # keep lookup_name as name
+            elif lookup_name not in params_dict:
+                # Try stripping "model." prefix
+                if lookup_name.startswith("model."):
+                    lookup_name = lookup_name[len("model."):]  # layers.0.self_attn.o_proj.weight
+            if lookup_name not in params_dict and "model.layers." in name:
+                # Try stripping "model.layers.x." to get self_attn.o_proj.weight
+                parts = name.split(".")
+                lookup_name = ".".join(parts[3:])  # self_attn.o_proj.weight
+            if lookup_name not in params_dict:
+                # Last resort: use original name as-is
+                lookup_name = name
+            if lookup_name.endswith(".bias") and lookup_name not in params_dict:
                 continue
-            param = params_dict[name]
+            if lookup_name not in params_dict:
+                # Key not found, skip
+                continue
+            param = params_dict[lookup_name]
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype))
@@ -309,17 +354,22 @@ def gpt2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn
     pass
 
 
-def redistribute_dtensor(param_name: str, loaded_weights: DTensor, parallelize_plan: Dict = None):
-    param_name = _process_parameter_names(name=param_name)
-    if parallelize_plan is not None:
-        assert (
-            param_name
-            in parallelize_plan.keys()), f"param name: {param_name} not in parallelize_plan :{parallelize_plan.keys()}"
-        placement = parallelize_plan[param_name]
-        local_loaded_weights = loaded_weights.redistribute(device_mesh=loaded_weights.device_mesh,
-                                                           placements=placement).to_local()
+def redistribute_dtensor(param_name: str, loaded_weights, parallelize_plan: Dict = None):
+    # Handle both DTensor and regular Tensor
+    if isinstance(loaded_weights, DTensor):
+        param_name = _process_parameter_names(name=param_name)
+        if parallelize_plan is not None:
+            assert (
+                param_name
+                in parallelize_plan.keys()), f"param name: {param_name} not in parallelize_plan :{parallelize_plan.keys()}"
+            placement = parallelize_plan[param_name]
+            local_loaded_weights = loaded_weights.redistribute(device_mesh=loaded_weights.device_mesh,
+                                                               placements=placement).to_local()
+        else:
+            local_loaded_weights = loaded_weights.full_tensor()
     else:
-        local_loaded_weights = loaded_weights.full_tensor()
+        # Regular tensor - return as-is
+        local_loaded_weights = loaded_weights
     return local_loaded_weights
 
 

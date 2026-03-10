@@ -101,10 +101,14 @@ class vLLMRollout(BaseRollout):
         enable_lora = kwargs.get('enable_lora', False)
         max_lora_rank = kwargs.get('max_lora_rank', 64)
 
+        print(f"[DEBUG vLLMRollout] init received kwargs: enable_lora={enable_lora}, max_lora_rank={max_lora_rank}, kwargs={kwargs}")
+
         lora_kwargs = {}
         if enable_lora:
             lora_kwargs['enable_lora'] = True
             lora_kwargs['max_lora_rank'] = max_lora_rank
+            lora_kwargs['max_loras'] = 10
+            lora_kwargs['max_cpu_loras'] = 10
 
         self.inference_engine = LLM(
             actor_module,

@@ -232,11 +232,24 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
         # Multi-agent LoRA initialization
-        _multi_agent_enabled = hasattr(self.config, 'multi_agent') and getattr(self.config.multi_agent, 'enable', False)
+        import sys
+        # Check for multi_agent config - it may be in current config or parent
+        _multi_agent_enabled = False
+        multi_agent_cfg = None
+        if hasattr(self.config, 'multi_agent') and self.config.multi_agent is not None:
+            _multi_agent_enabled = getattr(self.config.multi_agent, 'enable', False)
+            multi_agent_cfg = self.config.multi_agent
+        elif hasattr(self.config, '_parent') and self.config._parent is not None:
+            parent = self.config._parent
+            if hasattr(parent, 'multi_agent') and parent.multi_agent is not None:
+                _multi_agent_enabled = getattr(parent.multi_agent, 'enable', False)
+                multi_agent_cfg = parent.multi_agent
+        sys.stderr.write(f"[DEBUG1] self.config has multi_agent: {hasattr(self.config, 'multi_agent')}, _multi_agent_enabled: {_multi_agent_enabled}\n")
+        sys.stderr.flush()
         if _multi_agent_enabled:
             from peft import get_peft_model, LoraConfig as PeftLoraConfig
 
-            lora_cfg = self.config.multi_agent.lora
+            lora_cfg = multi_agent_cfg.lora
             peft_config = PeftLoraConfig(
                 r=lora_cfg.rank,
                 lora_alpha=lora_cfg.alpha,
@@ -246,7 +259,35 @@ class ActorRolloutRefWorker(Worker):
             actor_module = get_peft_model(actor_module, peft_config, adapter_name="planner")
             actor_module.add_adapter("executor", peft_config)
             actor_module.add_adapter("writer", peft_config)
+            # Convert LoRA parameters to match base model dtype (LoRA defaults to float32)
+            base_dtype = actor_module.dtype
+            for name, param in actor_module.named_parameters():
+                if param.dtype != base_dtype:
+                    param.data = param.data.to(base_dtype)
+            # IMMEDIATELY check params after PEFT
+            params_after_peft = dict(actor_module.named_parameters())
+            lora_keys = [k for k in params_after_peft.keys() if 'lora' in k.lower()]
+            sys.stderr.write(f"[DEBUG_PEFT] After get_peft_model: total_params={len(params_after_peft)}, lora_keys={lora_keys[:10] if lora_keys else 'NONE'}\n")
+            sys.stderr.flush()
             log_gpu_memory_usage('After multi-agent LoRA init', logger=logger)
+
+            # Debug: print LoRA keys before FSDP wrapping - CHECKPOINT 1
+            import sys
+            all_params_before = dict(actor_module.named_parameters())
+            lora_keys_before = [k for k in all_params_before.keys() if 'lora_' in k.lower()]
+            sys.stderr.write(f"[CHECKPOINT1] Before FSDP: total={len(all_params_before)}, lora={lora_keys_before[:10] if lora_keys_before else 'NONE'}\n")
+            sys.stderr.flush()
+            # Also check PEFT's base_model structure
+            if hasattr(actor_module, 'base_model'):
+                base_params = dict(actor_module.base_model.named_parameters())
+                base_lora_keys = [k for k in base_params.keys() if 'lora_' in k.lower()]
+                sys.stderr.write(f"[CHECKPOINT2] base_model params: {len(base_params)}, lora_keys: {base_lora_keys[:5] if base_lora_keys else 'NONE'}\n")
+                sys.stderr.flush()
+                if hasattr(actor_module.base_model, 'adapters'):
+                    sys.stderr.write(f"[CHECKPOINT3] adapters: {list(actor_module.base_model.adapters.keys())}\n")
+                    sys.stderr.flush()
+            sys.stderr.write(f"[CHECKPOINT4] About to create FSDP\n")
+            sys.stderr.flush()
 
         # We wrap FSDP for rollout as well
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
@@ -281,7 +322,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module,
             cpu_offload=cpu_offload,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=True,  # Changed to True to preserve LoRA parameter structure
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3
@@ -289,6 +330,13 @@ class ActorRolloutRefWorker(Worker):
             sync_module_states=True,
             device_mesh=self.device_mesh,
             forward_prefetch=False)
+
+        # Debug: print LoRA keys after FSDP wrapping
+        all_params_after = dict(actor_module_fsdp.named_parameters())
+        lora_keys_after = [k for k in all_params_after.keys() if 'lora_' in k.lower()]
+        print(f"[DEBUG fsdp_workers] After FSDP wrap: total_params={len(all_params_after)}, lora_keys={lora_keys_after[:5] if lora_keys_after else 'NONE'}", flush=True)
+        # Print all param names to understand structure
+        print(f"[DEBUG fsdp_workers] All param names (first 30): {list(all_params_after.keys())[:30]}", flush=True)
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
 
@@ -339,11 +387,24 @@ class ActorRolloutRefWorker(Worker):
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
             log_gpu_memory_usage('Before building vllm rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
-            _multi_agent_enabled = hasattr(self.config, 'multi_agent') and getattr(self.config.multi_agent, 'enable', False)
+            # Check multi_agent config - it may be in parent config or at top level
+            _multi_agent_enabled = False
+            multi_agent_cfg = None
+            if 'multi_agent' in self.config and self.config.multi_agent is not None:
+                _multi_agent_enabled = getattr(self.config.multi_agent, 'enable', False)
+                multi_agent_cfg = self.config.multi_agent
+            # Also check parent config for multi_agent
+            elif hasattr(self.config, '_parent') and self.config._parent is not None:
+                parent = self.config._parent
+                if 'multi_agent' in parent and parent.multi_agent is not None:
+                    _multi_agent_enabled = getattr(parent.multi_agent, 'enable', False)
+                    multi_agent_cfg = parent.multi_agent
+            print(f"[DEBUG fsdp_workers] _multi_agent_enabled={_multi_agent_enabled}")
             lora_rollout_kwargs = {}
-            if _multi_agent_enabled:
+            if _multi_agent_enabled and multi_agent_cfg is not None:
                 lora_rollout_kwargs['enable_lora'] = True
-                lora_rollout_kwargs['max_lora_rank'] = self.config.multi_agent.lora.rank
+                lora_rollout_kwargs['max_lora_rank'] = multi_agent_cfg.lora.rank
+            print(f"[DEBUG fsdp_workers] lora_rollout_kwargs={lora_rollout_kwargs}")
 
             if vllm_mode == 'customized':
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
@@ -365,8 +426,8 @@ class ActorRolloutRefWorker(Worker):
                 self.config.rollout.load_format = 'dummy_hf'
 
             lora_config = None
-            if _multi_agent_enabled:
-                lora_cfg = self.config.multi_agent.lora
+            if _multi_agent_enabled and multi_agent_cfg is not None:
+                lora_cfg = multi_agent_cfg.lora
                 lora_config = {
                     'rank': lora_cfg.rank,
                     'alpha': lora_cfg.alpha,
@@ -377,7 +438,7 @@ class ActorRolloutRefWorker(Worker):
             rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
                                                                inference_engine=rollout.inference_engine,
                                                                model_config=self.actor_model_config,
-                                                               full_params='hf' in self.config.rollout.load_format,
+                                                               full_params=self.config.rollout.load_format == 'hf',
                                                                device_mesh=rollout_device_mesh,
                                                                lora_config=lora_config)
             log_gpu_memory_usage('After building sharding manager', logger=None)
