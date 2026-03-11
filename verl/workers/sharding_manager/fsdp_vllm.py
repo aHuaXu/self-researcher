@@ -81,33 +81,21 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
 
-        # Debug: print first few keys to understand the format
-        all_keys = list(params.keys())
-        sample_keys = all_keys[:10]
-        lora_keys = [k for k in all_keys if 'lora_' in k.lower()]
-        print(f"[DEBUG __enter__] Total keys: {len(all_keys)}, sample: {sample_keys}", flush=True)
-        print(f"[DEBUG __enter__] Lora keys: {lora_keys[:10] if lora_keys else 'NONE'}", flush=True)
-
-        # Also check if there are any keys with 'base_model' prefix
-        base_model_keys = [k for k in all_keys if 'base_model' in k]
-        print(f"[DEBUG __enter__] base_model keys: {base_model_keys[:5] if base_model_keys else 'NONE'}", flush=True)
-
         if self._lora_config is not None:
-            # Debug: check for lora keys in params
-            lora_keys = [k for k in params.keys() if 'lora_A' in k or 'lora_B' in k]
-            print(f"[DEBUG _save_lora_adapters] Found {len(lora_keys)} lora keys, e.g.: {lora_keys[:3] if lora_keys else 'NONE'}", flush=True)
             self._save_lora_adapters(params)
             params = self._filter_lora_keys(params)
             log_gpu_memory_usage('After LoRA filter/save in sharding manager', logger=logger)
-            filtered_keys = list(params.keys())[:5]
-            print(f"[DEBUG __enter__] after _filter_lora_keys: {filtered_keys}", flush=True)
 
         # Remap Qwen2 Q/K/V projection keys to vLLM's fused qkv_proj format
         # Only needed for dtensor load_format. For 'hf' load_format, vLLM's own
         # load_weights will handle q_proj/k_proj/v_proj -> qkv_proj replacement.
         load_format = 'hf' if self.full_params else 'dtensor'
         if load_format == 'dtensor':
-            params = self._remap_qwen2_keys_for_vllm(params)
+            # When LoRA is enabled, skip QKV remapping to keep separate q/k/v structure.
+            # This allows vLLM to load base model weights without remapping,
+            # which matches the LoRA adapter's separate q/k/v structure.
+            if self._lora_config is None:
+                params = self._remap_qwen2_keys_for_vllm(params)
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
@@ -159,23 +147,6 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)
 
-    def _strip_model_prefix(self, params: dict) -> dict:
-        """Strip 'model.' prefix from FSDP state_dict keys.
-
-        FSDP state_dict has:    model.layers.0.self_attn.q_proj.weight
-        vLLM HF load expects:  layers.0.self_attn.q_proj.weight
-
-        vLLM's Qwen2 load_weights internally maps q_proj/k_proj/v_proj -> qkv_proj.
-        """
-        remapped = OrderedDict()
-        for key, value in params.items():
-            if key.startswith('model.'):
-                new_key = key[len('model.'):]
-            else:
-                new_key = key
-            remapped[new_key] = value
-        return remapped
-
     def _remap_qwen2_keys_for_vllm(self, params: dict) -> dict:
         """Remap Qwen2 separate Q/K/V projection keys to vLLM's fused qkv_proj format.
 
@@ -202,8 +173,6 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 new_key = key.replace('.self_attn.v_proj.', '.self_attn.qkv_proj.')
             else:
                 new_key = key
-            if 'qkv_proj' in new_key and new_key != key:
-                print(f"[DEBUG _remap] {key} -> {new_key}", flush=True)
             remapped[new_key] = value
         return remapped
 
@@ -251,21 +220,24 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
                 adapter_weights = OrderedDict()
                 for key, value in params.items():
-                    # PEFT key format: base_model.model.model.layers.x.self_attn.q_proj.lora_A.planner.weight
-                    # We need to find lora_A.{adapter_name} or lora_B.{adapter_name} in the key
+                    # PEFT key format: _fsdp_wrapped_module.base_model.model.model.layers.x.self_attn.q_proj.lora_A.planner.weight
+                    # FSDP state_dict after use_orig_params=True: base_model.model.model.layers.x...lora_A.planner.weight
+                    # vLLM's parse_fine_tuned_lora_name requires lora_A/lora_B to be the second-to-last path component.
+                    # The adapter name (planner/executor/writer) is passed via LoRARequest.lora_adapter_name, not in the key.
+                    # So we strip the adapter name suffix: .lora_A.planner.weight -> .lora_A.weight
                     if f'.lora_A.{adapter_name}.' in key or f'.lora_B.{adapter_name}.' in key:
-                        # Convert key: strip adapter name from lora_A/lora_B
-                        # From: base_model.model.model.layers.0.self_attn.q_proj.lora_A.planner.weight
-                        # To:   base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight
                         new_key = key.replace(
-                            f'.{adapter_name}.weight', '.weight'
+                            f'.lora_A.{adapter_name}.weight', '.lora_A.weight'
+                        ).replace(
+                            f'.lora_B.{adapter_name}.weight', '.lora_B.weight'
                         )
-                        # Strip the outer "base_model.model." (PEFT uses only one level)
-                        # vLLM expects: base_model.model.layers.0.self_attn.q_proj.lora_A.weight
-                        if new_key.startswith('base_model.model.'):
-                            new_key = new_key[len('base_model.model.'):]
-                        # Re-add "base_model." prefix (vLLM PEFT adapter format)
-                        new_key = 'base_model.' + new_key
+                        # Strip _fsdp_wrapped_module. prefix if present
+                        if '_fsdp_wrapped_module.' in new_key:
+                            new_key = new_key.replace('_fsdp_wrapped_module.', '')
+                        # vLLM expects: base_model.model.layers.x.self_attn.q_proj.lora_A.weight
+                        # So we strip one "model." from the prefix
+                        if new_key.startswith('base_model.model.model.'):
+                            new_key = 'base_model.model.' + new_key[len('base_model.model.model.'):]
                         if hasattr(value, 'full_tensor'):
                             full_value = value.full_tensor()
                         else:

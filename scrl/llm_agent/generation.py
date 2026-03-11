@@ -396,7 +396,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
 
     def run_llm_loop(self, gen_batch: DataProto, global_steps: int, lora_adapter_name: str = None) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
-        node_rank = int(os.environ["PET_NODE_RANK"])
+        node_rank = int(os.environ.get("PET_NODE_RANK", 0))
         print(f"node {node_rank} gains {len(gen_batch.batch['input_ids'])} datas!",flush=True)
         query_contents = self.parse_question(gen_batch.batch['input_ids'])
         messages_list = []

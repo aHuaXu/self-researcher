@@ -148,6 +148,24 @@ def llama_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
             weight_loader(param, local_loaded_weight)
 
 
+def _resolve_param_name(params_dict: dict, name: str) -> str:
+    """Resolve a parameter name, handling vLLM LoRA base_layer wrapping.
+
+    When vLLM applies LoRA to a layer, it wraps it with BaseLayerWithLoRA
+    which renames e.g. qkv_proj.weight -> qkv_proj.base_layer.weight.
+    This helper tries the plain name first, then the base_layer variant.
+    Returns the resolved name if found, else None.
+    """
+    if name in params_dict:
+        return name
+    for orig_suffix, base_suffix in [(".weight", ".base_layer.weight"), (".bias", ".base_layer.bias")]:
+        if name.endswith(orig_suffix):
+            candidate = name[:-len(orig_suffix)] + base_suffix
+            if candidate in params_dict:
+                return candidate
+    return None
+
+
 def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> nn.Module:
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
@@ -171,37 +189,31 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
                 continue
             name = name.replace(weight_name, param_name)
             # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
+            if name.endswith(".bias") and _resolve_param_name(params_dict, name) is None:
                 continue
-            # If the fused param name doesn't exist, skip and let the else branch handle it
-            if name not in params_dict:
+            # Try plain name, then base_layer variant (for LoRA-wrapped layers)
+            actual_name = _resolve_param_name(params_dict, name)
+            if actual_name is None:
                 continue
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)
-            param = params_dict[name]
+            param = params_dict[actual_name]
             weight_loader = param.weight_loader
             weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)
             break
         else:
-            # Try multiple name formats for non-stacked params
-            lookup_name = name
-            # First check: if name is already in params_dict, use it directly
-            if lookup_name in params_dict:
-                pass  # keep lookup_name as name
-            elif lookup_name not in params_dict:
-                # Try stripping "model." prefix
-                if lookup_name.startswith("model."):
-                    lookup_name = lookup_name[len("model."):]  # layers.0.self_attn.o_proj.weight
-            if lookup_name not in params_dict and "model.layers." in name:
-                # Try stripping "model.layers.x." to get self_attn.o_proj.weight
+            # Try multiple name formats for non-stacked params.
+            # _resolve_param_name also handles LoRA base_layer wrapping:
+            #   e.g. o_proj.weight -> o_proj.base_layer.weight
+            lookup_name = _resolve_param_name(params_dict, name)
+            if lookup_name is None and name.startswith("model."):
+                # Try stripping "model." prefix (some vLLM model variants omit it)
+                stripped = name[len("model."):]
+                lookup_name = _resolve_param_name(params_dict, stripped)
+            if lookup_name is None and "model.layers." in name:
+                # Last resort: strip "model.layers.x." to get self_attn.o_proj.weight
                 parts = name.split(".")
-                lookup_name = ".".join(parts[3:])  # self_attn.o_proj.weight
-            if lookup_name not in params_dict:
-                # Last resort: use original name as-is
-                lookup_name = name
-            if lookup_name.endswith(".bias") and lookup_name not in params_dict:
-                continue
-            if lookup_name not in params_dict:
-                # Key not found, skip
+                lookup_name = _resolve_param_name(params_dict, ".".join(parts[3:]))
+            if lookup_name is None:
                 continue
             param = params_dict[lookup_name]
             local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)

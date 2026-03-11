@@ -971,7 +971,7 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         
         import os
-        node_rank = int(os.environ["PET_NODE_RANK"])
+        node_rank = int(os.environ.get("PET_NODE_RANK", 0))
         print(f"node {node_rank} in fit function!")
 
         gen_config = GenerationConfig(
@@ -1080,9 +1080,10 @@ class RayPPOTrainer(object):
                             rewards = multi_agent_reward(reward_data)
 
                         # --- Advantage computation + Update per agent ---
+                        todo_mapping = rollout_result['metadata'].get('todo_mapping', None)
                         for agent_name in ['planner', 'executor', 'writer']:
                             agent_output = rollout_result[agent_name]
-                            agent_rewards = rewards[agent_name]  # list[float]
+                            agent_rewards = rewards[agent_name]  # list[float], one per question
 
                             if not hasattr(agent_output, 'batch') or 'responses' not in agent_output.batch:
                                 print(f"[MultiAgent] Skipping {agent_name}: no response data", flush=True)
@@ -1092,6 +1093,11 @@ class RayPPOTrainer(object):
                             if batch_size == 0:
                                 print(f"[MultiAgent] Skipping {agent_name}: empty batch", flush=True)
                                 continue
+
+                            # Executor outputs one response per TODO, while rewards are per question.
+                            # Expand rewards using todo_mapping so len(agent_rewards) == batch_size.
+                            if agent_name == 'executor' and todo_mapping is not None:
+                                agent_rewards = [agent_rewards[todo_mapping[j]] for j in range(len(todo_mapping))]
 
                             resp_len = agent_output.batch['responses'].shape[1]
 
@@ -1117,7 +1123,11 @@ class RayPPOTrainer(object):
                             if index is None:
                                 index = torch.arange(batch_size)
                             elif not isinstance(index, torch.Tensor):
-                                index = torch.tensor(index, dtype=torch.long)
+                                # DataProto requires non_tensor_batch dtype=object; convert to int64 first
+                                if isinstance(index, np.ndarray) and index.dtype == object:
+                                    index = torch.tensor(index.astype(np.int64), dtype=torch.long)
+                                else:
+                                    index = torch.tensor(index, dtype=torch.long)
 
                             advantages, returns = compute_grpo_outcome_advantage(
                                 token_level_rewards=reward_tensor,
@@ -1137,6 +1147,14 @@ class RayPPOTrainer(object):
                                 with torch.no_grad():
                                     log_prob_output = self.actor_rollout_wg.compute_log_prob(agent_output)
                                 agent_output = agent_output.union(log_prob_output)
+
+                            # Compute ref_log_probs if KL loss is enabled
+                            if self.config.actor_rollout_ref.actor.use_kl_loss and \
+                                    hasattr(self, 'ref_policy_wg') and self.ref_policy_wg is not None:
+                                with _timer(f'ref_log_prob_{agent_name}', timing_raw):
+                                    with torch.no_grad():
+                                        ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(agent_output)
+                                agent_output = agent_output.union(ref_log_prob_output)
 
                             # Set meta_info required for the actor update
                             agent_output.meta_info['global_token_num'] = (
