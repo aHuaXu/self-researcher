@@ -1,192 +1,278 @@
 #!/usr/bin/env python3
 """
-Smoke test for export_fsdp_to_hf.py.
+Smoke tests for export_fsdp_to_hf.py.
 
-Creates a tiny synthetic FSDP checkpoint (using a 2-layer GPT2-like config),
-runs the export, then verifies:
-  1. model.safetensors exists in output_dir
-  2. The exported weights match the original weights (round-trip accuracy)
-  3. from_pretrained can load the output without error
-
-Run:
+Single GPU (default):
     python scripts/test_export_fsdp_to_hf.py
+
+Multi GPU (requires 2 free GPUs, must match world_size used for saving):
+    torchrun --nproc_per_node=2 scripts/test_export_fsdp_to_hf.py --mode multi_gpu
+
+Both modes:
+    1. Create a tiny synthetic model and simulate a training step (add noise).
+    2. Save a FSDP SHARDED_STATE_DICT checkpoint (each rank saves its own shard).
+    3. Reload via export logic (each rank loads its shard → FULL_STATE_DICT on rank 0).
+    4. Verify: exported weights == trained weights (not original weights).
 """
 
+import argparse
 import os
-import sys
+import shutil
 import tempfile
 import warnings
 
 import torch
 import torch.distributed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
-from torch.distributed.fsdp import ShardedStateDictConfig
+from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Config
 
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
+# ── Shared helpers ────────────────────────────────────────────────────
 
-def init_dist():
+def make_tiny_model():
+    """2-layer GPT2 model, ~648 KB — fast to init and save."""
+    cfg = GPT2Config(vocab_size=512, n_embd=64, n_layer=2, n_head=4, n_inner=128)
+    return AutoModelForCausalLM.from_config(cfg)
+
+
+def find_local_tokenizer():
+    candidates = [
+        '/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-0.5B-Instruct',
+        '/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-3B-Instruct',
+        os.path.expanduser('~/models/Qwen2.5-0.5B-Instruct'),
+    ]
+    for p in candidates:
+        if os.path.isdir(p):
+            return p
+    raise RuntimeError('No local tokenizer found. Checked:\n' + '\n'.join(candidates))
+
+
+def run_export_inline(model_fsdp, ckpt_dir, output_dir, tokenizer_path, rank, world_size):
+    """Core export logic, mirroring export_fsdp_to_hf.py main()."""
+    state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+
+    # Each rank loads its own shard (mirrors FSDPCheckpointManager.load_checkpoint)
+    ckpt_path = os.path.join(ckpt_dir, f'model_world_size_{world_size}_rank_{rank}.pt')
+    model_state_dict = torch.load(ckpt_path, map_location='cpu')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        with FSDP.state_dict_type(model_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg):
+            model_fsdp.load_state_dict(model_state_dict)
+    del model_state_dict
+
+    # Collect full state dict on rank 0
+    full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        with FSDP.state_dict_type(model_fsdp, StateDictType.FULL_STATE_DICT, full_cfg):
+            full_sd = model_fsdp.state_dict()
+
+    if rank == 0:
+        os.makedirs(output_dir, exist_ok=True)
+        # Build a clean (non-FSDP) model from config to avoid flat_param shape issues
+        # when loading into _fsdp_wrapped_module on multi-GPU (world_size > 1).
+        clean_model = AutoModelForCausalLM.from_config(model_fsdp._fsdp_wrapped_module.config)
+        clean_model.load_state_dict(full_sd)
+        clean_model.save_pretrained(output_dir, safe_serialization=True)
+        tok = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+        tok.save_pretrained(output_dir)
+
+    torch.distributed.barrier()
+
+
+def verify_output(output_dir, trained_sd):
+    """Run assertions on the exported directory. Called on rank 0 only."""
+    safetensors_path = os.path.join(output_dir, 'model.safetensors')
+    assert os.path.exists(safetensors_path), f'FAIL: model.safetensors not found'
+    print(f'  [PASS] model.safetensors exists ({os.path.getsize(safetensors_path) // 1024} KB)')
+
+    assert os.path.exists(os.path.join(output_dir, 'config.json')), 'FAIL: config.json not found'
+    print('  [PASS] config.json exists')
+
+    loaded = AutoModelForCausalLM.from_pretrained(output_dir)
+    exported_sd = loaded.state_dict()
+
+    max_diff_trained = max(
+        (exported_sd[k].cpu() - trained_sd[k]).abs().max().item() for k in trained_sd
+    )
+    assert max_diff_trained < 1e-5, f'FAIL: max diff vs trained = {max_diff_trained}'
+    print(f'  [PASS] Max weight diff vs trained : {max_diff_trained:.2e}  (should be ~0)')
+    print(f'  [PASS] from_pretrained reload successful')
+
+
+# ── Single GPU test ───────────────────────────────────────────────────
+
+def run_single_gpu_test(tokenizer_path):
     if not torch.distributed.is_initialized():
         os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
         os.environ.setdefault('MASTER_PORT', '29502')
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
         torch.distributed.init_process_group(backend=backend, world_size=1, rank=0)
 
-
-def make_tiny_model():
-    """Create a tiny GPT2 model for fast testing (< 1 MB)."""
-    cfg = GPT2Config(
-        vocab_size=512,
-        n_embd=64,
-        n_layer=2,
-        n_head=4,
-        n_inner=128,
-    )
-    return AutoModelForCausalLM.from_config(cfg)
-
-
-def save_fake_fsdp_checkpoint(model, ckpt_dir, tokenizer_dir):
-    """Wrap with FSDP and save a SHARDED_STATE_DICT checkpoint."""
+    rank, world_size = 0, 1
     device_id = 0 if torch.cuda.is_available() else None
-    model_fsdp = FSDP(model, device_id=device_id, use_orig_params=True, sync_module_states=True)
-
-    os.makedirs(ckpt_dir, exist_ok=True)
-    state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        with FSDP.state_dict_type(model_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg):
-            sd = model_fsdp.state_dict()
-    torch.save(sd, os.path.join(ckpt_dir, 'model_world_size_1_rank_0.pt'))
-
-    # Save config + tokenizer to huggingface/ subdir
-    hf_dir = os.path.join(ckpt_dir, 'huggingface')
-    os.makedirs(hf_dir, exist_ok=True)
-    model_fsdp._fsdp_wrapped_module.config.save_pretrained(hf_dir)
-
-    # Use GPT2 tokenizer as a stand-in
-    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
-    tok.save_pretrained(hf_dir)
-
-    return model_fsdp
-
-
-# ──────────────────────────────────────────────
-# Main test
-# ──────────────────────────────────────────────
-
-def find_local_tokenizer():
-    """Find a locally available tokenizer path (offline-friendly)."""
-    candidates = [
-        '/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-0.5B-Instruct',
-        '/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-3B-Instruct',
-        os.path.expanduser('~/models/Qwen2.5-0.5B-Instruct'),
-    ]
-    for path in candidates:
-        if os.path.isdir(path):
-            return path
-    raise RuntimeError(
-        'No local tokenizer found. Checked:\n' + '\n'.join(candidates)
-    )
-
-
-def run_test():
-    print('=' * 55)
-    print('Smoke test: export_fsdp_to_hf')
-    print('=' * 55)
-
-    init_dist()
-
-    tokenizer_path = find_local_tokenizer()
-    print(f'Using local tokenizer: {tokenizer_path}')
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ckpt_dir = os.path.join(tmpdir, 'actor')
         output_dir = os.path.join(tmpdir, 'exported_hf')
         base_model_dir = os.path.join(tmpdir, 'base_model')
 
-        # ── Step 1: create tiny model and save base HF copy ──────────
-        print('[1/4] Creating tiny model and saving base HF copy...')
+        # Create and save base model
+        torch.manual_seed(42)
         model = make_tiny_model()
         os.makedirs(base_model_dir, exist_ok=True)
         model.save_pretrained(base_model_dir)
         tok = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         tok.save_pretrained(base_model_dir)
 
-        # record original weights for comparison
-        original_sd = {k: v.clone().cpu() for k, v in model.state_dict().items()}
-
-        # ── Step 2: simulate a training step (mutate weights slightly) ──
-        print('[2/4] Simulating weight update (adding noise)...')
+        # Simulate training
+        torch.manual_seed(123)
         with torch.no_grad():
             for p in model.parameters():
                 p.add_(torch.randn_like(p) * 0.01)
         trained_sd = {k: v.clone().cpu() for k, v in model.state_dict().items()}
 
-        # ── Step 3: save FSDP checkpoint ────────────────────────────────
-        print('[3/4] Saving synthetic FSDP checkpoint...')
-        model_fsdp = save_fake_fsdp_checkpoint(model, ckpt_dir, tokenizer_path)
+        # FSDP wrap + save SHARDED checkpoint
+        model_fsdp = FSDP(model, device_id=device_id, use_orig_params=True, sync_module_states=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with FSDP.state_dict_type(model_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg):
+                sd = model_fsdp.state_dict()
+        torch.save(sd, os.path.join(ckpt_dir, f'model_world_size_{world_size}_rank_{rank}.pt'))
 
-        # ── Step 4: run export script logic inline ───────────────────────
-        print('[4/4] Running export...')
-        # Import and call the export logic directly
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from torch.distributed.fsdp import FullStateDictConfig
+        hf_dir = os.path.join(ckpt_dir, 'huggingface')
+        os.makedirs(hf_dir, exist_ok=True)
+        model_fsdp._fsdp_wrapped_module.config.save_pretrained(hf_dir)
 
-        full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model_fsdp, StateDictType.FULL_STATE_DICT, full_cfg):
-            full_sd = model_fsdp.state_dict()
+        # Export: build fresh FSDP model, load shard, dump to HF
+        torch.manual_seed(99)
+        export_model = make_tiny_model()
+        export_fsdp = FSDP(export_model, device_id=device_id, use_orig_params=True, sync_module_states=True)
+        run_export_inline(export_fsdp, ckpt_dir, output_dir, tokenizer_path, rank, world_size)
 
-        os.makedirs(output_dir, exist_ok=True)
-        unwrapped = model_fsdp._fsdp_wrapped_module
-        unwrapped.load_state_dict(full_sd)
-        unwrapped.save_pretrained(output_dir, safe_serialization=True)
-        tok.save_pretrained(output_dir)
+        verify_output(output_dir, trained_sd)
 
-        # ── Assertions ───────────────────────────────────────────────────
+
+# ── Multi GPU test ────────────────────────────────────────────────────
+
+def run_multi_gpu_test(tokenizer_path, dist_backend='gloo'):
+    """Must be launched via: torchrun --nproc_per_node=N test_export_fsdp_to_hf.py --mode multi_gpu
+
+    Uses gloo backend by default for portability (NCCL can hang on some servers
+    when testing on loopback; correctness does not depend on backend choice).
+    """
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend=dist_backend)
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    local_rank = int(os.environ.get('LOCAL_RANK', rank))
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device_id = local_rank
+    else:
+        device_id = None
+
+    # rank 0 creates tmpdir and broadcasts the path to all ranks
+    if rank == 0:
+        tmpdir = tempfile.mkdtemp(prefix='test_export_multi_')
+    else:
+        tmpdir = None
+    tmpdir_list = [tmpdir]
+    torch.distributed.broadcast_object_list(tmpdir_list, src=0)
+    tmpdir = tmpdir_list[0]
+
+    ckpt_dir = os.path.join(tmpdir, 'actor')
+    output_dir = os.path.join(tmpdir, 'exported_hf')
+
+    try:
+        # All ranks create the same model (fixed seed)
+        torch.manual_seed(42)
+        model = make_tiny_model()
+
+        # Record trained weights BEFORE FSDP (all ranks have full model here)
+        torch.manual_seed(123)
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(torch.randn_like(p) * 0.01)
+        trained_sd = {k: v.clone().cpu() for k, v in model.state_dict().items()}
+
+        # FSDP wrap + save each rank's shard
+        model_fsdp = FSDP(model, device_id=device_id, use_orig_params=True, sync_module_states=True)
+
+        if rank == 0:
+            os.makedirs(ckpt_dir, exist_ok=True)
+        torch.distributed.barrier()
+
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            with FSDP.state_dict_type(model_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg):
+                sd = model_fsdp.state_dict()
+        torch.save(sd, os.path.join(ckpt_dir, f'model_world_size_{world_size}_rank_{rank}.pt'))
+
+        if rank == 0:
+            hf_dir = os.path.join(ckpt_dir, 'huggingface')
+            os.makedirs(hf_dir, exist_ok=True)
+            model_fsdp._fsdp_wrapped_module.config.save_pretrained(hf_dir)
+
+        torch.distributed.barrier()
+
+        # Export: fresh FSDP model, each rank loads its shard
+        torch.manual_seed(0)  # different seed, weights will be overwritten by load
+        export_model = make_tiny_model()
+        export_fsdp = FSDP(export_model, device_id=device_id, use_orig_params=True, sync_module_states=True)
+        run_export_inline(export_fsdp, ckpt_dir, output_dir, tokenizer_path, rank, world_size)
+
+        if rank == 0:
+            verify_output(output_dir, trained_sd)
+
+    finally:
+        torch.distributed.barrier()
+        if rank == 0 and os.path.exists(tmpdir):
+            shutil.rmtree(tmpdir)
+
+    if rank == 0:
+        torch.distributed.destroy_process_group()
+
+
+# ── Entry point ───────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['single_gpu', 'multi_gpu'], default='single_gpu')
+    parser.add_argument('--dist_backend', default='gloo', choices=['gloo', 'nccl'],
+                        help='Distributed backend for multi_gpu mode (default: gloo)')
+    args = parser.parse_args()
+
+    tokenizer_path = find_local_tokenizer()
+
+    if args.mode == 'single_gpu':
+        print('=' * 55)
+        print('Smoke test: single GPU')
+        print('=' * 55)
+        print(f'Using local tokenizer: {tokenizer_path}')
+        run_single_gpu_test(tokenizer_path)
         print()
-        print('Verifying...')
+        print('All single-GPU checks passed.')
 
-        # 1. model.safetensors exists
-        safetensors_path = os.path.join(output_dir, 'model.safetensors')
-        assert os.path.exists(safetensors_path), \
-            f'FAIL: model.safetensors not found in {output_dir}'
-        print(f'  [PASS] model.safetensors exists ({os.path.getsize(safetensors_path) // 1024} KB)')
-
-        # 2. config.json exists
-        config_path = os.path.join(output_dir, 'config.json')
-        assert os.path.exists(config_path), 'FAIL: config.json not found'
-        print('  [PASS] config.json exists')
-
-        # 3. Exported weights match trained weights (not original)
-        loaded_model = AutoModelForCausalLM.from_pretrained(output_dir)
-        exported_sd = loaded_model.state_dict()
-
-        max_diff_from_trained = max(
-            (exported_sd[k].cpu() - trained_sd[k]).abs().max().item()
-            for k in trained_sd
-        )
-        max_diff_from_original = max(
-            (exported_sd[k].cpu() - original_sd[k]).abs().max().item()
-            for k in original_sd
-        )
-        print(f'  [PASS] Max weight diff vs trained  : {max_diff_from_trained:.2e}  (should be ~0)')
-        print(f'  [INFO] Max weight diff vs original : {max_diff_from_original:.2e}  (should be > 0)')
-        assert max_diff_from_trained < 1e-5, \
-            f'FAIL: exported weights differ from trained weights (max_diff={max_diff_from_trained})'
-        assert max_diff_from_original > 1e-6, \
-            'FAIL: exported weights are identical to original (noise was not preserved)'
-
-        # 4. from_pretrained works without error
-        reloaded = AutoModelForCausalLM.from_pretrained(output_dir)
-        assert reloaded is not None
-        print('  [PASS] from_pretrained reload successful')
-
-    print()
-    print('All checks passed.')
+    else:
+        rank = int(os.environ.get('RANK', 0))
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        if rank == 0:
+            print('=' * 55)
+            print(f'Smoke test: multi GPU  (world_size={world_size}, backend={args.dist_backend})')
+            print('=' * 55)
+            print(f'Using local tokenizer: {tokenizer_path}')
+        run_multi_gpu_test(tokenizer_path, dist_backend=args.dist_backend)
+        if int(os.environ.get('RANK', 0)) == 0:
+            print()
+            print('All multi-GPU checks passed.')
 
 
 if __name__ == '__main__':
-    run_test()
+    main()
