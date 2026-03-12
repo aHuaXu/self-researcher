@@ -1,4 +1,15 @@
 #!/bin/bash
+# Multi-agent LoRA GRPO training (Stage 2).
+#
+# To chain from Stage 1 (train_grpo.sh):
+#   1. Run Stage 1 training to completion.
+#   2. Export its FSDP checkpoint to HF format (single command, no GPU needed):
+#        python scripts/export_fsdp_to_hf.py \
+#          --ckpt_dir  ./ckpts/<project>/<exp>/global_step_<N>/actor \
+#          --base_model ./models/Qwen2.5-0.5B-Instruct \
+#          --output_dir ./ckpts/<project>/<exp>/exported_hf
+#   3. Set actor_rollout_ref.model.path below to the exported_hf directory.
+#
 set -euo pipefail
 
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
