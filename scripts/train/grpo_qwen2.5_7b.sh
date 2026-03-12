@@ -1,21 +1,21 @@
 #!/bin/bash
-# Stage 1: Single-agent GRPO training — Qwen3-7B-Instruct, 4 GPU (V100 32GB)
+# Stage 1: Single-agent GRPO training — Qwen2.5-7B-Instruct, 4 GPU (V100 32GB)
 # Goal: teach the model web_search tool-calling ability.
 #
 # Prerequisites:
-#   - Qwen3-7B-Instruct downloaded to ./models/Qwen3-7B-Instruct
+#   - Qwen2.5-7B-Instruct downloaded to ./models/Qwen2.5-7B-Instruct
 #   - online_search handler running (see CLAUDE.md)
 #
 # After training, export checkpoint for Stage 2:
 #   python scripts/export_fsdp_to_hf.py \
-#     --ckpt_dir  ./ckpts/deepresearcher/qwen3_7b_grpo/global_step_<N>/actor \
-#     --base_model ./models/Qwen3-7B-Instruct \
-#     --output_dir ./ckpts/deepresearcher/qwen3_7b_grpo/exported_hf
+#     --ckpt_dir  ./ckpts/deepresearcher/qwen2.5_7b_grpo/global_step_<N>/actor \
+#     --base_model ./models/Qwen2.5-7B-Instruct \
+#     --output_dir ./ckpts/deepresearcher/qwen2.5_7b_grpo/exported_hf
 #   # Multi-GPU export (must match training world_size=4):
 #   torchrun --nproc_per_node=4 scripts/export_fsdp_to_hf.py \
-#     --ckpt_dir  ./ckpts/deepresearcher/qwen3_7b_grpo/global_step_<N>/actor \
-#     --base_model ./models/Qwen3-7B-Instruct \
-#     --output_dir ./ckpts/deepresearcher/qwen3_7b_grpo/exported_hf
+#     --ckpt_dir  ./ckpts/deepresearcher/qwen2.5_7b_grpo/global_step_<N>/actor \
+#     --base_model ./models/Qwen2.5-7B-Instruct \
+#     --output_dir ./ckpts/deepresearcher/qwen2.5_7b_grpo/exported_hf
 set -euo pipefail
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
@@ -24,7 +24,7 @@ export PET_NODE_RANK=${PET_NODE_RANK:-0}
 export CUDA_VISIBLE_DEVICES=0,1,2,5
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export project_name="deepresearcher"
-export experiment_name="qwen3_7b_grpo"
+export experiment_name="qwen2.5_7b_grpo"
 
 BASE=/home/zjx/ahua_llm/self-researcher
 cd ${BASE}
@@ -38,7 +38,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.max_model_len=12240 \
     data.data_writing_file=${BASE}/signal/data.json \
     data.signal_writing_file=${BASE}/signal/signal.json \
-    actor_rollout_ref.model.path=${BASE}/models/Qwen3-7B-Instruct \
+    actor_rollout_ref.model.path=${BASE}/models/Qwen2.5-7B-Instruct \
     actor_rollout_ref.model.use_remove_padding=false \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
