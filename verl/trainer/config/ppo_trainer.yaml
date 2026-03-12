@@ -192,6 +192,7 @@ search_engine: rag
 multi_agent:
   enable: false
   base_model: GAIR/DeepResearcher-7b
+  lora_save_dir: ./tmp_lora_adapters
 
   lora:
     rank: 64

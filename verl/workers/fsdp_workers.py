@@ -432,7 +432,7 @@ class ActorRolloutRefWorker(Worker):
                     'rank': lora_cfg.rank,
                     'alpha': lora_cfg.alpha,
                     'adapter_names': ['planner', 'executor', 'writer'],
-                    'save_dir': './tmp_lora_adapters',
+                    'save_dir': multi_agent_cfg.get('lora_save_dir', './tmp_lora_adapters'),
                     'target_modules': list(lora_cfg.target_modules),
                 }
             rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
