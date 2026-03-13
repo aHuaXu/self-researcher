@@ -23,12 +23,9 @@ self-researcher/
 │   │   └── tensor_helper.py
 │   └── handler/                       # 搜索/浏览工具核心实现
 │       ├── __init__.py                # [新增]
-│       ├── handler.py                 # Handler 编排（文件 IPC / Flask API）
-│       ├── server_handler.py          # Flask 搜索服务
 │       ├── webpage.py                 # 数据类: WebPageInfo, SearchResultInfo, PageReadInfo
 │       ├── agent_action.py            # 数据类: ActionInfo, SubActionInfo
 │       ├── utils.py                   # LLM 调用 + tag 解析工具函数
-│       ├── config.yaml                # 搜索配置
 │       ├── reading_agent/             # ReadingAgent — 逐页 LLM 提取
 │       │   ├── __init__.py            # [新增]
 │       │   ├── reading_agent.py
@@ -77,9 +74,9 @@ self-researcher/
 
 ### 数据流
 
-**训练流程**（不变）：
+**训练流程**（当前实现）：
 ```
-vLLM → tool_call JSON → signal/data.json → handler.py → WebSearchAgent/ReadingAgent → 结果
+vLLM → tool_call JSON → generation.execute_predictions → research_agent.tools → WebSearchAgent/ReadingAgent → 结果
 ```
 
 **研究助手**（新增）：
@@ -91,9 +88,7 @@ Executor Agent → LangChain @tool → _state.py → WebSearchAgent/ReadingAgent
 
 ### 共享状态管理 (_state.py)
 
-`browse_webpage` 依赖 `web_search` 的结果（WebPageInfo 中的 browser 对象）。在原 handler 中由 `Handler.id_to_context` 管理。
-
-研究助手中由 `ToolState` 单例管理：
+`browse_webpage` 依赖 `web_search` 的结果（WebPageInfo 中的 browser 对象）。由 `ToolState` 单例管理上下文。
 ```python
 class ToolState:
     web_search_agent: WebSearchAgent
@@ -124,7 +119,7 @@ class ToolState:
 1. 新增 4 个 `__init__.py`（空文件）
 2. 14 个裸 import 改为绝对 import（如 `from utils import` → `from scrl.handler.utils import`）
 3. 已有的相对 import（`from .prompts import *`）不需改
-4. `handler.py` 和 `server_handler.py` 改用 `python -m scrl.handler.handler` 方式运行
+4. 训练与 `research_agent` 均通过进程内 `ToolState` 调用工具，不再依赖独立的 `handler` / `server_handler` 进程
 
 ---
 
@@ -134,7 +129,7 @@ class ToolState:
 1. 创建 4 个 `__init__.py`
 2. 修复 6 个文件的裸 import
 3. 安装依赖（smolagents, pathvalidate, mammoth 等）
-4. 验证 `from scrl.handler.handler import Handler` 可导入
+4. 验证 `from research_agent.graph import create_research_graph` 可导入
 
 ### Phase 2: 工具封装
 1. 创建 `research_agent/tools/_state.py`
@@ -154,22 +149,17 @@ class ToolState:
 
 ## 训练工具调用：从文件 IPC 改为直接调用
 
-### 旧流程（文件 IPC）
-```
-python -m scrl.handler.server_handler  # Flask :5000
-python -m scrl.handler.handler     # polling
+### 历史：文件 IPC（已废弃，仓库中无对应脚本）
 
-generation.py:
-  write data.json → signal.json=1 → sleep 10s 轮询 → 读结果
-```
+旧版曾通过独立进程与 JSON 文件协调搜索；当前代码已全部改为进程内调用。
 
 ### 新流程（直接调用）
 ```
-训练前只需初始化:
-  tool_state.initialize(config, client)
+首次工具调用: get_tool_state().ensure_initialized()
+  → research_agent.config.get_config()（仓库根 .env / 环境变量 SERPER_API_KEY 等）
 
-generation.py:
-  web_search.invoke({"query": [...]})  → 毫秒级返回
+generation.py execute_predictions:
+  web_search.invoke({"query": [...]})  → 同步返回
 ```
 
 ### 优势
@@ -188,7 +178,8 @@ generation.py:
 | 浏览工具 | scrl/handler/reading_agent/ | 同一份代码，LangChain @tool 封装 |
 | 工具参数 | generation.py:70-114 的 TOOLS | 完全一致 |
 | LLM 调用 | scrl/llm_agent/generation.py | 独立封装，复用相同的 LLM |
-| 编排 | handler.py (文件 IPC) | LangGraph (Planner→Executor→Writer) |
+| 编排（训练 rollout） | 独立 handler 进程（文件 IPC） | `generation.py` 内 `execute_predictions` + `ToolState` |
+| 编排（研究助手） | — | LangGraph (Planner→Executor→Writer) |
 
 ---
 

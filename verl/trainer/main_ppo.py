@@ -69,11 +69,14 @@ def main_task(config, compute_score=None):
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    use_ref_policy = config.actor_rollout_ref.actor.get('use_kl_loss', True)
+
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
+    if use_ref_policy:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -82,8 +85,9 @@ def main_task(config, compute_score=None):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if use_ref_policy:
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
@@ -116,13 +120,6 @@ def main_task(config, compute_score=None):
     val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
-
-    # node_rank = ray.util.get_node_rank()
-    node_rank = int(os.environ.get("PET_NODE_RANK", 0))
-    if node_rank == 0:
-        with open(config.data.signal_writing_file, 'w') as f:
-            json.dump({'signal': config.data.response_signal}, f, indent=4)
-        print("update signal file finish!")
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,

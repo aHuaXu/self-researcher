@@ -55,6 +55,7 @@ def create_research_graph():
         client = OpenAI(
             base_url=config.llm.base_url,
             api_key=config.llm.api_key,
+            timeout=config.llm.timeout,
         )
         tool_state = get_tool_state()
         tool_state.initialize(handler_config, client)

@@ -20,6 +20,16 @@ import os
 import warnings
 
 import torch
+# Enable expandable memory segments to prevent CUDA OOM from fragmented reserved
+# blocks. Must be set before the first CUDA allocation (before any model load
+# or distributed init). Ray workers may not inherit PYTORCH_CUDA_ALLOC_CONF
+# from the shell, so we also set it programmatically here.
+if not os.environ.get('PYTORCH_CUDA_ALLOC_CONF'):
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+try:
+    torch.cuda.memory._set_allocator_settings('expandable_segments:True')
+except Exception:
+    pass
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
 import verl.utils.torch_functional as verl_F
@@ -346,7 +356,8 @@ class ActorRolloutRefWorker(Worker):
             actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
                                           lr=optim_config.lr,
                                           betas=optim_config.get('betas', (0.9, 0.999)),
-                                          weight_decay=optim_config.get('weight_decay', 1e-2))
+                                          weight_decay=optim_config.get('weight_decay', 1e-2),
+                                          foreach=False)
 
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
@@ -525,8 +536,18 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        # Inject JIT optimizer load/offload callbacks so dp_actor._optimizer_step can
+        # load optimizer states from CPU only for the optimizer.step() call, keeping
+        # them off-GPU during the expensive forward+backward pass (~14 GB savings).
         if self._is_offload_optimizer:
-            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+            _device_id = torch.cuda.current_device()
+            self.actor._optimizer_load_fn = lambda: load_fsdp_optimizer(
+                optimizer=self.actor_optimizer, device_id=_device_id)
+            self.actor._optimizer_offload_fn = lambda: offload_fsdp_optimizer(
+                optimizer=self.actor_optimizer)
+        else:
+            self.actor._optimizer_load_fn = None
+            self.actor._optimizer_offload_fn = None
 
         data.batch = data.batch.cuda()
 

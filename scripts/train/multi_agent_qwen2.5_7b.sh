@@ -10,6 +10,7 @@
 #         --output_dir ./ckpts/deepresearcher/qwen2.5_7b_grpo/exported_hf
 #   - Set STAGE1_EXPORT_PATH below to the exported_hf directory
 #   - online_search handler running (see CLAUDE.md)
+#   - Repo-root .env: JUDGE_API_KEY (MiniMax) or LLM_API_KEY as fallback — passed to Hydra below
 set -euo pipefail
 
 # ── Fill in after Stage 1 export ──────────────────────────────────────
@@ -27,6 +28,15 @@ export experiment_name="multi_agent_lora_qwen2.5_7b"
 BASE=/home/zjx/ahua_llm/self-researcher
 cd ${BASE}
 
+# Load repo-root .env (MiniMax JUDGE_API_KEY / LLM_*)
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+export JUDGE_API_KEY="${JUDGE_API_KEY:-${LLM_API_KEY:-}}"
+
 # Clean up any stale Ray cluster to avoid placement group naming conflicts
 ray stop --force 2>/dev/null || true
 sleep 3
@@ -39,8 +49,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
     +data.max_model_len=2560 \
-    data.data_writing_file=${BASE}/signal/data.json \
-    data.signal_writing_file=${BASE}/signal/signal.json \
     actor_rollout_ref.model.path=${STAGE1_EXPORT_PATH} \
     actor_rollout_ref.model.use_remove_padding=false \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -80,7 +88,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     multi_agent.lora.alpha=128 \
     multi_agent.reward.judge_model="MiniMax-M2.7" \
     multi_agent.reward.judge_base_url="https://api.minimaxi.com/v1" \
-    multi_agent.reward.judge_api_key="sk-cp-ls65iNzF3RxCUXDv0HpObet6FyczQAQYIEyJA-W7mPuqqMQ9qLeD-x6CL-9UcqOC6AhZ8u-m1W7qKEqxEjUHbgZT6imI2pQW-vHQGDGS5DaKyllhVfIUGpM" \
+    multi_agent.reward.judge_api_key="${JUDGE_API_KEY}" \
     multi_agent.reward.judge_max_concurrent=10 \
     multi_agent.reward.alpha=0.2 \
     multi_agent.reward.beta=0.3 \

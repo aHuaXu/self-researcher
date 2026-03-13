@@ -1,5 +1,6 @@
 """Shared state between web_search and browse_webpage tools."""
 
+import os
 from typing import Dict, Optional
 
 from openai import OpenAI
@@ -12,8 +13,7 @@ from scrl.handler.agent_action import ActionInfo
 class ToolState:
     """Mutable state shared between search and browse tools.
 
-    browse_webpage needs WebPageInfo objects created during web_search,
-    mirroring Handler.id_to_context in scrl/handler/handler.py.
+    browse_webpage needs WebPageInfo objects created during web_search.
     """
 
     def __init__(self):
@@ -37,6 +37,10 @@ class ToolState:
             from research_agent.config import get_config
 
             config = get_config()
+            # timeout 在较新的 LLMConfig 上；旧代码或未同步的 config 用默认
+            llm_timeout = getattr(config.llm, "timeout", None)
+            if llm_timeout is None:
+                llm_timeout = float(os.getenv("LLM_TIMEOUT_SEC", "120"))
             handler_config = {
                 "search_engine": config.search.engine,
                 "serper_api_key": config.search.serper_api_key,
@@ -52,7 +56,9 @@ class ToolState:
             }
             client = OpenAI(
                 base_url=config.llm.base_url,
-                api_key=config.llm.api_key
+                api_key=config.llm.api_key,
+                timeout=llm_timeout,
+                max_retries=3,
             )
             self.initialize(handler_config, client)
 

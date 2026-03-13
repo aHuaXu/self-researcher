@@ -86,17 +86,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             params = self._filter_lora_keys(params)
             log_gpu_memory_usage('After LoRA filter/save in sharding manager', logger=logger)
 
-        # Remap Qwen2 Q/K/V projection keys to vLLM's fused qkv_proj format
-        # Only needed for dtensor load_format. For 'hf' load_format, vLLM's own
-        # load_weights will handle q_proj/k_proj/v_proj -> qkv_proj replacement.
+        # For dtensor load_format, qwen2_dtensor_weight_loader handles the
+        # q_proj/k_proj/v_proj -> qkv_proj fusion internally via stacked_params_mapping.
+        # Do NOT pre-remap keys here: Python dict semantics would keep only the last
+        # assignment (v_proj) under the shared "qkv_proj" key, discarding q/k, and
+        # the loader's `if "qkv_proj" in name: continue` would skip it anyway.
         load_format = 'hf' if self.full_params else 'dtensor'
-        if load_format == 'dtensor':
-            # When LoRA is enabled, skip QKV remapping to keep separate q/k/v structure.
-            # This allows vLLM to load base model weights without remapping,
-            # which matches the LoRA adapter's separate q/k/v structure.
-            if self._lora_config is None:
-                params = self._remap_qwen2_keys_for_vllm(params)
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
+            # Re-initialise KV cache if it was freed in the previous __exit__.
+            self.inference_engine.init_cache_engine()
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
             self.inference_engine.wake_up()
@@ -129,6 +127,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # TODO(ZSL): check this
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.offload_model_weights()
+            # Free KV cache so the GPU memory is available for FSDP actor update
+            # (optimizer states, gradients). It will be re-initialised in __enter__
+            # via _init_cache_engine() before the next rollout.
+            self.inference_engine.free_cache_engine()
         else:
             self.inference_engine.sleep(level=1)
         log_gpu_memory_usage('After vllm offload in sharding manager', logger=logger)

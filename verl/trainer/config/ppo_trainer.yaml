@@ -12,11 +12,6 @@ data:
   shuffle: True
   image_key: images
   n_gpus_per_node: 8
-  data_writing_file: ./signal/data.json
-  signal_writing_file: ./signal/signal.json
-  response_signal: 0
-  query_signal: 1
-
 actor_rollout_ref:
   hybrid_engine: True
   model:

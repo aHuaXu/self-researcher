@@ -44,6 +44,14 @@ class LoadFormat(str, enum.Enum):
 class ModelConfig(ModelConfig):
 
     def __init__(self, hf_config: PretrainedConfig, *args, **kwargs) -> None:
+        # vLLM 0.6.3 doesn't handle rope_type="default" (Qwen2.5 uses this to
+        # mean standard RoPE + custom theta, i.e. no scaling).  Strip it so
+        # vLLM falls back to its own plain RotaryEmbedding path.
+        rope_scaling = getattr(hf_config, "rope_scaling", None)
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type", "")
+            if rope_type == "default":
+                hf_config.rope_scaling = None
         super().__init__(model=hf_config._name_or_path, tokenizer=hf_config._name_or_path, *args, **kwargs)
         self.hf_config = hf_config
 

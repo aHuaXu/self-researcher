@@ -31,7 +31,7 @@ def web_search(query: List[str]) -> str:
 
     search_query_list = query[:3]
 
-    # Step 1: Call Serper API for each query, with caching (mirrors handler.py:60-91)
+    # Step 1: Call Serper API for each query, with caching
     for sq in search_query_list:
         if sq in state.api_result_dict and len(state.api_result_dict[sq].get('organic', [])) > 0 \
                 and (time.time() - state.api_result_dict[sq]['timestamp'] <= 60 * 60 * 24 * 7):
@@ -43,14 +43,14 @@ def web_search(query: List[str]) -> str:
             "organic": organic,
         }
 
-    # Step 2: Build WebPageInfo lists (mirrors web_search_agent.py:search_web)
+    # Step 2: Build WebPageInfo lists
     web_page_info_list_batch = state.web_search_agent.search_web_batch(
         user_query=state.current_question,
         search_query_list=search_query_list,
         api_result_dict=state.api_result_dict,
     )
 
-    # Step 3: Wrap into SearchResultInfo + ActionInfo (mirrors handler.py:287-299)
+    # Step 3: Wrap into SearchResultInfo + ActionInfo
     search_result_info_list = [
         SearchResultInfo(
             search_query=search_query_list[j],
@@ -66,7 +66,7 @@ def web_search(query: List[str]) -> str:
         search_result_info_list=search_result_info_list,
     )
 
-    # Step 4: Format output (mirrors handler.py:300-315)
+    # Step 4: Format output
     content = []
     for search_result_info in search_result_info_list:
         ret_web_page_info_list = []
