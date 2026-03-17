@@ -50,6 +50,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.model_config = model_config
         self.device_mesh = device_mesh
         self._lora_config = lora_config
+        self._cpu_weight_backup = None
+        try:
+            self._use_sleep_mode = inference_engine.llm_engine.vllm_config.model_config.enable_sleep_mode
+        except AttributeError:
+            self._use_sleep_mode = False
 
         # Full params
         self.full_params = full_params
@@ -76,7 +81,19 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             self.gen_random_states = None
 
+    def _log_physical_mem(self, label: str):
+        """Log actual GPU physical memory (nvidia-smi level), not just PyTorch tracked."""
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        pt_alloc = torch.cuda.memory_allocated()
+        pt_reserved = torch.cuda.memory_reserved()
+        logger.warning(
+            f"[GPU MEM] {label}: physical_used={used/1e9:.2f}GiB, "
+            f"physical_free={free/1e9:.2f}GiB, "
+            f"pt_alloc={pt_alloc/1e9:.2f}GiB, pt_reserved={pt_reserved/1e9:.2f}GiB")
+
     def __enter__(self):
+        self._log_physical_mem('Before __enter__ (before wake_up)')
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
@@ -86,25 +103,24 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             params = self._filter_lora_keys(params)
             log_gpu_memory_usage('After LoRA filter/save in sharding manager', logger=logger)
 
-        # For dtensor load_format, qwen2_dtensor_weight_loader handles the
-        # q_proj/k_proj/v_proj -> qkv_proj fusion internally via stacked_params_mapping.
-        # Do NOT pre-remap keys here: Python dict semantics would keep only the last
-        # assignment (v_proj) under the shared "qkv_proj" key, discarding q/k, and
-        # the loader's `if "qkv_proj" in name: continue` would skip it anyway.
         load_format = 'hf' if self.full_params else 'dtensor'
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-            # Re-initialise KV cache if it was freed in the previous __exit__.
             self.inference_engine.init_cache_engine()
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
-            self.inference_engine.wake_up()
-            # TODO(ZSL): deal with 'hf' format
+            if self._use_sleep_mode:
+                self.inference_engine.wake_up()
+                self._log_physical_mem('After wake_up()')
+            else:
+                self._restore_kv_cache()
+                self._log_physical_mem('After _restore_kv_cache()')
             if load_format == 'dtensor':
                 from verl.third_party.vllm import load_dtensor_weights
                 load_dtensor_weights(
                     params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
             else:
                 raise NotImplementedError(f'load_format {load_format} not implemented')
+        self._log_physical_mem('After sync model weights')
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
         del params
@@ -122,29 +138,80 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.torch_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.gen_random_states)
 
+    def _get_vllm_model(self):
+        return self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+
+
+    def _get_vllm_worker(self):
+        return self.inference_engine.llm_engine.model_executor.driver_worker.worker
+
+    def _offload_vllm_weights_to_cpu(self):
+        """Manually offload vLLM model weights to CPU (like old vLLM 0.6.3)."""
+        model = self._get_vllm_model()
+        if self._cpu_weight_backup is None:
+            self._cpu_weight_backup = {}
+            for name, param in model.named_parameters():
+                self._cpu_weight_backup[name] = torch.empty_like(param, device='cpu')
+                param.data = self._cpu_weight_backup[name]
+        else:
+            for name, param in model.named_parameters():
+                param.data = self._cpu_weight_backup[name]
+
+    def _free_kv_cache(self):
+        """Free the KV cache GPU memory when sleep mode is disabled.
+        
+        Must also clear kv_cache references stored in static_forward_context
+        by bind_kv_cache(), otherwise tensors remain referenced and GC can't free them.
+        """
+        worker = self._get_vllm_worker()
+        # Clear kv_cache references stored in each attention layer's forward context
+        model_runner = worker.model_runner
+        if hasattr(model_runner, 'vllm_config') and model_runner.vllm_config is not None:
+            ctx = model_runner.vllm_config.compilation_config.static_forward_context
+            for layer_name in list(ctx.keys()):
+                forward_ctx = ctx[layer_name]
+                if hasattr(forward_ctx, 'kv_cache'):
+                    for i in range(len(forward_ctx.kv_cache)):
+                        forward_ctx.kv_cache[i] = None
+        if hasattr(worker, 'gpu_cache') and worker.gpu_cache is not None:
+            del worker.gpu_cache
+            worker.gpu_cache = None
+        if hasattr(worker, 'cache_engine') and worker.cache_engine is not None:
+            del worker.cache_engine
+            worker.cache_engine = None
+
+    def _restore_kv_cache(self):
+        """Re-initialize KV cache after it was freed, and re-bind to attention layers."""
+        worker = self._get_vllm_worker()
+        if worker.gpu_cache is None:
+            worker._init_cache_engine()
+            # Re-bind kv_cache to attention layers (reverses what _free_kv_cache cleared)
+            from vllm.utils import bind_kv_cache
+            model_runner = worker.model_runner
+            bind_kv_cache(
+                model_runner.vllm_config.compilation_config.static_forward_context,
+                worker.gpu_cache)
+
     def __exit__(self, exc_type, exc_value, traceback):
+        self._log_physical_mem('Before __exit__ (before sleep/offload)')
         log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
-        # TODO(ZSL): check this
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.offload_model_weights()
-            # Free KV cache so the GPU memory is available for FSDP actor update
-            # (optimizer states, gradients). It will be re-initialised in __enter__
-            # via _init_cache_engine() before the next rollout.
             self.inference_engine.free_cache_engine()
-        else:
+        elif self._use_sleep_mode:
             self.inference_engine.sleep(level=1)
+        else:
+            self._offload_vllm_weights_to_cpu()
+            self._free_kv_cache()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._log_physical_mem('After __exit__ (after sleep/offload + empty_cache)')
         log_gpu_memory_usage('After vllm offload in sharding manager', logger=logger)
 
-        # self.module.to('cuda')
-        # if torch.distributed.get_rank() == 0:
-        #     print(f'after actor module to cuda in sharding manager memory allocated: {torch.cuda.memory_allocated() / 1e9}GB, reserved: {torch.cuda.memory_reserved() / 1e9}GB')
-
         self.module.train()
-
-        # add empty cache after each compute
         torch.cuda.empty_cache()
 
-        # restore random states
         if self.device_mesh is not None:
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)

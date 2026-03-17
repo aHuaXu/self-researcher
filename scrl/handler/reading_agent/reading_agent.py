@@ -33,6 +33,7 @@ class ReadingAgent:
             cur_webpage.browser = web_search_agent.scrape_and_check_valid_api(cur_webpage.url)
             if cur_webpage.browser is None:
                 cur_webpage.browser = "error"
+                print(f"read_page scrape_fail: {cur_webpage.url[:80]}", flush=True)
                 return cur_webpage
         context_so_far_prefix = ""
         for webpage in context:
@@ -44,7 +45,12 @@ class ReadingAgent:
 
         cur_useful_info = ""
         total_pages = len(cur_webpage.browser.viewport_pages)
-        while cur_webpage.browser.viewport_current_page < total_pages:
+        max_pages = int(os.getenv("READ_PAGE_MAX_PAGES", "3"))
+        _url_short = cur_webpage.url[:60]
+        print(f"read_page start: {_url_short} ({total_pages} pages)", flush=True)
+        _page_t0 = time.time()
+        pages_processed = 0
+        while cur_webpage.browser.viewport_current_page < total_pages and pages_processed < max_pages:
             context_so_far = ""
             if cur_useful_info:
                 context_so_far = context_so_far_prefix + f"<sub_question>{sub_question}</sub_question>\n<useful_info>{cur_useful_info}</useful_info>"
@@ -95,10 +101,13 @@ class ReadingAgent:
                 )
                 cur_useful_info += extracted_info + "\n\n"
 
+            pages_processed += 1
             if page_down:
                 cur_webpage.browser.page_down()
             else:
                 break
+        _elapsed = time.time() - _page_t0
+        print(f"read_page done: {_url_short} ({len(cur_webpage.page_read_info_list)} extracts, {_elapsed:.1f}s)", flush=True)
         return cur_webpage
 
     def read_batch(

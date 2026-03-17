@@ -291,6 +291,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
+                micro_batches = list(micro_batches)
+                # Help diagnose slow actor updates by exposing micro-batch split shape.
+                mini_batch_size = mini_batch.batch.batch_size[0] if isinstance(mini_batch, DataProto) else len(mini_batch)
+                micro_batch_sizes = [mb.batch.batch_size[0] if isinstance(mb, DataProto) else len(mb) for mb in micro_batches]
                 self.actor_optimizer.zero_grad()
 
                 for data in micro_batches:
@@ -355,7 +359,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 data = {'actor/grad_norm': grad_norm.detach().item()}
-                print(f"batch {batch_idx} use {time.time()-start_time} s!")
+                print(f"batch {batch_idx} use {time.time()-start_time} s! "
+                      f"(mini_size={mini_batch_size}, micro_count={len(micro_batches)}, "
+                      f"micro_sizes={micro_batch_sizes})")
             append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         return metrics

@@ -626,6 +626,7 @@ class RayPPOTrainer(object):
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             num_gpus=self.config.trainer.n_gpus_per_node,
+            max_seq_len_for_training=self.config.get('max_seq_len_for_training', 7000),
             model_name=self.config.actor_rollout_ref.model.path,
             n=1, # 只roll一次
             project_name=self.config.trainer.project_name,
@@ -973,6 +974,7 @@ class RayPPOTrainer(object):
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             num_gpus=self.config.trainer.n_gpus_per_node,
+            max_seq_len_for_training=self.config.get('max_seq_len_for_training', 7000),
             model_name=self.config.actor_rollout_ref.model.path,
             n=self.config.agent_grpo.n,
             project_name=self.config.trainer.project_name,

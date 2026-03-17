@@ -178,6 +178,9 @@ trainer:
 
 
 max_turns: 6
+# Training-side final sequence clamp applied in scrl/llm_agent/generation.py
+# (after rollout generation, before PPO actor/critic update).
+max_seq_len_for_training: 7000
 do_search: true
 agent_grpo:
   n: 2

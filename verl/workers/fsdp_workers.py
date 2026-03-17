@@ -219,10 +219,18 @@ class ActorRolloutRefWorker(Worker):
             else:
                 actor_module_class = AutoModelForCausalLM
 
+            # Ulysses + remove-padding is validated in verl tests with flash_attention_2.
+            # Using sdpa here can blow up memory on long gathered sequences in compute_log_prob.
+            attn_implementation = 'sdpa'
+            if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+                attn_implementation = 'flash_attention_2'
+                if self.rank == 0:
+                    print('Use attn_implementation=flash_attention_2 for Ulysses + remove-padding')
+
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
-                                                              attn_implementation='sdpa',
+                                                              attn_implementation=attn_implementation,
                                                               trust_remote_code=trust_remote_code)
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -642,9 +650,15 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('Before load_fsdp in compute_log_prob', logger=None)
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        log_gpu_memory_usage('After load_fsdp in compute_log_prob', logger=None)
         data = data.to('cuda')
+        log_gpu_memory_usage('After data.to(cuda) in compute_log_prob', logger=None)
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
