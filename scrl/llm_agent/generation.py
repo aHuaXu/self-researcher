@@ -497,6 +497,12 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                     activate_list_copy.append(activate_list[i])
                     tool_call_list.append((activate_list[i], messages_list[activate_list[i]][1]["content"], results[i][1], results[i][2]))
                     
+            if step == self.config.max_turns - 1:
+                print(f"node {node_rank}, turn {step} tool_call_list {len(tool_call_list)} datas")
+                print(f"第{step}轮(最后一轮)结束，跳过工具执行，{len(tool_call_list)}条样本未返回answer")
+                activate_list = activate_list_copy
+                break
+
             tool_call_list = self.execute_predictions(tool_call_list,len(messages_list))
             print(f"node {node_rank}, turn {step} tool_call_list {len(tool_call_list)} datas")
             tool_content_max_chars = int(os.getenv("TOOL_CONTENT_MAX_CHARS", "3000"))
