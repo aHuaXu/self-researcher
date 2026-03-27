@@ -42,21 +42,78 @@ Context so far:
 
 Please continue your research."""
 
+EXECUTOR_USER_PROMPT_WITH_FINDINGS = """Research Question: {question}
 
-def get_executor_prompt(question: str, context: str = "") -> list[dict]:
-    """Get the executor prompt messages."""
+## Prior Research Findings
+The following findings from earlier sub-questions are relevant to your task:
+{prior_findings}
+
+Context so far:
+{context}
+
+Use the prior findings as background knowledge. Continue your research to answer the question above."""
+
+
+def get_executor_prompt(
+    question: str,
+    context: str = "",
+    prior_findings: str = "",
+) -> list[dict]:
+    """Build executor prompt messages.
+
+    Args:
+        question: The sub-question to research.
+        context: Conversation context from previous turns (tool call history).
+        prior_findings: Formatted findings from dependency sub-questions.
+            Empty string means this is an INDEPENDENT task with no prior context.
+            Non-empty means this task DEPENDS on prior results.
+
+    Returns:
+        List of chat messages (system + user).
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     system_prompt = EXECUTOR_SYSTEM_PROMPT.format(today=today)
 
-    if context:
-        user_prompt = EXECUTOR_USER_PROMPT.format(question=question, context=context)
+    if not context:
+        context = "[No research done yet]"
+
+    if prior_findings:
+        user_prompt = EXECUTOR_USER_PROMPT_WITH_FINDINGS.format(
+            question=question, context=context, prior_findings=prior_findings
+        )
     else:
-        user_prompt = EXECUTOR_USER_PROMPT.format(question=question, context="[No research done yet]")
+        user_prompt = EXECUTOR_USER_PROMPT.format(question=question, context=context)
 
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
+        {"role": "user", "content": user_prompt},
     ]
+
+
+def format_prior_findings(findings: dict[int, dict[str, str]]) -> str:
+    """Format dependency findings for injection into executor prompt.
+
+    Args:
+        findings: Dict mapping sub-question index to a dict with keys:
+            - "question": the sub-question text
+            - "answer": the finding/answer text
+            Example: {1: {"question": "What country was X born in?", "answer": "France"}}
+
+    Returns:
+        Formatted string for the prior_findings parameter.
+        Empty string if findings dict is empty.
+    """
+    if not findings:
+        return ""
+
+    blocks = []
+    for idx in sorted(findings.keys()):
+        entry = findings[idx]
+        blocks.append(
+            f"[Sub-question {idx}] {entry['question']}\n"
+            f"[Finding]: {entry['answer']}"
+        )
+    return "\n\n".join(blocks)
 
 
 # Tool definitions - exactly matching generation.py
