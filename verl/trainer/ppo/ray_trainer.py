@@ -1060,24 +1060,33 @@ class RayPPOTrainer(object):
 
                         # --- Multi-agent Reward ---
                         reward_data = DataProto()
-                        reward_data.non_tensor_batch = rollout_result['metadata']
-                        reward_data.non_tensor_batch['exec_max_turns'] = (
-                            self.config.multi_agent.agents.executor.max_turns
-                        )
-                        # Derive exec_actual_turns from executor trajectories
-                        exec_trajectories = rollout_result['metadata'].get('exec_trajectories', [])
-                        reward_data.non_tensor_batch['exec_actual_turns'] = [
-                            len(traj) for traj in exec_trajectories
-                        ]
+                        reward_data.non_tensor_batch = {
+                            'final_answers': rollout_result.final_answers,
+                            'golden_answers': [
+                                gen_batch.non_tensor_batch['reward_model'][i]['ground_truth']
+                                for i in range(len(rollout_result.queries))
+                            ],
+                            'plan_texts': rollout_result.plan_texts,
+                            'exec_trajectories': [[] for _ in rollout_result.queries],
+                            'exec_actual_turns': [0] * len(rollout_result.queries),
+                        }
 
                         with _timer('adv', timing_raw):
                             rewards = multi_agent_reward(reward_data)
 
                         # --- Advantage computation + Update per agent ---
-                        todo_mapping = rollout_result['metadata'].get('todo_mapping', None)
-                        for agent_name in ['planner', 'executor', 'writer']:
-                            agent_output = rollout_result[agent_name]
-                            agent_rewards = rewards[agent_name]  # list[float], one per question
+                        todo_mapping = rollout_result.todo_mapping
+                        agent_outputs = {
+                            'planner': rollout_result.planner_outputs,
+                            'executor': rollout_result.executor_outputs,
+                        }
+                        agent_rewards_map = {
+                            'planner': rewards.planner,
+                            'executor': rewards.executor,
+                        }
+                        for agent_name in ['planner', 'executor']:
+                            agent_output = agent_outputs[agent_name]
+                            agent_rewards = agent_rewards_map[agent_name]
 
                             if not hasattr(agent_output, 'batch') or 'responses' not in agent_output.batch:
                                 print(f"[MultiAgent] Skipping {agent_name}: no response data", flush=True)
