@@ -280,7 +280,6 @@ class ActorRolloutRefWorker(Worker):
             )
             actor_module = get_peft_model(actor_module, peft_config, adapter_name="planner")
             actor_module.add_adapter("executor", peft_config)
-            actor_module.add_adapter("writer", peft_config)
             # Convert LoRA parameters to match base model dtype (LoRA defaults to float32)
             base_dtype = actor_module.dtype
             for name, param in actor_module.named_parameters():
@@ -454,7 +453,7 @@ class ActorRolloutRefWorker(Worker):
                 lora_config = {
                     'rank': lora_cfg.rank,
                     'alpha': lora_cfg.alpha,
-                    'adapter_names': ['planner', 'executor', 'writer'],
+                    'adapter_names': ['planner', 'executor'],
                     'save_dir': multi_agent_cfg.get('lora_save_dir', './tmp_lora_adapters'),
                     'target_modules': list(lora_cfg.target_modules),
                 }

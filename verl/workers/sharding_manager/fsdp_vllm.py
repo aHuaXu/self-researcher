@@ -292,7 +292,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     # PEFT key format: _fsdp_wrapped_module.base_model.model.model.layers.x.self_attn.q_proj.lora_A.planner.weight
                     # FSDP state_dict after use_orig_params=True: base_model.model.model.layers.x...lora_A.planner.weight
                     # vLLM's parse_fine_tuned_lora_name requires lora_A/lora_B to be the second-to-last path component.
-                    # The adapter name (planner/executor/writer) is passed via LoRARequest.lora_adapter_name, not in the key.
+                    # The adapter name (planner/executor) is passed via LoRARequest.lora_adapter_name, not in the key.
                     # So we strip the adapter name suffix: .lora_A.planner.weight -> .lora_A.weight
                     if f'.lora_A.{adapter_name}.' in key or f'.lora_B.{adapter_name}.' in key:
                         new_key = key.replace(
