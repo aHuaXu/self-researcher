@@ -209,9 +209,6 @@ multi_agent:
       max_turns: 10
 
   reward:
-    judge_model: ""
-    judge_base_url: ""
-    judge_api_key: ""
-    judge_max_concurrent: 50
     alpha: 0.2
     beta: 0.3
+    max_turns: 10
