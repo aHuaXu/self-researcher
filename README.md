@@ -74,11 +74,84 @@ RL rollouts call `research_agent.tools` directly from `scrl/llm_agent/generation
 export SERPER_API_KEY=your_serper_key   # google.serper.dev
 export SEARCH_ENGINE=google             # or bing + AZURE_BING_KEY
 ```
-### Training model
+### Training Pipeline (Dual-Agent)
 
-Using the following command to train the model:
+The full training pipeline has 3 steps: single-agent warmup → model export → dual-agent training.
+
+#### Step 1: Prepare Data
+
+Download DeepResearch-9K and convert to training parquet (L1+L2 for phase 1, L2+L3 for phase 2):
+
 ```bash
- bash train_grpo.sh
+python scripts/prepare_deepresearch_data.py
+```
+
+Output:
+- `data/deepresearch_phase1.parquet` (L1+L2, ~2800 samples)
+- `data/deepresearch_phase1_val.parquet` (L1+L2, ~500 samples)
+- `data/deepresearch_phase2.parquet` (L2+L3)
+- `data/deepresearch_phase2_val.parquet` (L2+L3)
+
+#### Step 2: Phase 0 — Single-Agent GRPO (Warmup)
+
+Train the base model to use web_search / browse_webpage tools:
+
+```bash
+bash scripts/train/grpo_qwen3_4b.sh
+```
+
+- Data: L1+L2 (simple/medium QA)
+- Goal: learn tool-calling ability
+- Output: FSDP checkpoint at `ckpts/deepresearcher/qwen3_4b_grpo_ws4/global_step_N/actor/`
+
+#### Step 3: Export FSDP Checkpoint to HuggingFace Format
+
+The FSDP checkpoint is sharded across GPUs and cannot be directly used as a base model. Export it:
+
+```bash
+torchrun --nproc_per_node=4 scripts/export_fsdp_to_hf.py \
+    --ckpt_dir  ./ckpts/deepresearcher/qwen3_4b_grpo_ws4/global_step_N/actor \
+    --base_model ./models/Qwen3-4B-Instruct \
+    --output_dir ./models/Qwen3-4B-SingleAgent
+```
+
+#### Step 4: Phase 1 — Dual-Agent GRPO (Planner + Executor)
+
+Train the planner decomposition and executor search cooperation:
+
+```bash
+# Edit grpo_dual_agent.sh: set model.path to the exported model
+bash scripts/train/grpo_dual_agent.sh
+```
+
+- Base model: Phase 0 exported checkpoint (already knows how to search)
+- Data: L2+L3 (medium/hard multi-hop QA)
+- Architecture: 2 LoRA adapters (planner + executor) on shared base
+- Planner: decomposes question into 3-5 sub-tasks with dependency DAG
+- Executor: executes sub-tasks in topological wave order, injects prior findings
+- Reward: `α × rule_score + (1-α) × F1` per agent, GRPO advantage
+
+#### Architecture Diagram
+
+```
+Question
+    │
+    ▼ [Planner LoRA]
+<plan>
+1. [INDEPENDENT] Sub-question A
+2. [INDEPENDENT] Sub-question B
+3. [DEPENDS:1,2] Synthesize final answer
+</plan>
+    │
+    ▼ [Executor LoRA, Wave 0 — parallel]
+Task 1 → web_search → finding_1
+Task 2 → web_search → finding_2
+    │
+    ▼ [Executor LoRA, Wave 1 — with findings]
+Task 3 (context: finding_1 + finding_2) → <answer>Final Answer</answer>
+    │
+    ▼ [Reward]
+F1(final_answer, golden_answer) + rule_rewards → GRPO update
 ```
 
 ### Evaluate
