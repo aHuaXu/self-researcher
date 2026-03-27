@@ -64,7 +64,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if _force_full_params:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.FULL_STATE_DICT,
-                                     state_dict_config=FullStateDictConfig())
+                                     state_dict_config=FullStateDictConfig(
+                                         offload_to_cpu=True, rank0_only=True))
         else:
             FSDP.set_state_dict_type(self.module,
                                      state_dict_type=StateDictType.SHARDED_STATE_DICT,
@@ -99,6 +100,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
 
         if self._lora_config is not None:
+            from verl.utils.fsdp_utils import offload_fsdp_model_to_cpu
+            offload_fsdp_model_to_cpu(self.module)
+            log_gpu_memory_usage('After FSDP offload before vLLM sync', logger=logger)
             self._save_lora_adapters(params)
             params = self._filter_lora_keys(params)
             log_gpu_memory_usage('After LoRA filter/save in sharding manager', logger=logger)
@@ -116,8 +120,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 self._log_physical_mem('After _restore_kv_cache()')
             if load_format == 'dtensor':
                 from verl.third_party.vllm import load_dtensor_weights
-                load_dtensor_weights(
-                    params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
+                vllm_model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+                for param in vllm_model.parameters():
+                    if param.device.type == 'cpu':
+                        param.data = param.data.cuda()
+                load_dtensor_weights(params, vllm_model)
             else:
                 raise NotImplementedError(f'load_format {load_format} not implemented')
         self._log_physical_mem('After sync model weights')
@@ -151,7 +158,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self._cpu_weight_backup is None:
             self._cpu_weight_backup = {}
             for name, param in model.named_parameters():
-                self._cpu_weight_backup[name] = torch.empty_like(param, device='cpu')
+                self._cpu_weight_backup[name] = param.data.detach().cpu().clone()
                 param.data = self._cpu_weight_backup[name]
         else:
             for name, param in model.named_parameters():
@@ -324,6 +331,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     'bias': 'none',
                     'task_type': 'CAUSAL_LM',
                     'peft_type': 'LORA',
+                    'base_model_name_or_path': cfg.get('base_model', ''),
                 }
                 with open(os.path.join(adapter_dir, 'adapter_config.json'), 'w') as f:
                     json.dump(adapter_config, f, indent=2)

@@ -255,3 +255,62 @@ if total_search > 0 and relevant_count / total_search < 0.3:
 
 **面试建议表述：**
 > "训练早期遇到过模式坍缩——模型放弃搜索直接答题。根因是搜索能力弱时 F1 差距不大，GRPO 无法产生有效对比信号。我们加了 no-tool penalty(-0.3)，让'不搜'永远劣于'搜了'，有效打破了局部最优。至于 grounding faithfulness，目前靠数据难度和 rule reward 隐式保障。未来优化方向有两个：一是在 GRPO rule_reward 中加入搜索结果与答案的相关性指标；二是更激进地切到 PPO，在有效搜索位置给 per-step reward，同时解决 credit assignment 和 grounding 问题。"
+
+---
+
+## 7. 检索结果和模型参数知识冲突时，训练目标是什么？
+
+**核心立场：既不「永远信检索」，也不「永远信参数」，而是 outcome-driven —— 在必须调用工具的前提下，让最终答案对齐 golden answer。**
+
+### 我们实际在优化什么
+
+当前 reward 没有显式的 source reliability 或 conflict resolution 规则：
+
+```
+reward = F1(final_answer, golden_answer)   # 主信号，不关心答案来自参数还是检索
+       + no-tool penalty (-0.3)            # 强制「搜过」，解决的是「搜不搜」而非「信谁」
+       + rule_e（搜索非空 / browse / 轮次效率）  # 过程质量，不评估来源可信度
+```
+
+冲突怎么解，reward 里没写死；**谁跟 golden answer 一致，谁的 trajectory 在 GRPO group 里拿高 advantage**。
+
+### 为什么现阶段还能 work
+
+- **数据分布**：L2+L3 multi-hop 上参数知识往往不够，模型自然学会多轮 search + browse
+- **架构辅助**：Dual-Agent 把问题拆成子任务，Executor 跨 wave 注入 findings，比单轮 RAG 更像多源综合
+- **行为涌现**：多轮 RL 后模型会自发 cross-check、换 query 再搜（DeepResearcher 观察到的 emergent behavior），但这是隐式学到的，不是 reward 显式约束
+
+### 当前方案的局限
+
+| 局限 | 说明 |
+|------|------|
+| Outcome-only | F1 不区分「猜对」和「搜对」，冲突场景下可能强化错误 side |
+| No-tool penalty 副作用 | 即使参数知识够用，训练里也倾向先搜再答 |
+| 无 conflict 专项数据 | 未构造 conflict documents / outdated facts，冲突主要靠真实 web 噪声碰运气 |
+
+### 未来方向：conflict/outdated 合成数据 + curriculum
+
+**两类合成样本：**
+
+1. **Outdated facts** — 参数知识过时（如旧 CEO），检索里有新信息，golden = 新事实 → 训练「易变事实跟检索走」
+2. **Conflict documents** — 多个来源说法矛盾（旧新闻 vs 官网），golden = 权威/最新来源 → 训练「多源交叉验证再选边」，不是抄第一条 snippet
+
+**Curriculum（分阶段加难度）：**
+
+| 阶段 | 数据 | 目标 |
+|------|------|------|
+| Phase 0–1（已有） | L1–L3 multi-hop | 会搜、会分解、会多步整合 |
+| Phase 2（未做） | outdated facts | 参数 vs 检索冲突时跟 golden 走 |
+| Phase 3（未做） | conflict documents | 多源矛盾时交叉验证 |
+| Phase 4（可选） | 错误前提 / 搜不到 | 拒答或澄清，不硬编 |
+
+配合 **faithfulness reward**（NLI / citation verify，见 Q5）让模型不仅答对，还要证据链成立。
+
+### 推理层的 ideal policy（线上，非当前训练目标）
+
+- 多源不一致 → 继续搜 / browse 深读 / 换 query，而非盲信第一条
+- 信号：来源权威度、发布时间、snippet vs 全文一致性
+- 静态知识题 → routing 不强制搜索（no-tool penalty 是训练期 bias，线上应做 query routing）
+
+**面试建议表述：**
+> "我们的训练目标不是永远信检索，而是 F1 对齐标注答案 + 必须调用工具。冲突消解目前没有显式 reliability scorer，主要靠 multi-hop 多轮搜索和 dual-agent 分解隐式涌现。如果要系统化，我会加 conflict/outdated 合成数据做 curriculum，再配合 faithfulness reward，把『猜对』和『搜对且证据成立』区分开。"

@@ -456,6 +456,7 @@ class ActorRolloutRefWorker(Worker):
                     'adapter_names': ['planner', 'executor'],
                     'save_dir': multi_agent_cfg.get('lora_save_dir', './tmp_lora_adapters'),
                     'target_modules': list(lora_cfg.target_modules),
+                    'base_model': multi_agent_cfg.get('base_model', self.config.model.path),
                 }
             rollout_sharding_manager = FSDPVLLMShardingManager(module=self.actor_module_fsdp,
                                                                inference_engine=rollout.inference_engine,
