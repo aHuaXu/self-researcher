@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from research_agent.prompts.planner import (
     get_planner_prompt,
     parse_plan,
+    SubTask,
     DEFAULT_MIN_TASKS,
     DEFAULT_MAX_TASKS,
 )
@@ -52,17 +53,18 @@ class TestParsePlan:
 </plan>"""
         items = parse_plan(text)
         assert len(items) == 3
-        assert items[0]["index"] == 1
-        assert items[0]["deps"] == []
-        assert items[0]["sub_question"] == "What country was director X born in?"
-        assert items[0]["is_final"] is False
+        assert isinstance(items[0], SubTask)
+        assert items[0].index == 1
+        assert items[0].deps == []
+        assert items[0].sub_question == "What country was director X born in?"
+        assert items[0].is_final is False
 
-        assert items[1]["index"] == 2
-        assert items[1]["deps"] == []
+        assert items[1].index == 2
+        assert items[1].deps == []
 
-        assert items[2]["index"] == 3
-        assert items[2]["deps"] == [1, 2]
-        assert items[2]["is_final"] is True
+        assert items[2].index == 3
+        assert items[2].deps == [1, 2]
+        assert items[2].is_final is True
 
     def test_single_dependency(self):
         text = """<plan>
@@ -71,7 +73,7 @@ class TestParsePlan:
 </plan>"""
         items = parse_plan(text)
         assert len(items) == 2
-        assert items[1]["deps"] == [1]
+        assert items[1].deps == [1]
 
     def test_multiple_dependencies(self):
         text = """<plan>
@@ -81,7 +83,7 @@ class TestParsePlan:
 4. [DEPENDS:1,2,3] Final synthesis
 </plan>"""
         items = parse_plan(text)
-        assert items[3]["deps"] == [1, 2, 3]
+        assert items[3].deps == [1, 2, 3]
 
     def test_last_item_is_final(self):
         text = """<plan>
@@ -90,9 +92,9 @@ class TestParsePlan:
 3. [DEPENDS:2] Q3
 </plan>"""
         items = parse_plan(text)
-        assert items[0]["is_final"] is False
-        assert items[1]["is_final"] is False
-        assert items[2]["is_final"] is True
+        assert items[0].is_final is False
+        assert items[1].is_final is False
+        assert items[2].is_final is True
 
     def test_no_plan_tags_returns_empty(self):
         text = "Here are some thoughts about the question..."
@@ -123,8 +125,8 @@ That should cover the decomposition."""
 </plan>"""
         items = parse_plan(text)
         assert len(items) == 2
-        assert items[0]["deps"] == []
-        assert items[1]["deps"] == [1]
+        assert items[0].deps == []
+        assert items[1].deps == [1]
 
     def test_ignores_malformed_lines(self):
         text = """<plan>
@@ -135,8 +137,8 @@ This is garbage
 </plan>"""
         items = parse_plan(text)
         assert len(items) == 2
-        assert items[0]["sub_question"] == "Valid line"
-        assert items[1]["sub_question"] == "Another valid line"
+        assert items[0].sub_question == "Valid line"
+        assert items[1].sub_question == "Another valid line"
 
     def test_realistic_l3_decomposition(self):
         text = """<plan>
@@ -147,8 +149,8 @@ This is garbage
 </plan>"""
         items = parse_plan(text)
         assert len(items) == 4
-        assert items[0]["deps"] == []
-        assert items[1]["deps"] == [1]
-        assert items[2]["deps"] == [2]
-        assert items[3]["deps"] == [3]
-        assert items[3]["is_final"] is True
+        assert items[0].deps == []
+        assert items[1].deps == [1]
+        assert items[2].deps == [2]
+        assert items[3].deps == [3]
+        assert items[3].is_final is True
