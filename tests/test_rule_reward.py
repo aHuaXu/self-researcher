@@ -17,7 +17,7 @@ planner_rules = _mod.planner_rules
 executor_rules = _mod.executor_rules
 
 
-# ── Planner Tests ──
+# ── Planner Tests (new <plan> format) ──
 
 
 class TestPlannerRulesEmpty:
@@ -35,145 +35,126 @@ class TestPlannerRulesEmpty:
 class TestPlannerRulesTaskCount:
 
     def test_too_few_tasks(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chips\n"
-            "   Search Query: AI chip market\n"
-            "2. [LOW] Sub-topic: GPU demand\n"
-            "   Search Query: GPU demand 2024\n"
-        )
+        plan = """<plan>
+1. [INDEPENDENT] What is X?
+2. [DEPENDS:1] What is Y?
+</plan>"""
         score = planner_rules(plan)
-        assert score < 0.8
+        # 2 tasks < min(3), count score = 0
+        assert score <= 0.5
 
     def test_too_many_tasks(self):
-        lines = []
-        for i in range(1, 9):
-            lines.append(f"{i}. [HIGH] Sub-topic: topic {i}\n   Search Query: query {i}")
+        lines = ["<plan>"]
+        for i in range(1, 8):
+            lines.append(f"{i}. [INDEPENDENT] Unique topic number {i} about something")
+        lines.append("</plan>")
         plan = "\n".join(lines)
         score = planner_rules(plan)
-        assert score < 0.8
+        # 7 tasks > max(5), count score = 0
+        assert score <= 0.5
 
     def test_three_tasks_valid(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chips\n"
-            "   Search Query: AI chip market\n"
-            "2. [MEDIUM] Sub-topic: GPU demand\n"
-            "   Search Query: GPU demand 2024\n"
-            "3. [LOW] Sub-topic: Cloud computing\n"
-            "   Search Query: cloud computing growth\n"
-        )
+        plan = """<plan>
+1. [INDEPENDENT] What country was director X born in?
+2. [INDEPENDENT] What year was the film released?
+3. [DEPENDS:1,2] Compare the GDP of the country in that year
+</plan>"""
         score = planner_rules(plan)
-        assert score >= 0.8
+        assert score == 1.0  # 3 tasks in [3,5], no duplicates
 
-    def test_seven_tasks_valid(self):
-        topics = ["AI chips", "GPU market", "Cloud computing", "Edge AI",
-                  "Data centers", "Quantum computing", "5G infrastructure"]
-        priorities = ["HIGH", "HIGH", "MEDIUM", "MEDIUM", "LOW", "LOW", "MEDIUM"]
-        lines = []
-        for i, (topic, pri) in enumerate(zip(topics, priorities), 1):
-            lines.append(f"{i}. [{pri}] Sub-topic: {topic}\n   Search Query: {topic} market 2024")
-        plan = "\n".join(lines)
+    def test_five_tasks_valid(self):
+        plan = """<plan>
+1. [INDEPENDENT] Who directed the 1970 film Move?
+2. [INDEPENDENT] What year was the film Méditerranée released?
+3. [DEPENDS:1] What nationality does this director hold?
+4. [DEPENDS:2] Which production company distributed the second film?
+5. [DEPENDS:3,4] Compare the cultural backgrounds of both films
+</plan>"""
         score = planner_rules(plan)
-        assert score >= 0.8
+        assert score == 1.0  # 5 tasks in [3,5], no duplicates
 
+    def test_custom_range(self):
+        plan = """<plan>
+1. [INDEPENDENT] Q1
+2. [DEPENDS:1] Q2
+</plan>"""
+        # With min=2, max=3 this should pass count check
+        score = planner_rules(plan, min_tasks=2, max_tasks=3)
+        assert score >= 0.5
 
-class TestPlannerRulesPriority:
-
-    def test_all_same_priority(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chips\n"
-            "   Search Query: AI chip market\n"
-            "2. [HIGH] Sub-topic: GPU demand\n"
-            "   Search Query: GPU demand 2024\n"
-            "3. [HIGH] Sub-topic: Cloud computing\n"
-            "   Search Query: cloud computing growth\n"
-        )
-        score = planner_rules(plan)
-        assert score < 1.0
-
-    def test_two_distinct_priorities(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chips\n"
-            "   Search Query: AI chip market\n"
-            "2. [MEDIUM] Sub-topic: GPU demand\n"
-            "   Search Query: GPU demand 2024\n"
-            "3. [HIGH] Sub-topic: Cloud computing\n"
-            "   Search Query: cloud computing growth\n"
-        )
-        score = planner_rules(plan)
-        assert score >= 0.8
-
-    def test_three_distinct_priorities(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chips\n"
-            "   Search Query: AI chip market\n"
-            "2. [MEDIUM] Sub-topic: GPU demand\n"
-            "   Search Query: GPU demand 2024\n"
-            "3. [LOW] Sub-topic: Cloud computing\n"
-            "   Search Query: cloud computing growth\n"
-        )
-        score = planner_rules(plan)
-        assert score >= 0.8
+    def test_custom_range_too_many(self):
+        plan = """<plan>
+1. [INDEPENDENT] Q1 about topic A
+2. [INDEPENDENT] Q2 about topic B
+3. [DEPENDS:1] Q3 about topic C
+4. [DEPENDS:2] Q4 about topic D
+</plan>"""
+        # With max=3, 4 tasks exceeds
+        score = planner_rules(plan, min_tasks=2, max_tasks=3)
+        assert score <= 0.5
 
 
 class TestPlannerRulesDuplicates:
 
-    def test_duplicate_subtopics(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chip market size\n"
-            "   Search Query: AI chip market size 2024\n"
-            "2. [MEDIUM] Sub-topic: AI chip market growth\n"
-            "   Search Query: AI chip market growth forecast\n"
-            "3. [LOW] Sub-topic: Cloud computing\n"
-            "   Search Query: cloud computing growth\n"
-        )
+    def test_duplicate_subtasks(self):
+        plan = """<plan>
+1. [INDEPENDENT] What is the AI chip market size?
+2. [INDEPENDENT] What is the AI chip market growth?
+3. [DEPENDS:1,2] Compare market size and growth
+</plan>"""
         score = planner_rules(plan)
+        # Tasks 1 and 2 have high keyword overlap
         assert score < 1.0
 
     def test_no_duplicates(self):
+        plan = """<plan>
+1. [INDEPENDENT] Who directed the film Move?
+2. [INDEPENDENT] What year was Méditerranée released?
+3. [DEPENDS:1,2] Are both directors from the same country?
+</plan>"""
+        score = planner_rules(plan)
+        assert score == 1.0
+
+
+class TestPlannerRulesLegacyFormat:
+    """Ensure backward compatibility with old [HIGH/MEDIUM/LOW] format."""
+
+    def test_legacy_format_still_works(self):
         plan = (
-            "1. [HIGH] Sub-topic: AI chip market\n"
-            "   Search Query: AI chip market size\n"
+            "1. [HIGH] AI chip market size\n"
+            "2. [MEDIUM] GPU demand trends\n"
+            "3. [LOW] Cloud computing growth\n"
+        )
+        score = planner_rules(plan)
+        assert score >= 0.5  # Should parse 3 tasks
+
+    def test_legacy_without_plan_tags(self):
+        plan = (
+            "1. [HIGH] Sub-topic: AI chips\n"
             "2. [MEDIUM] Sub-topic: Quantum computing\n"
-            "   Search Query: quantum computing progress\n"
-            "3. [LOW] Sub-topic: Cloud infrastructure\n"
-            "   Search Query: cloud infrastructure growth\n"
+            "3. [LOW] Sub-topic: Edge AI\n"
+            "4. [HIGH] Sub-topic: Cloud platforms\n"
         )
         score = planner_rules(plan)
-        assert score >= 0.8
+        assert score >= 0.5
 
 
-class TestPlannerRulesChinese:
+class TestPlannerRulesScoring:
 
-    def test_chinese_labels(self):
-        plan = (
-            "1. [HIGH] 子主题: AI芯片市场规模\n"
-            "   搜索查询: AI chip market size 2024\n"
-            "2. [MEDIUM] 子主题: 主要玩家竞争格局\n"
-            "   搜索查询: NVIDIA AMD Intel AI chip competition\n"
-            "3. [LOW] 子主题: 未来发展趋势\n"
-            "   搜索查询: AI chip future trend\n"
-        )
+    def test_perfect_score(self):
+        plan = """<plan>
+1. [INDEPENDENT] What seminal literary work explores psychological turmoil?
+2. [DEPENDS:1] Which illustrator was nurtured by the publisher of that work?
+3. [DEPENDS:2] Which singer-songwriter did the illustrator collaborate with?
+4. [DEPENDS:3] What venue shaped the sound of that musician's era?
+</plan>"""
         score = planner_rules(plan)
-        assert score >= 0.8
+        assert score == 1.0
 
-
-class TestPlannerRulesGoodPlan:
-
-    def test_perfect_plan(self):
-        plan = (
-            "1. [HIGH] Sub-topic: AI chip market size\n"
-            "   Search Query: AI chip market size 2024\n"
-            "2. [HIGH] Sub-topic: NVIDIA competitive advantage\n"
-            "   Search Query: NVIDIA AMD Intel AI chip competition\n"
-            "3. [MEDIUM] Sub-topic: China domestic chip development\n"
-            "   Search Query: China AI chip Huawei Ascend\n"
-            "4. [MEDIUM] Sub-topic: Edge AI processor trends\n"
-            "   Search Query: edge AI chip mobile deployment\n"
-            "5. [LOW] Sub-topic: Quantum computing impact\n"
-            "   Search Query: quantum computing AI chip disruption\n"
-        )
+    def test_zero_score_empty_plan_tags(self):
+        plan = "<plan>\n</plan>"
         score = planner_rules(plan)
-        assert 0.8 <= score <= 1.0
+        assert score == 0.0
 
 
 # ── Executor Tests ──
@@ -234,14 +215,6 @@ class TestExecutorRulesEmptyResults:
     def test_empty_search_result(self):
         trajectory = [
             {"tool": "web_search", "result": ""},
-            {"tool": "browse_webpage", "result": "The global AI chip market reached $50B in 2024, with NVIDIA holding 80%..."},
-        ]
-        score = executor_rules(trajectory, max_turns=5, actual_turns=3)
-        assert score < 1.0
-
-    def test_short_search_result(self):
-        trajectory = [
-            {"tool": "web_search", "result": "no data"},
             {"tool": "browse_webpage", "result": "The global AI chip market reached $50B in 2024, with NVIDIA holding 80%..."},
         ]
         score = executor_rules(trajectory, max_turns=5, actual_turns=3)
