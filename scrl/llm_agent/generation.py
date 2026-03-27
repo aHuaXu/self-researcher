@@ -334,7 +334,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             if active_batch size is not divisible by num_gpus, pad with first sequence
             then remove padding from output
         """
-        _ADAPTER_BASE_ID = {"planner": 1, "executor": 2, "writer": 3}
+        _ADAPTER_BASE_ID = {"planner": 1, "executor": 2}
 
         if lora_adapter_name is not None:
             lora_save_dir = getattr(self, 'lora_save_dir', './tmp_lora_adapters')

@@ -27,10 +27,6 @@ _verl_mod.DataProto = _FakeDataProto
 sys.modules["verl"] = _verl_mod
 sys.modules["verl.protocol"] = ModuleType("verl.protocol")
 
-# Mock the LLM judge (not needed for dual-agent)
-_judge_mod = ModuleType("verl.utils.reward_score.llm_judge")
-_judge_mod.LLMJudge = None
-sys.modules["verl.utils.reward_score.llm_judge"] = _judge_mod
 
 from verl.workers.reward_manager.multi_agent import (
     compute_f1_reward,
