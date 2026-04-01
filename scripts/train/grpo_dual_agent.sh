@@ -23,7 +23,7 @@ export experiment_name_base="qwen3_4b_dual_agent"
 IFS=',' read -ra _CUDA_DEVICES_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 export experiment_name="${experiment_name_base}_ws${#_CUDA_DEVICES_ARR[@]}"
 
-BASE=/home/zjx/ahua_llm/self-researcher
+BASE=/home/zjx/self_llm/self-researcher
 cd ${BASE}
 
 if [ -f .env ]; then

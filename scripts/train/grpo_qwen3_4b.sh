@@ -10,7 +10,7 @@ set -euo pipefail
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
-export CUDA_VISIBLE_DEVICES=2,3,4,5
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
@@ -19,7 +19,7 @@ export experiment_name_base="qwen3_4b_grpo"
 IFS=',' read -ra _CUDA_DEVICES_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 export experiment_name="${experiment_name_base}_ws${#_CUDA_DEVICES_ARR[@]}"
 
-BASE=/home/zjx/ahua_llm/self-researcher
+BASE=/home/zjx/self_llm/self-researcher
 cd ${BASE}
 
 if [ -f .env ]; then
@@ -99,4 +99,4 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     agent_grpo.n=8 \
     max_turns=5 \
     search_engine=online_search \
-    trainer.total_epochs=1 2>&1 | tee ${BASE}/${project_name}_${experiment_name}.log
+    trainer.total_epochs=3 2>&1 | tee ${BASE}/${project_name}_${experiment_name}.log

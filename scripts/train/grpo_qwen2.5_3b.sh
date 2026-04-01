@@ -16,7 +16,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 export project_name="deepresearcher"
 export experiment_name="qwen2.5_3b_grpo"
 
-BASE=/home/zjx/ahua_llm/self-researcher
+BASE=/home/zjx/self_llm/self-researcher
 cd ${BASE}
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
