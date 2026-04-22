@@ -189,3 +189,127 @@ generation.py:
 | 工具参数 | generation.py:70-114 的 TOOLS | 完全一致 |
 | LLM 调用 | scrl/llm_agent/generation.py | 独立封装，复用相同的 LLM |
 | 编排 | handler.py (文件 IPC) | LangGraph (Planner→Executor→Writer) |
+
+---
+
+## Multi-Agent RL 训练方案
+
+### 整体思路
+
+三模型串行生成一个完整 rollout，分别计算三个 Agent 的 reward，独立进行梯度更新。
+
+```
+Query → Planner → Executor → Writer → Final Answer
+          ↓           ↓          ↓
+       reward_p   reward_e   reward_w
+          ↓           ↓          ↓
+      update_θp  update_θe  update_θw
+```
+
+### 技术方案
+
+基于 verl 框架扩展，自定义 MultiAgentTrainer：
+
+```python
+class MultiAgentTrainer:
+    def __init__(self, planner_model, executor_model, writer_model):
+        self.planner = planner_model      # 3B 模型
+        self.executor = executor_model    # 7B 模型（待训练）
+        self.writer = writer_model        # 3B 模型
+
+    def rollout(self, queries):
+        """串行生成完整轨迹"""
+        # Step 1: Planner 生成计划
+        plan_outputs = self.planner.generate(queries)
+
+        # Step 2: Executor 执行计划（调用工具）
+        exec_outputs = self.executor.generate(queries, plan_outputs)
+
+        # Step 3: Writer 生成最终报告
+        writer_outputs = self.writer.generate(queries, plan_outputs, exec_outputs)
+
+        return combined_trajectories
+
+    def compute_rewards(self, trajectories):
+        """分别计算三个 Agent 的 reward"""
+        reward_p = reward_fn_planner(trajectories['planner'])
+        reward_e = reward_fn_executor(trajectories['executor'])
+        reward_w = reward_fn_writer(trajectories['writer'])
+        return {'planner': reward_p, 'executor': reward_e, 'writer': reward_w}
+
+    def update(self, trajectories, rewards):
+        """三次 GRPO 更新"""
+        self.planner.update(trajectories['planner'], rewards['planner'])
+        self.executor.update(trajectories['executor'], rewards['executor'])
+        self.writer.update(trajectories['writer'], rewards['writer'])
+```
+
+### Rollout 流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Multi-Agent Rollout                      │
+├─────────────────────────────────────────────────────────────┤
+│  Query                                                      │
+│    │                                                        │
+│    ▼                                                        │
+│  ┌─────────────┐                                           │
+│  │   Planner   │ ──→ plan_1, plan_2, ...                  │
+│  │  (3B model) │                                           │
+│  └─────────────┘                                           │
+│    │                                                        │
+│    ▼                                                        │
+│  ┌─────────────┐                                           │
+│  │  Executor   │ ──→ tool_calls, tool_results, answer     │
+│  │ (7B model)  │     (多轮工具调用)                         │
+│  └─────────────┘                                           │
+│    │                                                        │
+│    ▼                                                        │
+│  ┌─────────────┐                                           │
+│  │   Writer    │ ──→ final_report                         │
+│  │  (3B model) │                                           │
+│  └─────────────┘                                           │
+│    │                                                        │
+│    ▼                                                        │
+│  ┌─────────────────────────────────────┐                   │
+│  │        Combined Trajectory          │                   │
+│  │  [plan] [exec] [writer] [final]     │                   │
+│  └─────────────────────────────────────┘                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Reward 设计
+
+| Agent | Reward 来源 | 说明 |
+|-------|-------------|------|
+| **Planner** | 计划合理性 | Plan 是否清晰、可执行？是否遗漏关键步骤？ |
+| **Executor** | 执行质量 | 工具调用是否正确？是否找到有效信息？答案是否准确？ |
+| **Writer** | 报告质量 | 报告是否完整、准确、结构清晰、可读性强？ |
+
+**分层 Reward 方案**：
+- 主 reward：最终答案/报告质量（三个 Agent 共享）
+- 辅助 reward：每个 Agent 的过程质量
+
+### 实现要点
+
+1. **自定义 generation.py**
+   - 实现三模型串行 rollout
+   - 拼接完整的 [plan][exec][writer] 轨迹
+
+2. **扩展 trainer**
+   - 支持多模型独立更新
+   - 分别记录三个模型的 log_prob
+
+3. **关键挑战**
+   - 训练时间：三模型串行生成，耗时长
+   - Reward 分配：如何合理分配 credit
+   - 显存：三模型同时加载，需要多卡或模型并行
+
+### 替代方案
+
+**只训练 Executor**（简化版）：
+- Planner 和 Writer 固定用小模型
+- 只对 Executor 做 RL 更新
+- 实现简单，效果稳定
+
+适合初期验证，等流程跑通后再扩展到三模型联合训练。
