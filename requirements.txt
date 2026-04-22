@@ -62,3 +62,5 @@ html2text
 flask
 psutil
 pymongo
+langchain-core
+langgraph

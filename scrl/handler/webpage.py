@@ -1,5 +1,5 @@
 from typing import List, Dict, Any
-from web_search_agent.search.text_web_browser import SimpleTextBrowser
+from scrl.handler.web_search_agent.search.text_web_browser import SimpleTextBrowser
 
 
 class WebSelectInfo:

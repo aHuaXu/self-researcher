@@ -67,6 +67,7 @@ class TaskExecutor:
                 return answer, trajectory
 
             # Process tool calls
+            tool_results = []
             for tc in tool_calls:
                 func_name = tc["function"]["name"]
                 args_str = tc["function"]["arguments"]
@@ -76,6 +77,13 @@ class TaskExecutor:
                 except:
                     args = {}
 
+                if func_name == "web_search":
+                    print(f"    [{func_name}] query={args.get('query', [])}")
+                elif func_name == "browse_webpage":
+                    print(f"    [{func_name}] urls={args.get('url_list', [])}")
+                else:
+                    print(f"    [{func_name}] {args}")
+
                 tool_result = self._execute_tool(func_name, args)
                 trajectory.append({
                     "turn": turns,
@@ -83,25 +91,20 @@ class TaskExecutor:
                     "args": args,
                     "result": tool_result,
                 })
+                tool_results.append((tc, tool_result))
 
-                # Add tool result to messages
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": func_name,
-                                "arguments": args_str if isinstance(args_str, str) else json.dumps(args_str),
-                            }
-                        }
-                    ]
-                })
+            # Append assistant message with original tool_calls (preserves id)
+            messages.append({
+                "role": "assistant",
+                "content": content or "",
+                "tool_calls": tool_calls,
+            })
+            # Append each tool result
+            for tc, result in tool_results:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", f"call_{turns}"),
-                    "content": tool_result,
+                    "content": result,
                 })
 
         return "Max turns reached without answer", trajectory

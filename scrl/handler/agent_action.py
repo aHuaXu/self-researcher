@@ -1,11 +1,11 @@
 from typing import List, Dict, Any
-from web_search_agent.search.text_web_browser import (
+from scrl.handler.web_search_agent.search.text_web_browser import (
     SimpleTextBrowser,
     SearchInformationTool,
     VisitTool,
     PageDownTool
 )
-from webpage import *
+from scrl.handler.webpage import *
 
 class SubActionInfo:
     def __init__(self, sub_action_thinking, sub_action, take_sub_action_time_taken):

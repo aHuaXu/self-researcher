@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from handler import Handler
+from scrl.handler.handler import Handler
 import yaml
 from openai import OpenAI
 from types import SimpleNamespace

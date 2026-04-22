@@ -8,8 +8,8 @@ import json
 from .prompts import *
 import concurrent.futures
 from .search.text_web_browser import SimpleTextBrowser
-from utils import *
-from webpage import WebPageInfo
+from scrl.handler.utils import *
+from scrl.handler.webpage import WebPageInfo
 from .search.search_api import web_search
 import threading
 import os

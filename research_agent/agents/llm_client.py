@@ -72,24 +72,11 @@ class LLMClient:
 
 
 def create_llm_client(config: "AgentConfig", model_type: str = "small") -> LLMClient:
-    """Create an LLM client based on model type."""
+    """Create an LLM client. All agents share the same model for now."""
     from research_agent.config import AgentConfig
 
-    if model_type == "executor":
-        return LLMClient(
-            model=config.llm.executor_model,
-            base_url=config.llm.executor_base_url,
-            api_key=config.llm.executor_api_key,
-        )
-    elif model_type == "summary":
-        return LLMClient(
-            model=config.llm.summary_model,
-            base_url=config.llm.summary_base_url,
-            api_key=config.llm.summary_api_key,
-        )
-    else:  # small model for planner and writer
-        return LLMClient(
-            model=config.llm.small_model,
-            base_url=config.llm.small_base_url,
-            api_key=config.llm.small_api_key,
-        )
+    return LLMClient(
+        model=config.llm.model,
+        base_url=config.llm.base_url,
+        api_key=config.llm.api_key,
+    )

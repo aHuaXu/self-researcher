@@ -1,15 +1,15 @@
-from web_search_agent.web_search_agent import WebSearchAgent
-from reading_agent.reading_agent import ReadingAgent
+from scrl.handler.web_search_agent.web_search_agent import WebSearchAgent
+from scrl.handler.reading_agent.reading_agent import ReadingAgent
 import yaml
 from openai import OpenAI
 from typing import List
-from webpage import SearchResultInfo
+from scrl.handler.webpage import SearchResultInfo
 import json
-from agent_action import *
+from scrl.handler.agent_action import *
 import time
 from types import SimpleNamespace
 import concurrent.futures
-from web_search_agent.search.search_api import web_search
+from scrl.handler.web_search_agent.search.search_api import web_search
 import threading
 import time
 import os
