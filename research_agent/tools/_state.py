@@ -31,6 +31,31 @@ class ToolState:
         self.reading_agent = ReadingAgent(config=config, client=client)
         self._initialized = True
 
+    def ensure_initialized(self):
+        """Auto-initialize if not initialized yet."""
+        if not self._initialized:
+            from research_agent.config import get_config
+
+            config = get_config()
+            handler_config = {
+                "search_engine": config.search.engine,
+                "serper_api_key": config.search.serper_api_key,
+                "search_top_k": config.search.top_k,
+                "search_region": config.search.region,
+                "search_lang": config.search.lang,
+                "azure_bing_search_subscription_key": config.search.azure_subscription_key,
+                "azure_bing_search_mkt": config.search.azure_mkt,
+                "quick_summary_model": config.llm.model,
+                "reading_agent_model": config.llm.model,
+                "query_save_path": config.query_save_path,
+                "page_view_port_size": config.search.viewport_size,
+            }
+            client = OpenAI(
+                base_url=config.llm.base_url,
+                api_key=config.llm.api_key
+            )
+            self.initialize(handler_config, client)
+
     def reset_for_question(self, question: str):
         self.current_question = question
         self.action_info = None
