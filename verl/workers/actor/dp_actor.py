@@ -223,7 +223,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
-    def update_policy(self, data: DataProto, tokenizer):
+    def update_policy(self, data: DataProto, tokenizer, lora_name: str = None):
+        # LoRA gradient isolation: activate the target adapter and freeze other LoRA params
+        if lora_name is not None:
+            self.actor_module.set_adapter(lora_name)
+            for name, param in self.actor_module.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = (lora_name in name)
+
         # make sure we are in training mode
         self.actor_module.train()
 
