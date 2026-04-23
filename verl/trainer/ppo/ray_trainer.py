@@ -996,6 +996,33 @@ class RayPPOTrainer(object):
             is_validation=False,
         )
 
+        # --- Multi-agent initialization (conditional) ---
+        if getattr(self.config, 'multi_agent', None) and self.config.multi_agent.enable:
+            from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
+            from verl.workers.reward_manager.multi_agent import MultiAgentRewardManager
+
+            # Build lora_paths from config or initial empty paths
+            lora_paths = {
+                "planner": getattr(self.config.multi_agent, 'planner_lora_path', ''),
+                "executor": getattr(self.config.multi_agent, 'executor_lora_path', ''),
+                "writer": getattr(self.config.multi_agent, 'writer_lora_path', ''),
+            }
+
+            multi_agent_gen = MultiAgentGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                lora_paths=lora_paths,
+            )
+            multi_agent_reward = MultiAgentRewardManager(
+                tokenizer=self.tokenizer,
+                config=self.config.multi_agent,
+            )
+            _multi_agent_enabled = True
+            print(f"[MultiAgent] Multi-agent training enabled with LoRA paths: {lora_paths}", flush=True)
+        else:
+            _multi_agent_enabled = False
+
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -1016,146 +1043,275 @@ class RayPPOTrainer(object):
                     )
 
                 with _timer('step', timing_raw):
-                    # generate a batch
-                    if not self.config.do_search:
+                    if _multi_agent_enabled:
+                        # =============================================================
+                        # Multi-agent training branch (Planner -> Executor -> Writer)
+                        # =============================================================
+                        from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+
+                        # --- Multi-agent Rollout ---
                         with _timer('gen', timing_raw):
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            rollout_result = multi_agent_gen.run_multi_agent_loop(
+                                gen_batch, self.global_steps
+                            )
 
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                            with _timer('gen_max', timing_raw):
-                                gen_baseline_batch = deepcopy(gen_batch)
-                                gen_baseline_batch.meta_info['do_sample'] = False
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                        # --- Multi-agent Reward ---
+                        reward_data = DataProto()
+                        reward_data.non_tensor_batch = rollout_result['metadata']
+                        reward_data.non_tensor_batch['exec_max_turns'] = (
+                            self.config.multi_agent.agents.executor.max_turns
+                        )
+                        # Derive exec_actual_turns from executor trajectories
+                        exec_trajectories = rollout_result['metadata'].get('exec_trajectories', [])
+                        reward_data.non_tensor_batch['exec_actual_turns'] = [
+                            len(traj) for traj in exec_trajectories
+                        ]
 
-                                batch = batch.union(gen_baseline_output)
-                                reward_baseline_tensor = self.reward_fn(batch)
-                                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                        with _timer('adv', timing_raw):
+                            rewards = multi_agent_reward(reward_data)
 
-                                batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                        # --- Advantage computation + Update per agent ---
+                        for agent_name in ['planner', 'executor', 'writer']:
+                            agent_output = rollout_result[agent_name]
+                            agent_rewards = rewards[agent_name]  # list[float]
 
-                                batch.batch['reward_baselines'] = reward_baseline_tensor
+                            if not hasattr(agent_output, 'batch') or 'responses' not in agent_output.batch:
+                                print(f"[MultiAgent] Skipping {agent_name}: no response data", flush=True)
+                                continue
 
-                                del gen_baseline_batch, gen_baseline_output
-                    else:
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                            assert False, 'REMAX is not supported for search'
-                        else:
-                            with _timer('gen', timing_raw):
-                                generation_manager.timing_raw = timing_raw
-                                gen_str_list, gen_batch_output = generation_manager.run_llm_loop(
-                                    gen_batch=gen_batch,
-                                    global_steps=self.global_steps
+                            batch_size = agent_output.batch['responses'].shape[0]
+                            if batch_size == 0:
+                                print(f"[MultiAgent] Skipping {agent_name}: empty batch", flush=True)
+                                continue
+
+                            resp_len = agent_output.batch['responses'].shape[1]
+
+                            # Build token-level reward tensor (reward at last valid token)
+                            reward_tensor = torch.zeros(batch_size, resp_len)
+                            attention = agent_output.batch.get('attention_mask', None)
+                            for i in range(batch_size):
+                                if attention is not None:
+                                    valid_len = attention[i, -resp_len:].sum().item()
+                                else:
+                                    valid_len = resp_len
+                                valid_len = max(1, int(valid_len))
+                                reward_tensor[i, valid_len - 1] = agent_rewards[i]
+
+                            # EOS mask for advantage computation
+                            if attention is not None:
+                                eos_mask = attention[:, -resp_len:]
+                            else:
+                                eos_mask = torch.ones(batch_size, resp_len)
+
+                            # GRPO group index
+                            index = agent_output.non_tensor_batch.get(
+                                'agent_grpo_idx', torch.arange(batch_size)
+                            )
+                            if not isinstance(index, torch.Tensor):
+                                index = torch.tensor(index)
+
+                            advantages, returns = compute_grpo_outcome_advantage(
+                                token_level_rewards=reward_tensor,
+                                eos_mask=eos_mask,
+                                index=index,
+                            )
+
+                            # Pack advantages into agent_output for update
+                            agent_output.batch['advantages'] = advantages
+                            agent_output.batch['returns'] = returns
+                            agent_output.batch['token_level_rewards'] = reward_tensor
+                            agent_output.batch['token_level_scores'] = reward_tensor
+
+                            # Compute old_log_probs if not present
+                            if 'old_log_probs' not in agent_output.batch or agent_output.batch.get('old_log_probs') is None:
+                                agent_output.batch['old_log_probs'] = agent_output.batch.get(
+                                    'log_probs', torch.zeros_like(advantages)
                                 )
-                            for key in gen_batch_output.batch.keys():
-                                gen_batch_output.batch[key] = gen_batch_output.batch[key].long()
 
-                            with torch.no_grad():
-                                output = self.actor_rollout_wg.compute_log_prob(gen_batch_output)
-                                gen_batch_output = gen_batch_output.union(output)
-                                
+                            # Set meta_info required for the actor update
+                            agent_output.meta_info['global_token_num'] = (
+                                torch.sum(agent_output.batch['attention_mask'], dim=-1).tolist()
+                            )
+                            agent_output.meta_info['temperature'] = (
+                                self.config.actor_rollout_ref.rollout.temperature
+                            )
+                            agent_output.meta_info['lora_name'] = agent_name
 
-                                
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    
-                    batch = batch.repeat(repeat_times=self.config.agent_grpo.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                            # Update only this agent's LoRA
+                            with _timer(f'update_actor_{agent_name}', timing_raw):
+                                actor_output = self.actor_rollout_wg.update_actor(agent_output)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                            # Prefix per-agent metrics
+                            for mk, mv in actor_output_metrics.items():
+                                metrics[f'{agent_name}/{mk}'] = mv
 
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
+                            # Log per-agent reward stats
+                            metrics[f'{agent_name}/reward/mean'] = np.mean(agent_rewards)
+                            metrics[f'{agent_name}/reward/max'] = np.max(agent_rewards)
+                            metrics[f'{agent_name}/reward/min'] = np.min(agent_rewards)
 
-                    # compute global_valid tokens
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                        # --- Validation (shared with single-agent path) ---
+                        if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                            self.global_steps % self.config.trainer.test_freq == 0:
+                            with _timer('testing', timing_raw):
+                                val_metrics: dict = self._validate(self.global_steps)
+                            metrics.update(val_metrics)
 
-                    # recompute old_log_probs
-                    if not self.config.do_search:
-                        with _timer('old_log_prob', timing_raw):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            batch = batch.union(old_log_prob)
+                        if self.config.trainer.save_freq > 0 and \
+                                self.global_steps % self.config.trainer.save_freq == 0:
+                            with _timer('save_checkpoint', timing_raw):
+                                self._save_checkpoint()
 
-                    # 跳过old_log_probs的检查，防止下面assert报错
-                    # AssertionError: old_log_probs in tensor_dict1 and tensor_dict2 are not the same object
-                    for key in batch.batch.keys():
-                        if key != 'old_log_probs':
-                            batch.batch[key] = batch.batch[key].long()
+                    else:
+                        # =============================================================
+                        # Original single-agent training path (unchanged)
+                        # =============================================================
+                        # generate a batch
+                        if not self.config.do_search:
+                            with _timer('gen', timing_raw):
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-                    # compute values
-                    if self.use_critic:
-                        with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                                with _timer('gen_max', timing_raw):
+                                    gen_baseline_batch = deepcopy(gen_batch)
+                                    gen_baseline_batch.meta_info['do_sample'] = False
+                                    gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-                    with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                                    batch = batch.union(gen_baseline_output)
+                                    reward_baseline_tensor = self.reward_fn(batch)
+                                    reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                                    batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
+                                    batch.batch['reward_baselines'] = reward_baseline_tensor
+
+                                    del gen_baseline_batch, gen_baseline_output
                         else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-                        
-                        # compute advantages, executed on the driver process
-                        # batch = compute_advantage(batch,
-                        #                           adv_estimator=self.config.algorithm.adv_estimator,
-                        #                           gamma=self.config.algorithm.gamma,
-                        #                           lam=self.config.algorithm.lam,
-                        #                           num_repeat=self.config.actor_rollout_ref.rollout.n)
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.agent_grpo.n) # 不过这个函数里面也没用到num_repeat参数
-                    
-                    # update critic
-                    if self.use_critic:
-                        with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                                assert False, 'REMAX is not supported for search'
+                            else:
+                                with _timer('gen', timing_raw):
+                                    generation_manager.timing_raw = timing_raw
+                                    gen_str_list, gen_batch_output = generation_manager.run_llm_loop(
+                                        gen_batch=gen_batch,
+                                        global_steps=self.global_steps
+                                    )
+                                for key in gen_batch_output.batch.keys():
+                                    gen_batch_output.batch[key] = gen_batch_output.batch[key].long()
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+                                with torch.no_grad():
+                                    output = self.actor_rollout_wg.compute_log_prob(gen_batch_output)
+                                    gen_batch_output = gen_batch_output.union(output)
 
-                    # validate
-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
-                        self.global_steps % self.config.trainer.test_freq == 0:
-                        with _timer('testing', timing_raw):
-                            val_metrics: dict = self._validate(self.global_steps)
-                        metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and \
-                            self.global_steps % self.config.trainer.save_freq == 0:
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+
+                        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                                 dtype=object)
+
+                        batch = batch.repeat(repeat_times=self.config.agent_grpo.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
+
+                        # balance the number of valid tokens on each dp rank.
+                        # Note that this breaks the order of data inside the batch.
+                        # Please take care when you implement group based adv computation such as GRPO and rloo
+                        self._balance_batch(batch, metrics=metrics)
+
+                        # compute global_valid tokens
+                        batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+
+                        # recompute old_log_probs
+                        if not self.config.do_search:
+                            with _timer('old_log_prob', timing_raw):
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                                batch = batch.union(old_log_prob)
+
+                        # 跳过old_log_probs的检查，防止下面assert报错
+                        # AssertionError: old_log_probs in tensor_dict1 and tensor_dict2 are not the same object
+                        for key in batch.batch.keys():
+                            if key != 'old_log_probs':
+                                batch.batch[key] = batch.batch[key].long()
+
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with _timer('ref', timing_raw):
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+                        # compute values
+                        if self.use_critic:
+                            with _timer('values', timing_raw):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
+
+                        with _timer('adv', timing_raw):
+                            # compute scores. Support both model and function-based.
+                            # We first compute the scores using reward model. Then, we call reward_fn to combine
+                            # the results from reward model and rule-based results.
+                            if self.use_rm:
+                                # we first compute reward model score
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            # we combine with rule-based rm
+                            reward_tensor = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+
+                            # compute rewards. apply_kl_penalty if available
+                            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                                batch, kl_metrics = apply_kl_penalty(batch,
+                                                                     kl_ctrl=self.kl_ctrl,
+                                                                     kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+
+                            # compute advantages, executed on the driver process
+                            # batch = compute_advantage(batch,
+                            #                           adv_estimator=self.config.algorithm.adv_estimator,
+                            #                           gamma=self.config.algorithm.gamma,
+                            #                           lam=self.config.algorithm.lam,
+                            #                           num_repeat=self.config.actor_rollout_ref.rollout.n)
+                            batch = compute_advantage(batch,
+                                                      adv_estimator=self.config.algorithm.adv_estimator,
+                                                      gamma=self.config.algorithm.gamma,
+                                                      lam=self.config.algorithm.lam,
+                                                      num_repeat=self.config.agent_grpo.n) # 不过这个函数里面也没用到num_repeat参数
+
+                        # update critic
+                        if self.use_critic:
+                            with _timer('update_critic', timing_raw):
+                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
+                            metrics.update(critic_output_metrics)
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            # update actor
+                            with _timer('update_actor', timing_raw):
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                            metrics.update(actor_output_metrics)
+
+                        # validate
+                        if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
+                            self.global_steps % self.config.trainer.test_freq == 0:
+                            with _timer('testing', timing_raw):
+                                val_metrics: dict = self._validate(self.global_steps)
+                            metrics.update(val_metrics)
+
+                        if self.config.trainer.save_freq > 0 and \
+                                self.global_steps % self.config.trainer.save_freq == 0:
+                            with _timer('save_checkpoint', timing_raw):
+                                self._save_checkpoint()
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                if not _multi_agent_enabled:
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                else:
+                    # For multi-agent, log timing metrics only (no single unified batch)
+                    metrics.update({
+                        f'timing_s/{name}': value for name, value in timing_raw.items()
+                    })
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
