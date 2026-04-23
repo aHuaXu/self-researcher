@@ -81,11 +81,11 @@ def serper_google_search(
             print(f"search success for {query}")
             return results
     except Exception as e:
-        # print(f"Serper search API error: {e}")
-        if depth < 512:
+        print(f"Serper search API error: {e}")
+        if depth < 3:
             time.sleep(1)
             return serper_google_search(query, serper_api_key, top_k, region, lang, depth=depth+1)
-    print("search failed")
+    print(f"search failed for {query}")
     return []
 
 

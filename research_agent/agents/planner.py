@@ -37,6 +37,8 @@ class TodoPlanner:
 
         content = response.get("content", "")
         todos = self._parse_todos(content)
+        if not todos:
+            print(f"  [Planner] 解析失败，LLM 原始输出:\n{content[:500]}")
 
         if not todos:
             # Fallback: create a simple todo from the question
@@ -52,16 +54,40 @@ class TodoPlanner:
         """Parse TODO items from LLM response."""
         todos = []
 
-        # Match pattern like: 1. [HIGH] Sub-topic: XXX\n   Search Query: XXX
-        pattern = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*Sub-topic:\s*(.+?)\n\s*Search Query:\s*(.+?)(?=\n\d+\.|\n\n|$)'
-
+        # Try strict format first: 1. [HIGH] Sub-topic: XXX\n   Search Query: XXX
+        pattern = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*Sub-topic:\s*(.+?)\n\s*Search Query:\s*(.+?)(?=\n\d+\.|\n\n|</todos>|$)'
         matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
         for match in matches:
+            search_query = match[3].strip().rstrip('</todos>')
             todos.append({
                 "index": int(match[0]),
                 "priority": match[1].lower(),
                 "sub_topic": match[2].strip(),
-                "search_query": match[3].strip(),
+                "search_query": search_query,
+            })
+
+        if todos:
+            return todos
+
+        # Fallback: match numbered items with brackets like "1. [HIGH] ..."
+        pattern2 = r'(\d+)\.\s*\[(HIGH|MEDIUM|LOW)\]\s*(.+?)(?=\n\d+\.\s*\[|$)'
+        matches2 = re.findall(pattern2, content, re.IGNORECASE | re.DOTALL)
+        for match in matches2:
+            text = match[2].strip()
+            # Try to split sub_topic and search_query
+            sq_match = re.search(r'(?:Search\s*Query|搜索|查询)[：:]\s*(.+)', text, re.IGNORECASE)
+            if sq_match:
+                sub_topic = text[:sq_match.start()].strip().rstrip('\n')
+                search_query = sq_match.group(1).strip()
+            else:
+                sub_topic = text.split('\n')[0].strip()
+                search_query = sub_topic
+            sub_topic = re.sub(r'^(?:Sub-topic|子主题|主题)[：:]\s*', '', sub_topic, flags=re.IGNORECASE)
+            todos.append({
+                "index": int(match[0]),
+                "priority": match[1].lower(),
+                "sub_topic": sub_topic,
+                "search_query": search_query,
             })
 
         return todos
