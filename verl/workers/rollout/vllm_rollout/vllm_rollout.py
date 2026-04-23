@@ -98,6 +98,14 @@ class vLLMRollout(BaseRollout):
             raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
                              please increase max_num_batched_tokens or disable chunked prefill')
 
+        enable_lora = kwargs.get('enable_lora', False)
+        max_lora_rank = kwargs.get('max_lora_rank', 64)
+
+        lora_kwargs = {}
+        if enable_lora:
+            lora_kwargs['enable_lora'] = True
+            lora_kwargs['max_lora_rank'] = max_lora_rank
+
         self.inference_engine = LLM(
             actor_module,
             tokenizer=tokenizer,
@@ -112,6 +120,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
+            **lora_kwargs,
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -159,6 +168,8 @@ class vLLMRollout(BaseRollout):
         if self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
 
+        lora_request = kwargs.pop('lora_request', None)
+
         idx = prompts.batch['input_ids']  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
@@ -185,13 +196,18 @@ class vLLMRollout(BaseRollout):
                 'n': 1  # if greedy, only 1 response
             }
 
+        generate_kwargs = dict(
+            prompts=None,  # because we have already convert it to prompt token id
+            sampling_params=self.sampling_params,
+            prompt_token_ids=idx_list,
+            use_tqdm=False,
+        )
+        if lora_request is not None:
+            generate_kwargs['lora_request'] = lora_request
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            output = self.inference_engine.generate(
-                prompts=None,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                use_tqdm=False)
+            output = self.inference_engine.generate(**generate_kwargs)
 
         # TODO(sgm): disable logprob when recompute_log_prob is enable
         # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
