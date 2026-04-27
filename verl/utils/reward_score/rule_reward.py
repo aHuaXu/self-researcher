@@ -29,10 +29,16 @@ def _keyword_overlap(a: str, b: str) -> float:
 def planner_rules(plan_text: str) -> float:
     """Score planner output on task count, uniqueness, and priority distribution."""
     if not plan_text or not plan_text.strip():
+        print("[RuleReward] WARNING: planner_rules received empty plan_text, returning 0.0", flush=True)
         return 0.0
 
     tasks = _parse_tasks(plan_text)
     if not tasks:
+        print(
+            f"[RuleReward] WARNING: planner_rules parsed 0 tasks from plan_text "
+            f"({len(plan_text)} chars), returning 0.0",
+            flush=True,
+        )
         return 0.0
 
     score = 0.0
