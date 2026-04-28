@@ -138,9 +138,7 @@ class TaskExecutor:
         for i, todo in enumerate(todo_list):
             priority = todo.get("priority", "medium").upper()
             sub_topic = todo.get("sub_topic", "")
-            search_query = todo.get("search_query", "")
             lines.append(f"{i+1}. [{priority}] {sub_topic}")
-            lines.append(f"   Search: {search_query}")
         return "\n".join(lines)
 
 

@@ -11,7 +11,6 @@ import json
 import torch
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass
 
 from verl import DataProto
 from scrl.llm_agent.generation import LLMGenerationManager, GenerationConfig
@@ -19,17 +18,6 @@ from scrl.llm_agent.generation import LLMGenerationManager, GenerationConfig
 from research_agent.prompts.planner import get_planner_prompt
 from research_agent.prompts.executor import get_executor_prompt, EXECUTOR_TOOLS
 from research_agent.prompts.writer import get_writer_prompt
-
-try:
-    from vllm.lora.request import LoRARequest
-except ImportError:
-
-    @dataclass
-    class LoRARequest:
-        name: str
-        id: int
-        path: str
-
 
 class MultiAgentGenerationManager(LLMGenerationManager):
     """Three-stage rollout manager: Planner -> Executor -> Writer.
@@ -44,33 +32,29 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         tokenizer,
         actor_rollout_wg,
         config: GenerationConfig,
-        lora_paths: dict,
+        lora_save_dir: str = './tmp_lora_adapters',
         is_validation: bool = False,
     ):
         super().__init__(tokenizer, actor_rollout_wg, config, is_validation)
-
-        # Create LoRARequest objects for each agent
-        # lora_paths = {"planner": "/path/...", "executor": "/path/...", "writer": "/path/..."}
-        self.lora_requests = {}
-        for idx, (agent_name, path) in enumerate(lora_paths.items(), start=1):
-            self.lora_requests[agent_name] = LoRARequest(
-                name=agent_name,
-                id=idx,
-                path=path,
-            )
+        self.lora_save_dir = lora_save_dir
+        self._lora_step = 0
 
     # -------------------------------------------------------------------------
     # Main entry point
     # -------------------------------------------------------------------------
 
     def run_multi_agent_loop(
-        self, gen_batch: DataProto, global_steps: int
+        self, gen_batch: DataProto, global_steps: int,
+        agent_grpo_idx: Optional[List[int]] = None,
     ) -> dict:
         """Run the three-stage multi-agent rollout.
 
         Args:
             gen_batch: Input DataProto containing tokenized questions.
             global_steps: Current training step (for logging).
+            agent_grpo_idx: GRPO group index for each sample in gen_batch.
+                Samples with the same index are different rollouts of the
+                same original question.
 
         Returns:
             Dict with 'planner', 'executor', 'writer' DataProto outputs
@@ -79,6 +63,7 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         node_rank = int(os.environ.get("PET_NODE_RANK", 0))
         questions = self._extract_questions(gen_batch)
         num_questions = len(questions)
+        self._lora_step += 1
         print(
             f"[MultiAgent] node {node_rank}, {num_questions} questions, "
             f"step {global_steps}",
@@ -91,7 +76,7 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         print(f"[MultiAgent] Stage 1: Planner", flush=True)
         planner_batch = self._build_planner_batch(questions, gen_batch)
         plan_outputs = self._generate_with_gpu_padding(
-            planner_batch, lora_request=self.lora_requests.get("planner")
+            planner_batch, lora_adapter_name="planner"
         )
         plan_texts = self._decode_outputs(plan_outputs)
         parsed_todos = [self._parse_todos(text) for text in plan_texts]
@@ -114,7 +99,7 @@ class MultiAgentGenerationManager(LLMGenerationManager):
             exec_msg_strings, exec_outputs = self.run_llm_loop(
                 executor_batch,
                 global_steps,
-                lora_request=self.lora_requests.get("executor"),
+                lora_adapter_name="executor",
             )
         else:
             print(
@@ -144,7 +129,7 @@ class MultiAgentGenerationManager(LLMGenerationManager):
             questions, plan_texts, grouped_findings, gen_batch
         )
         writer_outputs = self._generate_with_gpu_padding(
-            writer_batch, lora_request=self.lora_requests.get("writer")
+            writer_batch, lora_adapter_name="writer"
         )
         final_reports = self._decode_outputs(writer_outputs)
 
@@ -152,6 +137,17 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         self._log_stage_outputs(
             "writer", global_steps, questions, final_reports
         )
+
+        # Propagate GRPO group index to outputs so advantage computation
+        # groups multiple rollouts of the same question together.
+        if agent_grpo_idx is not None:
+            plan_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx)
+            writer_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx)
+            # Executor has one output per TODO, not per question — build its index
+            # from the todo_mapping (each todo maps back to a question index)
+            if todo_mapping:
+                exec_grpo_idx = [agent_grpo_idx[q_idx] for q_idx in todo_mapping]
+                exec_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(exec_grpo_idx)
 
         return {
             "planner": plan_outputs,
@@ -444,24 +440,50 @@ class MultiAgentGenerationManager(LLMGenerationManager):
     ) -> List[List[Dict]]:
         """Build per-question executor trajectory metadata.
 
+        Parses raw message strings into structured tool call entries
+        with 'tool' and 'result' keys, matching the format expected
+        by executor_rules().
+
         Returns:
             List of lists (one per question), each containing dicts with
-            'todo_idx' and 'trajectory' keys.
+            'tool' and 'result' keys.
         """
         trajectories = [[] for _ in range(num_questions)]
 
         for exec_idx, q_idx in enumerate(todo_mapping):
-            entry = {
-                "todo_idx": exec_idx,
-                "trajectory": (
-                    exec_msg_strings[exec_idx]
-                    if exec_idx < len(exec_msg_strings)
-                    else ""
-                ),
-            }
-            trajectories[q_idx].append(entry)
+            raw = (
+                exec_msg_strings[exec_idx]
+                if exec_idx < len(exec_msg_strings)
+                else ""
+            )
+            steps = self._parse_tool_steps(raw)
+            trajectories[q_idx].extend(steps)
 
         return trajectories
+
+    @staticmethod
+    def _parse_tool_steps(raw_msg: str) -> List[Dict[str, str]]:
+        """Extract structured tool call steps from a raw executor message.
+
+        Looks for <tool_call>...</tool_call> followed by
+        <observation>...</observation> pairs.
+        """
+        steps = []
+        tool_call_pattern = re.compile(
+            r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+            r'.*?'
+            r'<observation>(.*?)</observation>',
+            re.DOTALL,
+        )
+        for match in tool_call_pattern.finditer(raw_msg):
+            try:
+                call = json.loads(match.group(1))
+                tool_name = call.get("name", "")
+            except (json.JSONDecodeError, AttributeError):
+                tool_name = ""
+            result = match.group(2).strip()
+            steps.append({"tool": tool_name, "result": result})
+        return steps
 
     def _extract_last_response(self, msg: str) -> str:
         """Extract the last meaningful response from a full message string.

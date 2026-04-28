@@ -20,6 +20,7 @@ class ReportWriter:
         self,
         question: str,
         findings: List[Dict[str, Any]],
+        plan_text: str = "",
     ) -> str:
         """
         Write a research report based on findings.
@@ -27,13 +28,21 @@ class ReportWriter:
         Args:
             question: The original research question.
             findings: List of research trajectory items.
+            plan_text: The planner output text (included as context,
+                matching the training-time input format).
 
         Returns:
             The generated research report.
         """
-        # Format findings into context
         findings_text = self._format_findings(findings)
-        messages = get_writer_prompt(question, findings_text)
+        if plan_text:
+            findings_block = (
+                f"=== Research Plan ===\n{plan_text}\n\n"
+                f"=== Research Findings ===\n{findings_text}"
+            )
+        else:
+            findings_block = findings_text
+        messages = get_writer_prompt(question, findings_block)
 
         response = self.llm.chat(messages)
 

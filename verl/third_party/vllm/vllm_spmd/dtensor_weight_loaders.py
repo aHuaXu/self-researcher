@@ -161,6 +161,8 @@ def qwen2_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -> n
     for name, loaded_weight in actor_weights.items():
         if "rotary_emb.inv_freq" in name:
             continue
+        if "lora_A" in name or "lora_B" in name:
+            continue
         if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
             continue
         for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -197,6 +199,8 @@ def qwen2vl_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) ->
     params_dict = dict(vllm_model.named_parameters(remove_duplicate=False))
     for name, loaded_weight in actor_weights.items():
         if "rotary_emb.inv_freq" in name:
+            continue
+        if "lora_A" in name or "lora_B" in name:
             continue
         if vllm_model.config.tie_word_embeddings and "lm_head.weight" in name:
             continue

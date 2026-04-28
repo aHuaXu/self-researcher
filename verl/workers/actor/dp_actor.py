@@ -166,7 +166,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.step()
         return grad_norm
 
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, lora_name: str = None) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -181,10 +181,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
+            lora_name: If set, switch to this LoRA adapter before computing log probs.
+
         Returns:
             torch.Tensor: the log_prob tensor
         """
-        # set to eval
+        if lora_name is not None and hasattr(self.actor_module, 'set_adapter'):
+            self.actor_module.set_adapter(lora_name)
         self.actor_module.eval()
 
         micro_batch_size = data.meta_info['micro_batch_size']

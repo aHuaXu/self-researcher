@@ -289,39 +289,48 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
 
         return results
 
-    def _generate_with_gpu_padding(self, active_batch: DataProto, lora_request=None) -> DataProto:
+    def _generate_with_gpu_padding(self, active_batch: DataProto, lora_adapter_name: str = None) -> DataProto:
         """
             Wrapper for generation that handles multi-GPU padding requirements.
             if num_gpus <= 1, return self.actor_rollout_wg.generate_sequences(active_batch)
             if active_batch size is not divisible by num_gpus, pad with first sequence
             then remove padding from output
         """
+        _ADAPTER_BASE_ID = {"planner": 1, "executor": 2, "writer": 3}
+
+        if lora_adapter_name is not None:
+            lora_save_dir = getattr(self, 'lora_save_dir', './tmp_lora_adapters')
+            lora_step = getattr(self, '_lora_step', 0)
+            active_batch.meta_info['lora_adapter_path'] = os.path.join(lora_save_dir, lora_adapter_name)
+            active_batch.meta_info['lora_adapter_name'] = lora_adapter_name
+            active_batch.meta_info['lora_adapter_id'] = lora_step * 10 + _ADAPTER_BASE_ID.get(lora_adapter_name, 1)
+
         num_gpus = self.config.num_gpus * self.config.nnodes
         if num_gpus <= 1:
-            return self.actor_rollout_wg.generate_sequences(active_batch, lora_request=lora_request)
+            return self.actor_rollout_wg.generate_sequences(active_batch)
 
         batch_size = active_batch.batch['input_ids'].shape[0]
         remainder = batch_size % num_gpus
 
         if remainder == 0:
-            return self.actor_rollout_wg.generate_sequences(active_batch, lora_request=lora_request)
+            return self.actor_rollout_wg.generate_sequences(active_batch)
         # Add padding sequences
         padding_size = num_gpus - remainder
         padded_batch = {}
-        
+
         for k, v in active_batch.batch.items():
             # Use first sequence as padding template
             pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
             padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
 
-        padded_active_batch = DataProto.from_dict(padded_batch)
+        padded_active_batch = DataProto.from_dict(padded_batch, meta_info=active_batch.meta_info)
 
         # Generate with padded batch
-        padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch, lora_request=lora_request)
-        
+        padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
+
         # Remove padding from output
         trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
-        
+
         # Handle meta_info if present
         if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
             trimmed_meta = {}
@@ -331,7 +340,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 else:
                     trimmed_meta[k] = v
             padded_output.meta_info = trimmed_meta
-            
+
         padded_output.batch = trimmed_batch
         return padded_output
 
@@ -384,7 +393,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 results.append((True, "", ""))
         return results
 
-    def run_llm_loop(self, gen_batch: DataProto, global_steps: int, lora_request=None) -> Tuple[Dict, Dict]:
+    def run_llm_loop(self, gen_batch: DataProto, global_steps: int, lora_adapter_name: str = None) -> Tuple[Dict, Dict]:
         """Run main LLM generation loop."""
         node_rank = int(os.environ["PET_NODE_RANK"])
         print(f"node {node_rank} gains {len(gen_batch.batch['input_ids'])} datas!",flush=True)
@@ -449,7 +458,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 'position_ids': rollings_active['position_ids'],
             })
             
-            gen_output = self._generate_with_gpu_padding(rollings_active, lora_request=lora_request)
+            gen_output = self._generate_with_gpu_padding(rollings_active, lora_adapter_name=lora_adapter_name)
             meta_info = gen_output.meta_info
             print(f"node {node_rank}, turn {step} gen_output {len(gen_output.batch['responses'])} datas")
 

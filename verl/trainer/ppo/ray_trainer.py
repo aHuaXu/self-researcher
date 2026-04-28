@@ -1001,25 +1001,26 @@ class RayPPOTrainer(object):
             from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
             from verl.workers.reward_manager.multi_agent import MultiAgentRewardManager
 
-            # Build lora_paths from config or initial empty paths
-            lora_paths = {
-                "planner": getattr(self.config.multi_agent, 'planner_lora_path', ''),
-                "executor": getattr(self.config.multi_agent, 'executor_lora_path', ''),
-                "writer": getattr(self.config.multi_agent, 'writer_lora_path', ''),
-            }
+            lora_save_dir = './tmp_lora_adapters'
+
+            # Use n=1 for multi-agent: GRPO expansion is done externally
+            # via gen_batch.repeat() before entering run_multi_agent_loop.
+            from copy import copy
+            multi_agent_gen_config = copy(gen_config)
+            multi_agent_gen_config.n = 1
 
             multi_agent_gen = MultiAgentGenerationManager(
                 tokenizer=self.tokenizer,
                 actor_rollout_wg=self.actor_rollout_wg,
-                config=gen_config,
-                lora_paths=lora_paths,
+                config=multi_agent_gen_config,
+                lora_save_dir=lora_save_dir,
             )
             multi_agent_reward = MultiAgentRewardManager(
                 tokenizer=self.tokenizer,
                 config=self.config.multi_agent,
             )
             _multi_agent_enabled = True
-            print(f"[MultiAgent] Multi-agent training enabled with LoRA paths: {lora_paths}", flush=True)
+            print(f"[MultiAgent] Multi-agent training enabled, adapters saved to: {lora_save_dir}", flush=True)
         else:
             _multi_agent_enabled = False
 
@@ -1049,10 +1050,18 @@ class RayPPOTrainer(object):
                         # =============================================================
                         from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 
+                        # --- GRPO expansion: repeat each question n times ---
+                        grpo_n = getattr(self.config.agent_grpo, 'n', 1)
+                        orig_batch_size = gen_batch.batch['input_ids'].shape[0]
+                        if grpo_n > 1:
+                            gen_batch = gen_batch.repeat(repeat_times=grpo_n, interleave=True)
+                        agent_grpo_idx = list(np.arange(orig_batch_size).repeat(grpo_n))
+
                         # --- Multi-agent Rollout ---
                         with _timer('gen', timing_raw):
                             rollout_result = multi_agent_gen.run_multi_agent_loop(
-                                gen_batch, self.global_steps
+                                gen_batch, self.global_steps,
+                                agent_grpo_idx=agent_grpo_idx,
                             )
 
                         # --- Multi-agent Reward ---
@@ -1104,11 +1113,11 @@ class RayPPOTrainer(object):
                                 eos_mask = torch.ones(batch_size, resp_len)
 
                             # GRPO group index
-                            index = agent_output.non_tensor_batch.get(
-                                'agent_grpo_idx', torch.arange(batch_size)
-                            )
-                            if not isinstance(index, torch.Tensor):
-                                index = torch.tensor(index)
+                            index = agent_output.non_tensor_batch.get('agent_grpo_idx', None)
+                            if index is None:
+                                index = torch.arange(batch_size)
+                            elif not isinstance(index, torch.Tensor):
+                                index = torch.tensor(index, dtype=torch.long)
 
                             advantages, returns = compute_grpo_outcome_advantage(
                                 token_level_rewards=reward_tensor,
@@ -1122,11 +1131,12 @@ class RayPPOTrainer(object):
                             agent_output.batch['token_level_rewards'] = reward_tensor
                             agent_output.batch['token_level_scores'] = reward_tensor
 
-                            # Compute old_log_probs if not present
-                            if 'old_log_probs' not in agent_output.batch or agent_output.batch.get('old_log_probs') is None:
-                                agent_output.batch['old_log_probs'] = agent_output.batch.get(
-                                    'log_probs', torch.zeros_like(advantages)
-                                )
+                            # Compute old_log_probs via forward pass with correct LoRA adapter
+                            agent_output.meta_info['lora_name'] = agent_name
+                            with _timer(f'old_log_prob_{agent_name}', timing_raw):
+                                with torch.no_grad():
+                                    log_prob_output = self.actor_rollout_wg.compute_log_prob(agent_output)
+                                agent_output = agent_output.union(log_prob_output)
 
                             # Set meta_info required for the actor update
                             agent_output.meta_info['global_token_num'] = (
@@ -1135,7 +1145,6 @@ class RayPPOTrainer(object):
                             agent_output.meta_info['temperature'] = (
                                 self.config.actor_rollout_ref.rollout.temperature
                             )
-                            agent_output.meta_info['lora_name'] = agent_name
 
                             # Update only this agent's LoRA
                             with _timer(f'update_actor_{agent_name}', timing_raw):

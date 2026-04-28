@@ -101,7 +101,7 @@ def _make_manager(tokenizer=None):
     mgr.tokenizer = tokenizer or MagicMock(pad_token_id=0, pad_token="<pad>")
     mgr.tensor_fn = MagicMock()
     mgr.config = MagicMock()
-    mgr.lora_requests = {}
+    mgr.lora_save_dir = './tmp_lora_adapters'
     return mgr
 
 
@@ -224,14 +224,19 @@ class TestBuildExecTrajectories:
         self.mgr = _make_manager()
 
     def test_normal_grouping(self):
-        msgs = ["traj0", "traj1", "traj2"]
+        msgs = [
+            '<tool_call>{"name":"web_search","arguments":{}}</tool_call>\n<observation>res0</observation>',
+            '<tool_call>{"name":"browse_webpage","arguments":{}}</tool_call>\n<observation>res1</observation>',
+            '<tool_call>{"name":"web_search","arguments":{}}</tool_call>\n<observation>res2</observation>',
+        ]
         mapping = [0, 0, 1]
         result = self.mgr._build_exec_trajectories(msgs, mapping, 2)
         assert len(result) == 2
         assert len(result[0]) == 2
         assert len(result[1]) == 1
-        assert result[0][0]["trajectory"] == "traj0"
-        assert result[1][0]["trajectory"] == "traj2"
+        assert result[0][0]["tool"] == "web_search"
+        assert result[0][0]["result"] == "res0"
+        assert result[1][0]["tool"] == "web_search"
 
     def test_empty_mapping(self):
         result = self.mgr._build_exec_trajectories([], [], 3)
@@ -239,11 +244,13 @@ class TestBuildExecTrajectories:
         assert all(len(t) == 0 for t in result)
 
     def test_exec_shorter_than_mapping(self):
-        msgs = ["only one"]
+        msgs = ['<tool_call>{"name":"web_search","arguments":{}}</tool_call>\n<observation>only one</observation>']
         mapping = [0, 1]
         result = self.mgr._build_exec_trajectories(msgs, mapping, 2)
-        assert result[0][0]["trajectory"] == "only one"
-        assert result[1][0]["trajectory"] == ""
+        assert len(result[0]) == 1
+        assert result[0][0]["result"] == "only one"
+        # index 1 maps to exec_idx=1 which is out of range → empty string → no tool steps parsed
+        assert len(result[1]) == 0
 
 
 class TestExtractLastResponse:
