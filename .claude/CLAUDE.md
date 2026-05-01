@@ -2,9 +2,11 @@
 
 ## 交互规则
 
+0. **每次回复前要说 "hello~~~"**
 1. **用中文回答**
 2. **执行改动前，一定先 plan，用户同意后才能执行修改**
 3. **依赖优先用项目内的 .venv**
+4. **修改远程服务器目录文件前，先更新本地项目目录下的文件，再同步到服务器**
 
 ## 核心规则
 
@@ -27,3 +29,11 @@
 - 实现与原始设计不一致 (如工具参数、返回格式)
 - 做了多余的功能
 - 需要反复修改
+
+## 远程服务器配置
+
+- 服务器: zjx@10.35.2.238
+- 项目目录: /home/zjx/ahua_llm/self-researcher
+- Conda 环境: deepresearcher
+- 激活命令: `source /home/zjx/anaconda3/bin/conda activate deepresearcher`
+- **只允许修改 /home/zjx/ahua_llm/self-researcher 目录下的文件**

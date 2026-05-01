@@ -284,6 +284,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 "idx": idx,
                 "question": question,
                 "think": think,
+                "tool_call": tool,
                 "content": result,
             })
 
