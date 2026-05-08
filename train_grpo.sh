@@ -55,29 +55,32 @@
 # ============ Qwen3-4B 训练脚本（4卡）============
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export project_name="deepresearcher"
-export experiment_name="qwen3_4b_test"
-export CUDA_VISIBLE_DEVICES=2,3,4,6
+export experiment_name="qwen2.5_3b_test"
+export CUDA_VISIBLE_DEVICES=0,1
+export PET_NODE_RANK=0
+
+cd /home/zjx/ahua_llm/self-researcher
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-    data.train_files=./data/train.parquet \
-    data.val_files=./data/dev.parquet \
-    data.train_batch_size=32 \
+    data.train_files=/home/zjx/ahua_llm/self-researcher/data/train.parquet \
+    data.val_files=/home/zjx/ahua_llm/self-researcher/data/dev.parquet \
+    data.train_batch_size=8 \
     data.max_prompt_length=10240 \
     data.max_response_length=2000 \
     +data.max_model_len=12240 \
-    data.data_writing_file=./signal/data.json \
-    data.signal_writing_file=./signal/signal.json \
-    actor_rollout_ref.model.path=./models/Qwen3-4B \
-    actor_rollout_ref.model.use_remove_padding=true \
+    data.data_writing_file=/home/zjx/ahua_llm/self-researcher/signal/data.json \
+    data.signal_writing_file=/home/zjx/ahua_llm/self-researcher/signal/signal.json \
+    actor_rollout_ref.model.path=/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-3B-Instruct \
+    actor_rollout_ref.model.use_remove_padding=false \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.dtype=bfloat16 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=true \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.dtype=float16 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=false \
+    actor_rollout_ref.rollout.max_num_batched_tokens=40000 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
@@ -93,7 +96,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     +trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
