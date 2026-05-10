@@ -35,7 +35,7 @@ from vllm.config import (
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.logger import init_logger
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
-from vllm.model_executor.models.interfaces import supports_lora
+from vllm.model_executor.models.interfaces import supports_lora, supports_multimodal
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.prompt_adapter.worker_manager import LRUCacheWorkerPromptAdapterManager
 from vllm.utils import DeviceMemoryProfiler, is_hip, supports_dynamo
