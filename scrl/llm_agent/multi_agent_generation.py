@@ -141,13 +141,14 @@ class MultiAgentGenerationManager(LLMGenerationManager):
         # Propagate GRPO group index to outputs so advantage computation
         # groups multiple rollouts of the same question together.
         if agent_grpo_idx is not None:
-            plan_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx)
-            writer_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx)
+            # DataProto.check_consistency() requires non_tensor_batch arrays to have dtype=object
+            plan_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx, dtype=object)
+            writer_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx, dtype=object)
             # Executor has one output per TODO, not per question — build its index
             # from the todo_mapping (each todo maps back to a question index)
             if todo_mapping:
                 exec_grpo_idx = [agent_grpo_idx[q_idx] for q_idx in todo_mapping]
-                exec_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(exec_grpo_idx)
+                exec_outputs.non_tensor_batch['agent_grpo_idx'] = np.array(exec_grpo_idx, dtype=object)
 
         return {
             "planner": plan_outputs,
@@ -159,6 +160,9 @@ class MultiAgentGenerationManager(LLMGenerationManager):
                 "parsed_todos": parsed_todos,
                 "exec_trajectories": exec_trajectories,
                 "final_reports": final_reports,
+                # todo_mapping[j] = question index for executor TODO j;
+                # used by ray_trainer to expand per-question rewards to per-TODO
+                "todo_mapping": todo_mapping,
             },
         }
 

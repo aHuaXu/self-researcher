@@ -118,7 +118,7 @@ def main_task(config, compute_score=None):
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
     # node_rank = ray.util.get_node_rank()
-    node_rank = int(os.environ["PET_NODE_RANK"])
+    node_rank = int(os.environ.get("PET_NODE_RANK", 0))
     if node_rank == 0:
         with open(config.data.signal_writing_file, 'w') as f:
             json.dump({'signal': config.data.response_signal}, f, indent=4)
