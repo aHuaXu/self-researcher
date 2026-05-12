@@ -1,19 +1,19 @@
 #!/bin/bash
-# Stage 2: Multi-agent LoRA GRPO training — Qwen3-7B-Instruct, 4 GPU (V100 32GB)
+# Stage 2: Multi-agent LoRA GRPO training — Qwen2.5-7B-Instruct, 4 GPU (V100 32GB)
 #
 # Prerequisites:
-#   - Stage 1 (grpo_qwen3_7b.sh) completed
+#   - Stage 1 (grpo_qwen2.5_7b.sh) completed
 #   - Export Stage 1 checkpoint (world_size=4, use torchrun):
 #       torchrun --nproc_per_node=4 scripts/export_fsdp_to_hf.py \
-#         --ckpt_dir  ./ckpts/deepresearcher/qwen3_7b_grpo/global_step_<N>/actor \
-#         --base_model ./models/Qwen3-7B-Instruct \
-#         --output_dir ./ckpts/deepresearcher/qwen3_7b_grpo/exported_hf
+#         --ckpt_dir  ./ckpts/deepresearcher/qwen2.5_7b_grpo/global_step_<N>/actor \
+#         --base_model ./models/Qwen2.5-7B-Instruct \
+#         --output_dir ./ckpts/deepresearcher/qwen2.5_7b_grpo/exported_hf
 #   - Set STAGE1_EXPORT_PATH below to the exported_hf directory
 #   - online_search handler running (see CLAUDE.md)
 set -euo pipefail
 
 # ── Fill in after Stage 1 export ──────────────────────────────────────
-STAGE1_EXPORT_PATH=/home/zjx/ahua_llm/self-researcher/ckpts/deepresearcher/qwen3_7b_grpo/exported_hf
+STAGE1_EXPORT_PATH=/home/zjx/ahua_llm/self-researcher/ckpts/deepresearcher/qwen2.5_7b_grpo/exported_hf
 # ──────────────────────────────────────────────────────────────────────
 
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
@@ -22,7 +22,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export CUDA_VISIBLE_DEVICES=0,1,2,5
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export project_name="multi_agent_research"
-export experiment_name="multi_agent_lora_qwen3_7b"
+export experiment_name="multi_agent_lora_qwen2.5_7b"
 
 BASE=/home/zjx/ahua_llm/self-researcher
 cd ${BASE}
