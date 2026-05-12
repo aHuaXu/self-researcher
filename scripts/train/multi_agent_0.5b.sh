@@ -1,15 +1,12 @@
 #!/bin/bash
-# Multi-agent LoRA GRPO training (Stage 2).
+# Stage 2: Multi-agent LoRA GRPO training — Qwen2.5-0.5B-Instruct, 1 GPU (V100 32GB)
 #
-# To chain from Stage 1 (train_grpo.sh):
-#   1. Run Stage 1 training to completion.
-#   2. Export its FSDP checkpoint to HF format (single command, no GPU needed):
-#        python scripts/export_fsdp_to_hf.py \
-#          --ckpt_dir  ./ckpts/<project>/<exp>/global_step_<N>/actor \
-#          --base_model ./models/Qwen2.5-0.5B-Instruct \
-#          --output_dir ./ckpts/<project>/<exp>/exported_hf
-#   3. Set actor_rollout_ref.model.path below to the exported_hf directory.
-#
+# To chain from Stage 1 (grpo_qwen2.5_3b.sh is too large; use a matching base):
+#   python scripts/export_fsdp_to_hf.py \
+#     --ckpt_dir  ./ckpts/<project>/<exp>/global_step_<N>/actor \
+#     --base_model ./models/Qwen2.5-0.5B-Instruct \
+#     --output_dir ./ckpts/<project>/<exp>/exported_hf
+#   Then set actor_rollout_ref.model.path below to the exported_hf directory.
 set -euo pipefail
 
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
@@ -18,16 +15,15 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export CUDA_VISIBLE_DEVICES=7
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export project_name="multi_agent_research"
-export experiment_name="multi_agent_lora_0.5b_test"
+export experiment_name="multi_agent_lora_0.5b"
 
-cd /home/zjx/ahua_llm/self-researcher
+BASE=/home/zjx/ahua_llm/self-researcher
+cd ${BASE}
 
 # Clean up any stale Ray cluster to avoid placement group naming conflicts
 ray stop --force 2>/dev/null || true
 sleep 3
 ray start --head 2>&1 | tail -2
-
-BASE=/home/zjx/ahua_llm/self-researcher
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=${BASE}/data/multi-research.parquet \
@@ -38,7 +34,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +data.max_model_len=2560 \
     data.data_writing_file=${BASE}/signal/data.json \
     data.signal_writing_file=${BASE}/signal/signal.json \
-    actor_rollout_ref.model.path=/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-0.5B-Instruct \
+    actor_rollout_ref.model.path=${BASE}/models/Qwen2.5-0.5B-Instruct \
     actor_rollout_ref.model.use_remove_padding=false \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=8 \
@@ -81,4 +77,4 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     multi_agent.reward.judge_max_concurrent=10 \
     multi_agent.reward.alpha=0.2 \
     multi_agent.reward.beta=0.3 \
-    trainer.total_epochs=1 2>&1 | tee ./${project_name}_${experiment_name}.log
+    trainer.total_epochs=1 2>&1 | tee ${BASE}/${project_name}_${experiment_name}.log
