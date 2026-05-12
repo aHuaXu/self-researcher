@@ -1001,7 +1001,7 @@ class RayPPOTrainer(object):
             from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
             from verl.workers.reward_manager.multi_agent import MultiAgentRewardManager
 
-            lora_save_dir = './tmp_lora_adapters'
+            lora_save_dir = self.config.multi_agent.get('lora_save_dir', './tmp_lora_adapters')
 
             # Use n=1 for multi-agent: GRPO expansion is done externally
             # via gen_batch.repeat() before entering run_multi_agent_loop.
