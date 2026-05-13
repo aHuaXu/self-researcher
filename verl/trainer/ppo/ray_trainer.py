@@ -626,11 +626,7 @@ class RayPPOTrainer(object):
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             num_gpus=self.config.trainer.n_gpus_per_node,
-            data_writing_file=self.config.data.data_writing_file,
-            signal_writing_file=self.config.data.signal_writing_file,
             model_name=self.config.actor_rollout_ref.model.path,
-            RESPONSE_SIGNAL=self.config.data.response_signal,
-            QUERY_SIGNAL=self.config.data.query_signal,
             n=1, # 只roll一次
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -977,11 +973,7 @@ class RayPPOTrainer(object):
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             num_gpus=self.config.trainer.n_gpus_per_node,
-            data_writing_file=self.config.data.data_writing_file,
-            signal_writing_file=self.config.data.signal_writing_file,
             model_name=self.config.actor_rollout_ref.model.path,
-            RESPONSE_SIGNAL=self.config.data.response_signal,
-            QUERY_SIGNAL=self.config.data.query_signal,
             n=self.config.agent_grpo.n,
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,

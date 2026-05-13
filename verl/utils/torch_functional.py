@@ -84,12 +84,17 @@ def logprobs_from_logits_v2(logits: torch.FloatTensor, labels):
         logsumexp_values = torch.stack([torch.logsumexp(l, dim=-1) for l in logits])
         logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
     else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+        # For bf16/fp16: use per-row logsumexp instead of F.log_softmax to avoid
+        # saving a full (seq_len, vocab_size) tensor per row in the autograd graph.
+        # F.log_softmax saves N rows' tensors simultaneously (N × ~260 MB on a 7B model),
+        # causing OOM on V100. logsumexp only retains a reference to the existing
+        # row_logits view; the (seq_len, vocab_size) softmax is materialised one row
+        # at a time during backward and immediately freed.
         logprobs_labels = []
-        for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
-            row_logprobs = F.log_softmax(row_logits, dim=-1)
-            row_logprobs_labels = row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            logprobs_labels.append(row_logprobs_labels)
+        for row_logits, row_labels in zip(logits, labels):
+            log_z = torch.logsumexp(row_logits, dim=-1)  # (seq_len,) — tiny
+            label_logit = row_logits.gather(-1, row_labels.unsqueeze(-1)).squeeze(-1)  # (seq_len,)
+            logprobs_labels.append(label_logit - log_z)
         logprobs_labels = torch.stack(logprobs_labels)
     return logprobs_labels
 
@@ -103,10 +108,21 @@ def clip_by_value(x, tensor_min, tensor_max):
     return clipped
 
 
-def entropy_from_logits(logits: torch.Tensor):
-    """Calculate entropy from logits."""
-    pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 4096):
+    """Calculate entropy from logits using chunked vocab sum to reduce peak GPU memory.
+
+    For large vocabularies (e.g. 152K for Qwen2.5), materializing the full
+    (bsz, seq, vocab) softmax tensor exceeds V100 memory. We accumulate
+    sum(p * logit) over vocab chunks to keep the peak allocation at
+    (bsz, seq, chunk_size) ≈ 32 MB instead of ~1.2 GB.
+    """
+    log_z = torch.logsumexp(logits, dim=-1)  # (bsz, seq)
+    entropy = log_z.clone()  # will subtract E[logit] below
+    vocab_size = logits.shape[-1]
+    for i in range(0, vocab_size, chunk_size):
+        chunk = logits[..., i:i + chunk_size]
+        p_chunk = torch.exp(chunk - log_z.unsqueeze(-1))
+        entropy -= torch.sum(p_chunk * chunk, dim=-1)
     return entropy
 
 

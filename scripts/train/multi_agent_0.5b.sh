@@ -1,6 +1,7 @@
 #!/bin/bash
 # Stage 2: Multi-agent LoRA GRPO training — Qwen2.5-0.5B-Instruct, 1 GPU (V100 32GB)
 #
+# Set JUDGE_API_KEY in repo-root .env (MiniMax judge API key) — passed to Hydra below.
 # To chain from Stage 1 (grpo_qwen2.5_3b.sh is too large; use a matching base):
 #   python scripts/export_fsdp_to_hf.py \
 #     --ckpt_dir  ./ckpts/<project>/<exp>/global_step_<N>/actor \
@@ -12,13 +13,25 @@ set -euo pipefail
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export project_name="multi_agent_research"
 export experiment_name="multi_agent_lora_0.5b"
 
-BASE=/home/zjx/ahua_llm/self-researcher
-cd ${BASE}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${BASE}"
+
+# Load repo-root .env into shell (JUDGE_API_KEY, etc.) if present
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+fi
+
+# Hydra judge key: prefer JUDGE_API_KEY, else same MiniMax key as tool LLM (LLM_API_KEY)
+export JUDGE_API_KEY="${JUDGE_API_KEY:-${LLM_API_KEY:-}}"
 
 # Clean up any stale Ray cluster to avoid placement group naming conflicts
 ray stop --force 2>/dev/null || true
@@ -32,8 +45,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=1024 \
     data.max_response_length=768 \
     +data.max_model_len=2560 \
-    data.data_writing_file=${BASE}/signal/data.json \
-    data.signal_writing_file=${BASE}/signal/signal.json \
     actor_rollout_ref.model.path=${BASE}/models/Qwen2.5-0.5B-Instruct \
     actor_rollout_ref.model.use_remove_padding=false \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -73,7 +84,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     multi_agent.lora.alpha=128 \
     multi_agent.reward.judge_model="MiniMax-M2.7" \
     multi_agent.reward.judge_base_url="https://api.minimaxi.com/v1" \
-    multi_agent.reward.judge_api_key="sk-cp-ls65iNzF3RxCUXDv0HpObet6FyczQAQYIEyJA-W7mPuqqMQ9qLeD-x6CL-9UcqOC6AhZ8u-m1W7qKEqxEjUHbgZT6imI2pQW-vHQGDGS5DaKyllhVfIUGpM" \
+    multi_agent.reward.judge_api_key="${JUDGE_API_KEY}" \
     multi_agent.reward.judge_max_concurrent=10 \
     multi_agent.reward.alpha=0.2 \
     multi_agent.reward.beta=0.3 \

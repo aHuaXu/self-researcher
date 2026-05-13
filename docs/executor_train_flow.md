@@ -31,16 +31,13 @@ train_grpo.sh
 | `algorithm.kl_ctrl.kl_coef` | 0.001 | KL 惩罚系数 |
 | `max_turns` | 10 | 每条 rollout 最多 10 轮工具调用 |
 
-前置条件：
+前置条件（`online_search` 时需在训练进程环境中可用）：
 
 ```bash
 export PET_NODE_RANK=0
 export VLLM_ATTENTION_BACKEND=XFORMERS
 ray start --head
-
-# 如果用 online_search 模式，另外需要启动搜索服务
-python -m scrl.handler.server_handler   # Flask :5000
-python -m scrl.handler.handler           # 轮询协调器
+export SERPER_API_KEY=...   # 或配置仓库根目录 .env，见 research_agent/config.py
 ```
 
 ## 2. Rollout 阶段 — 多轮 Agent 循环
@@ -57,7 +54,9 @@ python -m scrl.handler.handler           # 轮询协调器
          - 如果包含 <answer>...</answer> → 结束，记录答案
          - 如果包含 <tool_call>{"name":"web_search", ...}</tool_call>
            → 提取工具调用
-      3. 执行工具调用（通过文件 IPC）
+      3. 执行工具：`LLMGenerationManager.execute_predictions` 同步调用
+         `research_agent.tools`（`web_search` / `browse_webpage`），配置来自
+         `research_agent/config.py`（环境变量 / 仓库根 `.env`）
       4. 将工具结果作为 observation 追加到 messages
       5. 继续下一轮生成
 ```
@@ -73,33 +72,14 @@ python -m scrl.handler.handler           # 轮询协调器
 <answer>最终答案</answer>
 ```
 
-## 3. 文件 IPC — 训练节点 ↔ 搜索服务
+## 3. 工具执行（进程内）
 
-训练和搜索分别运行在不同进程（可以跨机器），通过两个 JSON 文件通信：
+Rollout 不再通过独立 `handler` 进程或 JSON 文件 IPC；工具在同一 Python 进程内执行：
 
-```
-训练进程                          搜索协调器 (handler.py)
-─────────────                    ──────────────────────
-生成 tool_call                   轮询 signal/signal.json
-写 signal/data.json (查询)       ↓
-写 signal/signal.json = {1}  ──► 读 signal/data.json
-等待...                          分发到 server_handler.py
-                                 Flask → WebSearchAgent / ReadingAgent
-                                 写回 signal/data.json (结果)
-读 signal/data.json ◄────────── 写 signal/signal.json = {0}
-继续生成
-```
+- `scrl/llm_agent/generation.py` → `execute_predictions` → `research_agent.tools.web_search` / `browse_webpage`
+- `research_agent/tools/_state.py` 中的 `ToolState` 持有 `WebSearchAgent` / `ReadingAgent`（实现仍在 `scrl/handler/web_search_agent/` 等目录）
 
-`signal/data.json` 格式示例（训练写入）：
-
-```json
-[
-  {"query": ["A股行情"], "action_type": "web_search"},
-  {"url_list": ["https://..."], "action_type": "browse_webpage"}
-]
-```
-
-搜索服务处理完后写回同一文件，内容替换为搜索/浏览结果。
+Serper / Bing 等密钥通过 `SERPER_API_KEY`、`AZURE_BING_KEY` 等环境变量注入（见 `research_agent/config.py`）。
 
 ## 4. Reward 计算
 
@@ -194,9 +174,8 @@ KL 惩罚防止模型偏离初始 Qwen2.5-7B 太远，保持语言生成质量�
 | `verl/workers/rollout/vllm_rollout/` | vLLM 推理引擎 |
 | `verl/utils/reward_score/format_and_f1.py` | Token-level F1 reward |
 | `verl/protocol.py` | `DataProto` — 核心批量 tensor 数据结构 |
-| `scrl/llm_agent/generation.py` | `LLMGenerationManager` — 多轮 agent 循环，tool call 解析 |
-| `scrl/handler/handler.py` | 训练↔搜索桥接（文件 IPC） |
-| `scrl/handler/server_handler.py` | Flask 搜索服务 |
+| `scrl/llm_agent/generation.py` | `LLMGenerationManager` — 多轮 agent 循环，tool call 解析与进程内工具调用 |
+| `research_agent/tools/` | LangChain 风格工具与 `ToolState`（搜索/浏览配置） |
 
 ## 总结
 

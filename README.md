@@ -66,25 +66,13 @@ export PET_NODE_RANK=0
 ray start --head
 ```
 
-### Run backend handler
+### Configure web search (in-process tools)
 
-Running the following command to launch the server handler:
-1. Modify ```serper_api_key``` or ```azure_bing_search_subscription_key``` & ```search_engine``` in ```./scrl/handler/config.yaml```
-2. Add  ```qwen-plus``` api key in ```./scrl/handler/server_handler.py```
-```python
-client = OpenAI(
-    api_key="sk-xxx",
-    base_url="xxxx"
-)
-```
-3. Start server handler:
-```bash
- python ./scrl/handler/server_handler.py
-```
+RL rollouts call `research_agent.tools` directly from `scrl/llm_agent/generation.py` (no separate handler server). Set keys via environment variables or a **repository root** `.env` file (see `research_agent/config.py`):
 
-After launching all server handlers, you can replace ```server_url_list``` in ```./scrl/handler/config.yaml``` in your training host node and then run:
 ```bash
- python ./scrl/handler/handler.py
+export SERPER_API_KEY=your_serper_key   # google.serper.dev
+export SEARCH_ENGINE=google             # or bing + AZURE_BING_KEY
 ```
 ### Training model
 

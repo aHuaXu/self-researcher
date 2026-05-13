@@ -79,7 +79,11 @@ def get_response_from_llm(
             "content": content.strip()
         }
     except Exception as e:
-        print(f"LLM API error: {e}")
+        base = getattr(client, "base_url", None) or ""
+        hint = ""
+        if "localhost" in str(base) or "127.0.0.1" in str(base):
+            hint = " (browse/reading uses LLM_BASE_URL; set a reachable OpenAI-compatible API in .env if browse_webpage is used)"
+        print(f"LLM API error: {e}{hint}")
         if "Input data may contain inappropriate content" in str(e):
             return {
                 "content": ""

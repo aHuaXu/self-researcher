@@ -7,7 +7,6 @@
 # Project URL: https://github.com/PeterGriffinJin/Search-R1
 # =============================================================================
 
-from sympy import SYMPY_DEBUG
 import torch
 import re
 from collections import defaultdict
@@ -17,23 +16,16 @@ from dataclasses import dataclass
 from scrl.llm_agent.tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from verl.utils.tracking import Tracking
-import shutil
-import requests
 import json
 import numpy as np
 import time
-from datetime import datetime
 from time import strftime, gmtime
 
 @dataclass
 class GenerationConfig:
     max_turns: int
     num_gpus: int
-    data_writing_file: str = None
-    signal_writing_file: str = None
     model_name: str = None
-    RESPONSE_SIGNAL: int = 0
-    QUERY_SIGNAL: int = 1
     n: int = 1,
     project_name: str = None,
     experiment_name: str = None,
@@ -142,22 +134,18 @@ The question I give you is a complex question that requires a *deep research* to
 I will provide you with one tool to help you answer the question:
 * A web search tool to help you perform search.
 
-You don't have to answer the question now, but you should first think about the research plan or what to search next.
+You don't have to answer the question now, but you should first analyze the question and think about what to search next.
 
 Your output format should be one of the following two formats:
 
-<think>
-YOUR THINKING PROCESS
-</think>
+Format 1 - When you have enough information to answer:
+[Your analysis and reasoning here]
 <answer>
-YOUR ANSWER AFTER GETTING ENOUGH INFORMATION
+YOUR FINAL ANSWER
 </answer>
 
-or
-
-<think>
-YOUR THINKING PROCESS
-</think>
+Format 2 - When you need to search for more information:
+[Your analysis and reasoning here]
 <tool_call>
 YOUR TOOL CALL WITH CORRECT FORMAT
 </tool_call>
@@ -177,22 +165,18 @@ I will provide you with two tools to help you answer the question:
 * A web search tool to help you perform google search. 
 * A webpage browsing tool to help you get new page content.
 
-You don't have to answer the question now, but you should first think about the research plan or what to search next.
+You don't have to answer the question now, but you should first analyze the question and think about what to search next.
 
 Your output format should be one of the following two formats:
 
-<think>
-YOUR THINKING PROCESS
-</think>
+Format 1 - When you have enough information to answer:
+[Your analysis and reasoning here]
 <answer>
-YOUR ANSWER AFTER GETTING ENOUGH INFORMATION
+YOUR FINAL ANSWER
 </answer>
 
-or
-
-<think>
-YOUR THINKING PROCESS
-</think>
+Format 2 - When you need to search for more information:
+[Your analysis and reasoning here]
 <tool_call>
 YOUR TOOL CALL WITH CORRECT FORMAT
 </tool_call>
@@ -250,13 +234,6 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         )['input_ids']
         return next_obs_ids
         
-    def postprocess_predictions(self, rollings_active: DataProto, gen_output: DataProto) -> Tuple[List[int], List[bool]]:
-        """Postprocess predictions to remove padding and convert to list of strings."""
-        """return: list of query contents including history"""
-
-        pass
-        return [{"prompt":""} for _ in range(rollings_active.batch['input_ids'].shape[0])]
-
     def execute_predictions(self, 
         tool_call_list: List[Tuple[int, str, str, str]], total_number: int = 4096
     ) :
@@ -353,43 +330,35 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         return query_contents
 
     def parse_response(self, input_ids: torch.Tensor, think: bool = False) -> List[Tuple[bool, str, str]]:
-        """Parse response to get the thinking process and answer or tool call.
-            return: [(is_stop, thinking, answer/tool_call), ...]
+        """Parse response to get the reasoning and answer or tool call.
+            return: [(is_stop, reasoning, answer/tool_call), ...]
         """
         response_contents = self.tokenizer.batch_decode(input_ids)
         results = []
-        for i, content in enumerate(response_contents):
-            if think:
-                content = "<think>" + content
-            if "<think>" in content and "<answer>" in content:
-                if "</think>" not in content or "</answer>" not in content:
+        for content in response_contents:
+            if "<answer>" in content and "</answer>" in content:
+                reasoning = content.split("<answer>")[0].strip()
+                answer = content.split("<answer>")[1].split("</answer>")[0].strip()
+                results.append((True, reasoning, answer))
+            elif "<tool_call>" in content and "</tool_call>" in content:
+                reasoning = content.split("<tool_call>")[0].strip()
+                tool_call_str = content.split("<tool_call>")[1].split("</tool_call>")[0].strip()
+                try:
+                    tool_call = json.loads(tool_call_str)
+                    assert "name" in tool_call, "no valid function name in tool_call"
+                    assert "arguments" in tool_call, "no valid arguments in tool_call"
+                    assert tool_call["name"] in ["web_search", "browse_webpage"], "invalid tool name"
+                    if tool_call["name"] == "web_search":
+                        assert "query" in tool_call["arguments"], "no valid query in tool_call"
+                        assert isinstance(tool_call["arguments"]["query"], list), "query should be a list"
+                    elif tool_call["name"] == "browse_webpage":
+                        assert "url_list" in tool_call["arguments"], "no valid url_list in tool_call"
+                        assert isinstance(tool_call["arguments"]["url_list"], list), "url_list should be a list"
+                        assert len(tool_call["arguments"]["url_list"]) >= 1, "url_list number must be greater than 0"
+                    results.append((False, reasoning, tool_call))
+                except Exception as e:
+                    print(f"model tool call format error: {e}")
                     results.append((True, "", ""))
-                else:
-                    think = content.split("<think>")[1].split("</think>")[0]
-                    answer = content.split("<answer>")[1].split("</answer>")[0]
-                    results.append((True, think, answer))
-            elif "<think>" in content and "<tool_call>" in content:
-                if "</tool_call>" not in content or "</think>" not in content:
-                    results.append((True, "", ""))
-                else:
-                    think = content.split("<think>")[1].split("</think>")[0]
-                    tool_call = content.split("<tool_call>")[1].split("</tool_call>")[0]
-                    try:
-                        tool_call = json.loads(tool_call)
-                        assert "name" in tool_call, "no vliad function name in tool_call"
-                        assert "arguments" in tool_call, "no valid arguments in tool_call"
-                        assert tool_call["name"] in ["web_search", "browse_webpage"], "invalid tool name"
-                        if tool_call["name"] == "web_search":
-                            assert "query" in tool_call["arguments"], "no valid query in tool_call"
-                            assert isinstance(tool_call["arguments"]["query"], list), "query should be a list"
-                        elif tool_call["name"] == "browse_webpage":
-                            assert "url_list" in tool_call["arguments"], "no valid url_list in tool_call"
-                            assert isinstance(tool_call["arguments"]["url_list"], list), "url_list should be a list"
-                            assert len(tool_call["arguments"]["url_list"]) >= 1, "url_list number must be greater than 0"
-                        results.append((False, think, tool_call))
-                    except Exception as e:
-                        print(f"model tool call format error: {e}")
-                        results.append((True, "", ""))
             else:
                 results.append((True, "", ""))
         return results
@@ -425,12 +394,6 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 break
 
             rollings_active = self.tokenizer.apply_chat_template(activate_messages_list, add_generation_prompt=True, tools=self.tools, tokenize=False)
-            think = True
-            
-            if think:
-                rollings_active = [rolling + "<think>" for rolling in rollings_active]
-            else:
-                rollings_active = [rolling for rolling in rollings_active]
             rollings_active = self.tokenizer(rollings_active, return_tensors="pt",padding=True)
 
             pad_mask = rollings_active['input_ids'] != self.tokenizer.pad_token_id
@@ -463,7 +426,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             meta_info = gen_output.meta_info
             print(f"node {node_rank}, turn {step} gen_output {len(gen_output.batch['responses'])} datas")
 
-            results = self.parse_response(gen_output.batch['responses'], think=think)
+            results = self.parse_response(gen_output.batch['responses'])
             assert len(results) == len(activate_list) # 每一轮更新后，结果数量和当前活跃的query数量一致
             activate_list_copy = []
             tool_call_list = []
@@ -480,7 +443,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 messages_list[tool_call_list[i]['idx']].append(
                     {
                         "role": "assistant", 
-                        "content": "<think>" + tool_call_list[i]['think'] + "</think>", 
+                        "content": tool_call_list[i]['think'],
                         "tool_calls": [
                                         {
                                             "type": "function", 

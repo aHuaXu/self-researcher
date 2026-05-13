@@ -28,7 +28,6 @@ def browse_webpage(url_list: List[str]) -> str:
     if state.action_info is None:
         return json.dumps({"error": "No previous search results. Call web_search first."})
 
-    # Mirrors handler.py:316-339
     read_webpage_list: List[WebPageInfo] = state.reading_agent.read_batch(
         user_query=state.current_question,
         search_result_info_list=state.action_info.search_result_info_list,

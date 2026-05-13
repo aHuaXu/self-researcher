@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any
 from scrl.handler.utils import (
     get_content_from_tag,
@@ -111,7 +112,10 @@ class ReadingAgent:
         for url in url_list:
             url_dict[url] = []
         future_to_content = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        # Many parallel LLM calls share one OpenAI client → bursts cause timeouts / connection errors
+        # against external APIs (e.g. MiniMax). Tune with READING_AGENT_MAX_WORKERS (default 8).
+        max_workers = max(1, int(os.getenv("READING_AGENT_MAX_WORKERS", "8")))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             for search_result_info in search_result_info_list:
                 search_query = search_result_info.search_query
                 web_page_info_list = search_result_info.web_page_info_list

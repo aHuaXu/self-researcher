@@ -162,11 +162,21 @@ class DataParallelPPOActor(BasePPOActor):
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
+        # JIT-load optimizer states from CPU to GPU only for this step, then offload back.
+        # This keeps the 14 GB fp32 AdamW state off-GPU during forward+backward, reducing
+        # peak memory from ~22 GB to ~7 GB at the start of update_policy.
+        if getattr(self, '_optimizer_load_fn', None) is not None:
+            self._optimizer_load_fn()
+
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         self.actor_optimizer.step()
+
+        if getattr(self, '_optimizer_offload_fn', None) is not None:
+            self._optimizer_offload_fn()
+
         return grad_norm
 
     def compute_log_prob(self, data: DataProto, lora_name: str = None) -> torch.Tensor:
@@ -230,6 +240,12 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs
 
     def update_policy(self, data: DataProto, tokenizer, lora_name: str = None):
+        # Release PyTorch-reserved-but-unallocated blocks accumulated by the previous
+        # step (vLLM inference, optimizer step, etc.) back to CUDA.  Without this,
+        # fragmentation from prior steps leaves the allocator unable to satisfy the
+        # ~66 MiB FSDP gradient shard allocation during backward (step 2+).
+        torch.cuda.empty_cache()
+
         # LoRA gradient isolation: activate the target adapter and freeze other LoRA params
         if lora_name is not None:
             self.actor_module.set_adapter(lora_name)

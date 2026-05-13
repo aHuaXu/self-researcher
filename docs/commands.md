@@ -17,9 +17,6 @@ print(f'Status: {resp.status_code}')
 print(resp.text[:200])
 "
 
-# 验证 scrl 包可正常导入
-.venv/bin/python -c "from scrl.handler.handler import Handler; print('OK')"
-
 # 验证 research_agent 可正常导入
 .venv/bin/python -c "from research_agent.graph import create_research_graph; print('OK')"
 ```
@@ -27,13 +24,7 @@ print(resp.text[:200])
 ## 训练流程（需要 GPU 环境）
 
 ```bash
-# 启动搜索服务
-python -m scrl.handler.server_handler
-
-# 启动训练协调器
-python -m scrl.handler.handler
-
-# 训练
+# 训练（工具在进程内通过 research_agent + SERPER_API_KEY 等配置，无需单独 handler 服务）
 export PET_NODE_RANK=0
 export VLLM_ATTENTION_BACKEND=XFORMERS
 ray start --head

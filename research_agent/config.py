@@ -3,11 +3,13 @@
 import os
 from dotenv import load_dotenv
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
-# 自动加载根目录的 .env 文件
-# config.py 在 research_agent/config.py，所以根目录是 ../../.env
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+# Load repo-root .env (self-researcher/.env): research_agent/ -> parent is repo root.
+# override=True: if the shell exported an empty SERPER_API_KEY (common with Ray / profiles),
+# still apply values from .env. To force env-only, unset variables before import or skip .env.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=True)
 
 
 @dataclass
@@ -25,10 +27,16 @@ class SearchConfig:
 
 @dataclass
 class LLMConfig:
-    """LLM configuration."""
+    """LLM configuration.
+
+    Used by ReadingAgent / page extraction when the model calls ``browse_webpage``.
+    ``web_search`` only needs Serper; browse still calls this OpenAI-compatible API.
+    If ``LLM_BASE_URL`` points at localhost and no server is running, expect timeouts.
+    """
     model: str = "qwen2.5-7b"
     base_url: str = "http://localhost:8000/v1"
     api_key: str = "token-xxx"
+    timeout: float = 120.0
 
 
 @dataclass
@@ -58,6 +66,7 @@ def load_config() -> AgentConfig:
     config.llm.model = os.getenv("LLM_MODEL", "qwen2.5-7b")
     config.llm.base_url = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
     config.llm.api_key = os.getenv("LLM_API_KEY", "token-xxx")
+    config.llm.timeout = float(os.getenv("LLM_TIMEOUT_SEC", "120"))
 
     # Cache paths
     config.query_save_path = os.getenv("QUERY_SAVE_PATH", "./research_agent/cache/search_result.json")
