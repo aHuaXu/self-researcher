@@ -167,6 +167,9 @@ def llama_attn_forward(
     """
     from transformers.models.llama.modeling_llama import eager_attention_forward
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    # transformers>=4.50 renamed this kwarg to `past_key_values`.
+    if past_key_value is None and "past_key_values" in kwargs:
+        past_key_value = kwargs.pop("past_key_values")
     bsz, q_len, _ = hidden_states.shape
 
     query_states = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)

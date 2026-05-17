@@ -24,14 +24,16 @@ class SimpleTextBrowser:
     def __init__(
         self,
         start_page: Optional[str] = None,
-        viewport_size: Optional[int] = 1024 * 8,
+        viewport_size: Optional[int] = None,
         downloads_folder: Optional[Union[str, None]] = None,
         serpapi_key: Optional[Union[str, None]] = None,
         serper_api_key: Optional[Union[str, None]] = None,
         request_kwargs: Optional[Union[Dict[str, Any], None]] = None,
     ):
         self.start_page: str = start_page if start_page else "about:blank"
-        self.viewport_size = viewport_size  # Applies only to the standard uri types
+        if viewport_size is None:
+            viewport_size = int(os.getenv("VIEWPORT_SIZE", str(200 * 1024)))
+        self.viewport_size = viewport_size
         self.downloads_folder = downloads_folder
         self.history: List[Tuple[str, float]] = list()
         self.page_title: Optional[str] = None

@@ -31,7 +31,7 @@ class WebSearchAgent:
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0"
 
         self.BROWSER_CONFIG = {
-            "viewport_size": 1024 * 5 * 8,
+            "viewport_size": int(os.getenv("VIEWPORT_SIZE", str(200 * 1024))),
             "downloads_folder": "downloads_folder",
             "request_kwargs": {
                 "headers": {"User-Agent": self.user_agent},

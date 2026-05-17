@@ -10,6 +10,7 @@ from scrl.handler.web_search_agent.search.search_api import web_search as serper
 from scrl.handler.webpage import WebPageInfo, SearchResultInfo
 from scrl.handler.agent_action import ActionInfo
 from research_agent.tools._state import get_tool_state
+from research_agent.tools.context import tool_rollout_message_idx, tool_rollout_user_query
 
 
 @tool
@@ -31,21 +32,30 @@ def web_search(query: List[str]) -> str:
 
     search_query_list = query[:3]
 
-    # Step 1: Call Serper API for each query, with caching
+    user_query = tool_rollout_user_query.get() or state.current_question
+
+    # Step 1: Call Serper API for each query, with caching (dict updates guarded for concurrent web_search).
     for sq in search_query_list:
-        if sq in state.api_result_dict and len(state.api_result_dict[sq].get('organic', [])) > 0 \
-                and (time.time() - state.api_result_dict[sq]['timestamp'] <= 60 * 60 * 24 * 7):
+        need_fetch = False
+        with state._api_result_lock:
+            ent = state.api_result_dict.get(sq)
+            if not ent or len(ent.get("organic", [])) == 0:
+                need_fetch = True
+            elif time.time() - ent["timestamp"] > 60 * 60 * 24 * 7:
+                need_fetch = True
+        if not need_fetch:
             continue
         config = state.web_search_agent.config
         organic = serper_search(sq, config)
-        state.api_result_dict[sq] = {
-            "timestamp": time.time(),
-            "organic": organic,
-        }
+        with state._api_result_lock:
+            state.api_result_dict[sq] = {
+                "timestamp": time.time(),
+                "organic": organic,
+            }
 
     # Step 2: Build WebPageInfo lists
     web_page_info_list_batch = state.web_search_agent.search_web_batch(
-        user_query=state.current_question,
+        user_query=user_query,
         search_query_list=search_query_list,
         api_result_dict=state.api_result_dict,
     )
@@ -59,12 +69,16 @@ def web_search(query: List[str]) -> str:
         for j, web_page_info_list in enumerate(web_page_info_list_batch)
     ]
 
-    state.action_info = ActionInfo(
-        user_query=state.current_question,
+    action_info = ActionInfo(
+        user_query=user_query,
         search_thinking="",
         search_query_list=search_query_list,
         search_result_info_list=search_result_info_list,
     )
+    msg_idx = tool_rollout_message_idx.get()
+    if msg_idx is not None:
+        state.per_message_action_info[msg_idx] = action_info
+    state.action_info = action_info
 
     # Step 4: Format output
     content = []

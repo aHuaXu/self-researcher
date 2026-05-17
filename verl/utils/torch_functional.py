@@ -108,21 +108,44 @@ def clip_by_value(x, tensor_min, tensor_max):
     return clipped
 
 
-def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 4096):
-    """Calculate entropy from logits using chunked vocab sum to reduce peak GPU memory.
+def _chunked_logsumexp(logits: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
+    """Compute logsumexp over last dim without materializing a full-vocab temporary.
 
-    For large vocabularies (e.g. 152K for Qwen2.5), materializing the full
-    (bsz, seq, vocab) softmax tensor exceeds V100 memory. We accumulate
-    sum(p * logit) over vocab chunks to keep the peak allocation at
-    (bsz, seq, chunk_size) ≈ 32 MB instead of ~1.2 GB.
+    ``torch.logsumexp`` creates a (bsz, seq, vocab) exp() temporary which OOMs
+    on V100-32 GB for Qwen2.5 vocab (151936).  This version keeps peak alloc at
+    (bsz, seq, chunk_size).
     """
-    log_z = torch.logsumexp(logits, dim=-1)  # (bsz, seq)
-    entropy = log_z.clone()  # will subtract E[logit] below
+    max_val = torch.full(logits.shape[:-1], float('-inf'),
+                         device=logits.device, dtype=logits.dtype)
     vocab_size = logits.shape[-1]
     for i in range(0, vocab_size, chunk_size):
+        chunk_max = logits[..., i:i + chunk_size].max(dim=-1).values
+        max_val = torch.max(max_val, chunk_max)
+
+    sum_exp = torch.zeros_like(max_val)
+    for i in range(0, vocab_size, chunk_size):
+        sum_exp += torch.exp(logits[..., i:i + chunk_size] - max_val.unsqueeze(-1)).sum(dim=-1)
+
+    return max_val + sum_exp.log()
+
+
+def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 1024):
+    """Calculate entropy from logits using chunked vocab operations to limit peak GPU memory.
+
+    Both logsumexp and the softmax·logit product are computed in vocab chunks so
+    that the largest temporary is (bsz, seq, chunk_size) ≈ 15 MB instead of the
+    full (bsz, seq, vocab) ≈ 3+ GB that would OOM on V100-32 GB.
+    """
+    log_z = _chunked_logsumexp(logits, chunk_size)  # (bsz, seq)
+    entropy = log_z.clone()
+    vocab_size = logits.shape[-1]
+    log_z_expanded = log_z.unsqueeze(-1)
+    for i in range(0, vocab_size, chunk_size):
         chunk = logits[..., i:i + chunk_size]
-        p_chunk = torch.exp(chunk - log_z.unsqueeze(-1))
-        entropy -= torch.sum(p_chunk * chunk, dim=-1)
+        p_chunk = torch.exp(chunk - log_z_expanded)
+        entropy.sub_(torch.sum(p_chunk * chunk, dim=-1))
+        del p_chunk
+    del log_z_expanded
     return entropy
 
 

@@ -10,8 +10,9 @@
 import torch
 import re
 from collections import defaultdict
+import concurrent.futures
 import os
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 from scrl.llm_agent.tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
@@ -25,6 +26,7 @@ from time import strftime, gmtime
 class GenerationConfig:
     max_turns: int
     num_gpus: int
+    max_seq_len_for_training: int = 7000
     model_name: str = None
     n: int = 1,
     project_name: str = None,
@@ -240,30 +242,88 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         """直接调用工具（无需文件 IPC）"""
         from research_agent.tools import web_search, browse_webpage
         from research_agent.tools._state import get_tool_state
+        from research_agent.tools.context import tool_rollout_message_idx, tool_rollout_user_query
 
         tool_state = get_tool_state()
         tool_state.ensure_initialized()
 
-        results = []
-        for tool_call in tool_call_list:
-            idx, question, think, tool = tool_call
-            tool_name = tool.get("name", "")
-            args = tool.get("arguments", {})
+        def run_at_index(i: int) -> Dict[str, Any]:
+            idx, question, think, tool = tool_call_list[i]
+            var_idx = tool_rollout_message_idx.set(idx)
+            var_uq = tool_rollout_user_query.set(question)
+            try:
+                ts = get_tool_state()
+                ts.ensure_initialized()
+                tool_name = tool.get("name", "")
+                args = tool.get("arguments", {})
+                if tool_name == "web_search":
+                    content = web_search.invoke(args)
+                elif tool_name == "browse_webpage":
+                    content = browse_webpage.invoke(args)
+                else:
+                    content = f'{{"error": "Unknown tool: {tool_name}"}}'
+                return {
+                    "idx": idx,
+                    "question": question,
+                    "think": think,
+                    "tool_call": tool,
+                    "content": content,
+                }
+            finally:
+                tool_rollout_user_query.reset(var_uq)
+                tool_rollout_message_idx.reset(var_idx)
 
-            if tool_name == "web_search":
-                result = web_search.invoke(args)
-            elif tool_name == "browse_webpage":
-                result = browse_webpage.invoke(args)
-            else:
-                result = f'{{"error": "Unknown tool: {tool_name}"}}'
+        n = len(tool_call_list)
+        results: List[Optional[Dict[str, Any]]] = [None] * n
 
-            results.append({
-                "idx": idx,
-                "question": question,
-                "think": think,
-                "tool_call": tool,
-                "content": result,
-            })
+        web_positions = [
+            i for i in range(n) if tool_call_list[i][3].get("name") == "web_search"
+        ]
+        browse_positions = [
+            i for i in range(n) if tool_call_list[i][3].get("name") == "browse_webpage"
+        ]
+        other_positions = [
+            i for i in range(n) if i not in web_positions and i not in browse_positions
+        ]
+
+        search_workers = max(1, int(os.getenv("TOOL_WEB_SEARCH_MAX_WORKERS", "5")))
+        browse_workers = max(1, int(os.getenv("TOOL_BROWSE_MAX_WORKERS", "4")))
+        timeout = int(os.getenv("TOOL_CALL_TIMEOUT", "120"))
+
+        def _run_parallel(positions: List[int], max_w: int):
+            if not positions:
+                return
+            if len(positions) == 1:
+                results[positions[0]] = run_at_index(positions[0])
+                return
+            w = min(max_w, len(positions))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=w) as pool:
+                futures = {pool.submit(run_at_index, i): i for i in positions}
+                try:
+                    for fut in concurrent.futures.as_completed(futures, timeout=timeout):
+                        i = futures[fut]
+                        try:
+                            results[i] = fut.result()
+                        except Exception as e:
+                            print(f"[execute_predictions] tool error at index {i}: {e}")
+                            idx, question, think, tool = tool_call_list[i]
+                            results[i] = {
+                                "idx": idx, "question": question, "think": think,
+                                "tool_call": tool, "content": json.dumps({"error": str(e)}),
+                            }
+                except concurrent.futures.TimeoutError:
+                    print(f"[execute_predictions] timeout after {timeout}s, filling remaining with errors")
+                    for fut, i in futures.items():
+                        if results[i] is None:
+                            idx, question, think, tool = tool_call_list[i]
+                            results[i] = {
+                                "idx": idx, "question": question, "think": think,
+                                "tool_call": tool, "content": json.dumps({"error": "timeout"}),
+                            }
+                            fut.cancel()
+
+        _run_parallel(web_positions, search_workers)
+        _run_parallel(browse_positions + other_positions, browse_workers)
 
         return results
 
@@ -439,6 +499,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                     
             tool_call_list = self.execute_predictions(tool_call_list,len(messages_list))
             print(f"node {node_rank}, turn {step} tool_call_list {len(tool_call_list)} datas")
+            tool_content_max_chars = int(os.getenv("TOOL_CONTENT_MAX_CHARS", "3000"))
             for i in range(len(tool_call_list)):
                 messages_list[tool_call_list[i]['idx']].append(
                     {
@@ -452,11 +513,14 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                                     ]
                     }
                 )
+                content = tool_call_list[i]['content']
+                if len(content) > tool_content_max_chars:
+                    content = content[:tool_content_max_chars] + "\n...[truncated]"
                 messages_list[tool_call_list[i]['idx']].append(
                     {
                         "role": "tool", 
                         "name": tool_call_list[i]['tool_call']["name"],
-                        "content": tool_call_list[i]['content']
+                        "content": content
                     }
                 )
             print(f"第{step}轮结束， node {node_rank} 原本有{len(activate_list)}个query，现在有{len(activate_list_copy)}个query")
@@ -481,9 +545,15 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         prompts_repeated = prompts_repeated.gather(1, sorted_indices)
         prompts_attention_mask = prompts_tokenizered['attention_mask'].gather(1, sorted_indices)
 
-        responses = self.tokenizer(response_str_list, return_tensors="pt",padding=True)['input_ids']
-        
-        responses_attention_mask = self.tokenizer(response_str_list, return_tensors="pt",padding=True)['attention_mask']
+        max_seq_len = int(self.config.max_seq_len_for_training)
+        max_response_tokens = max(512, max_seq_len - prompts_repeated.shape[1])
+
+        responses_tokenized = self.tokenizer(response_str_list, return_tensors="pt", padding=True)
+        responses = responses_tokenized['input_ids'][:, :max_response_tokens]
+        responses_attention_mask = responses_tokenized['attention_mask'][:, :max_response_tokens]
+        if responses_tokenized['input_ids'].shape[1] > max_response_tokens:
+            print(f"[WARN] response truncated from {responses_tokenized['input_ids'].shape[1]} to {max_response_tokens} tokens (max_seq_len={max_seq_len})")
+
         attention_mask = torch.cat((prompts_attention_mask, responses_attention_mask), dim=-1)
         position_ids = self.tensor_fn.create_position_ids(attention_mask)
         

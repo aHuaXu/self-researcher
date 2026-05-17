@@ -15,7 +15,7 @@
 import torch
 from transformers import PretrainedConfig
 
-VALID_CONFIG_TYPE = {"llama", "qwen2", "qwen2_vl", "qwen2_5_vl"}
+VALID_CONFIG_TYPE = {"llama", "qwen2", "qwen3", "qwen2_vl", "qwen2_5_vl"}
 
 
 def get_device_flops(unit="T"):
@@ -59,17 +59,18 @@ class FlopsCounter:
     """
 
     def __init__(self, config: PretrainedConfig):
-        if not config.model_type in VALID_CONFIG_TYPE:
-            print(f"Only support config type of {VALID_CONFIG_TYPE}, but got {self.config.model_type}. "
+        self.config = config
+        if config.model_type not in VALID_CONFIG_TYPE:
+            print(f"Only support config type of {VALID_CONFIG_TYPE}, but got {config.model_type}. "
                   f"MFU will always be zero.")
 
         self.estimate_func = {
             'qwen2': self._estimate_qwen2_flops,
+            'qwen3': self._estimate_qwen2_flops,
             'llama': self._estimate_qwen2_flops,
             'qwen2_vl': self._estimate_qwen2_flops,
             'qwen2_5_vl': self._estimate_qwen2_flops
         }
-        self.config = config
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time):
         return 0

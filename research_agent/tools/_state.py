@@ -1,6 +1,7 @@
 """Shared state between web_search and browse_webpage tools."""
 
 import os
+import threading
 from typing import Dict, Optional
 
 from openai import OpenAI
@@ -21,6 +22,9 @@ class ToolState:
         self.reading_agent: Optional[ReadingAgent] = None
         self.current_question: str = ""
         self.action_info: Optional[ActionInfo] = None
+        # When multiple web_search run concurrently, ActionInfo is keyed by messages_list index.
+        self.per_message_action_info: Dict[int, ActionInfo] = {}
+        self._api_result_lock = threading.Lock()
         self.api_result_dict: Dict = {}
         self._initialized = False
 
@@ -49,6 +53,7 @@ class ToolState:
                 "search_lang": config.search.lang,
                 "azure_bing_search_subscription_key": config.search.azure_subscription_key,
                 "azure_bing_search_mkt": config.search.azure_mkt,
+                "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8888"),
                 "quick_summary_model": config.llm.model,
                 "reading_agent_model": config.llm.model,
                 "query_save_path": config.query_save_path,
@@ -84,6 +89,7 @@ def build_handler_config(agent_config) -> dict:
         "search_lang": agent_config.search.lang,
         "azure_bing_search_subscription_key": agent_config.search.azure_subscription_key,
         "azure_bing_search_mkt": agent_config.search.azure_mkt,
+        "searxng_url": os.getenv("SEARXNG_URL", "http://localhost:8888"),
         "quick_summary_model": agent_config.llm.model,
         "reading_agent_model": agent_config.llm.model,
         "query_save_path": agent_config.query_save_path,

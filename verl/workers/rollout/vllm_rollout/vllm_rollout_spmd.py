@@ -24,6 +24,7 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+import logging
 import numpy as np
 from typing import List
 from contextlib import contextmanager
@@ -40,6 +41,8 @@ from vllm.distributed import parallel_state as vllm_ps
 from vllm import LLM, SamplingParams
 from verl.third_party.vllm import vllm_version
 from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 # TODO
 # 1. support pp in vllm
@@ -108,7 +111,7 @@ class vLLMRollout(BaseRollout):
 
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=True,
+            enable_sleep_mode=False,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,
@@ -116,17 +119,24 @@ class vLLMRollout(BaseRollout):
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
-            max_model_len=config.prompt_length + config.response_length,
+            max_model_len=config.get('max_model_len', config.prompt_length + config.response_length),
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_prefix_caching=config.get('enable_prefix_caching', False),
+            seed=config.get('seed', 0),
             **lora_kwargs,
         )
 
         self.inference_engine.set_tokenizer(tokenizer)
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        # Offload vLLM model weights to CPU to free GPU for FSDP training
+        model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        for param in model.parameters():
+            param.data = torch.empty_like(param, device='cpu')
+        torch.cuda.empty_cache()
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        logger.warning(f"[DEBUG MEM] After initial vLLM offload: free={free_mem/1e9:.2f}GiB, "
+                       f"used={(total_mem-free_mem)/1e9:.2f}GiB, total={total_mem/1e9:.2f}GiB")
 
         kwargs = dict(
             n=1,
@@ -194,10 +204,11 @@ class vLLMRollout(BaseRollout):
             vllm_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
                                                         non_tensor_batch.pop('multi_modal_data')):
-                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids, 'multi_modal_data': multi_modal_data})
+                ids = raw_prompt_ids.tolist() if isinstance(raw_prompt_ids, np.ndarray) else list(raw_prompt_ids)
+                vllm_inputs.append({'prompt_token_ids': ids, 'multi_modal_data': multi_modal_data})
         else:
             vllm_inputs = [{
-                'prompt_token_ids': raw_prompt_ids
+                'prompt_token_ids': raw_prompt_ids.tolist() if isinstance(raw_prompt_ids, np.ndarray) else list(raw_prompt_ids)
             } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
 
         do_sample = prompts.meta_info.get('do_sample', True)

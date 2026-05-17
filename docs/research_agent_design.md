@@ -343,3 +343,28 @@ for query in batch:
 - vLLM rollout 引擎：~14GB（KV cache）
 - LLM Judge（本地 72B）：需要额外 GPU
 - 总计：8×A100 80GB 应该足够（基座 + LoRA 训练 + Judge 推理）
+
+---
+
+## Qwen3 Ulysses Sequence Parallel 适配
+
+### 背景
+
+Qwen3-4B GRPO 训练需要在 V100 32GB 上降低长序列 actor/ref 前向显存。`use_remove_padding=true` 能去掉 padding token，`ulysses_sequence_parallel_size>1` 能把真实 token 序列切到多个 GPU 上计算。
+
+### 约束
+
+- Qwen3-4B: `num_attention_heads=32`, `num_key_value_heads=8`。
+- Ulysses SP size 必须能整除 attention heads，并与 KV heads 兼容。
+- 因此 `sp=5` 不合法，`sp=4` 合法。
+- 当前训练环境已安装 `flash-attn==2.7.4.post1`，`flash_attn.bert_padding` 可用。
+
+### 实现方案
+
+- 不再让 `qwen3` 复用 `qwen2_attn_forward`。
+- 新增 Qwen3 专属 attention monkey patch，保留 Qwen3 原生 `q_norm/k_norm`、RoPE、`sliding_window`、`past_key_values` 逻辑。
+- 在 Qwen3 attention 内部按 Ulysses 规则执行：
+  - `query/key/value`: `gather_seq_scatter_heads(seq_dim=2, head_dim=1)`；
+  - 使用全长 `position_embeddings` 计算 RoPE；
+  - attention 输出后 `gather_heads_scatter_seq(seq_dim=1, head_dim=2)` 回到本地 sequence shard。
+- 训练脚本切到 4 卡 + `ulysses_sequence_parallel_size=4`，并禁用恢复旧 5 卡 checkpoint 做 smoke test。

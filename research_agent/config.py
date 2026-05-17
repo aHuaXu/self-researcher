@@ -15,7 +15,7 @@ load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=True)
 @dataclass
 class SearchConfig:
     """Search engine configuration."""
-    engine: str = "google"  # "google" or "bing"
+    engine: str = "google"  # "google" | "bing" | "duckduckgo" | "searxng"
     top_k: int = 10
     region: str = "us"
     lang: str = "en"
