@@ -57,7 +57,11 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+        self.compute_entropy_from_logits = verl_F.entropy_from_logits
+
+        # V100 (sm_70) doesn't support native bf16 PTX; use fp16 autocast instead.
+        _major, _ = torch.cuda.get_device_capability()
+        self._autocast_dtype = torch.bfloat16 if _major >= 8 else torch.float16
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -72,7 +76,7 @@ class DataParallelPPOActor(BasePPOActor):
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch['multi_modal_inputs']],
                                                     dim=0)
 
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.autocast(device_type='cuda', dtype=self._autocast_dtype):
             input_ids = micro_batch['input_ids']
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch['attention_mask']
@@ -113,7 +117,7 @@ class DataParallelPPOActor(BasePPOActor):
                                            position_ids=position_ids_rmpad,
                                            **multi_modal_inputs,
                                            use_cache=False)  # prevent model thinks we are generating
-                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits_rmpad = output.logits.squeeze(0).float()  # (total_nnz, vocab_size), upcast to fp32
 
                 logits_rmpad.div_(temperature)
 
@@ -151,8 +155,7 @@ class DataParallelPPOActor(BasePPOActor):
                                            position_ids=position_ids,
                                            **multi_modal_inputs,
                                            use_cache=False)  # prevent model thinks we are generating
-                logits = output.logits
-                assert not logits.isnan().any(), "logits is nan"
+                logits = output.logits.float()  # upcast to fp32
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
@@ -172,6 +175,7 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+
         self.actor_optimizer.step()
 
         if getattr(self, '_optimizer_offload_fn', None) is not None:

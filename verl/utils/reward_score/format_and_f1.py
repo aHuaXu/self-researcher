@@ -64,22 +64,26 @@ def preprocess_text(text: str) -> str:
 
 
 
+NO_TOOL_USE_PENALTY_FACTOR = 0.5
+
+
 def compute_score(solution_str, ground_truth, val_type='f1') -> float:
-    solution_str = solution_str.lower()
+    solution_str_lower = solution_str.lower()
     ground_truth = ground_truth.lower()
     ground_truths = ground_truth.split("<|answer_split|>")
-    # 首先检查标签是否配对正确(格式是否正确)
-    if not check_tags_balance(solution_str):
+
+    has_tool_call = "<tool_call>" in solution_str_lower
+
+    if not check_tags_balance(solution_str_lower):
         return -1.0
-    # 使用正则提取第一个<answer>标签中的内容
+
     try:
-        answer_match = re.search(r'<answer>(.*?)</answer>', solution_str, re.DOTALL)
+        answer_match = re.search(r'<answer>(.*?)</answer>', solution_str_lower, re.DOTALL)
         if answer_match:
             answer_content = answer_match.group(1).strip()
-            # 对答案进行预处理
             answer_content = preprocess_text(answer_content)
         else:
-            return -1.0  # 如果没有answer标签，返回-1.0表示格式错误
+            return -1.0
     except Exception as e:
         print(f"Error extracting answer content: {e}")
         return -1.0
@@ -87,32 +91,31 @@ def compute_score(solution_str, ground_truth, val_type='f1') -> float:
     max_score = 0.0
     
     for gt in ground_truths:
-        # 对ground truth进行预处理
         gt = preprocess_text(gt)
         
         if val_type == 'em':
             if gt == answer_content:
-                return 1.0
+                max_score = 1.0
+                break
         else:
-            # 将答案和参考答案分词
             pred_tokens = set(answer_content.split())
             gt_tokens = set(gt.split())
             
-            if not gt_tokens:  # 避免除零错误
+            if not gt_tokens:
                 continue
             if not pred_tokens:
                 continue
             
-            # 计算共同的词数
             common_tokens = pred_tokens & gt_tokens
             
-            # 计算精确率和召回率
             precision = len(common_tokens) / len(pred_tokens) if pred_tokens else 0
             recall = len(common_tokens) / len(gt_tokens) if gt_tokens else 0
             
-            # 计算F1分数
-            if precision + recall > 0:  # 避免除零错误
+            if precision + recall > 0:
                 f1 = 2 * (precision * recall) / (precision + recall)
                 max_score = max(max_score, f1)
-            
+
+    if not has_tool_call and max_score > 0:
+        max_score *= NO_TOOL_USE_PENALTY_FACTOR
+
     return max_score

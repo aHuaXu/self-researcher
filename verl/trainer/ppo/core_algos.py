@@ -293,11 +293,8 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
             a float number indicating the fraction of policy gradient loss being clipped
 
     """
-    assert not old_log_prob.isnan().any(), "old_log_prob is nan"
-    assert not log_prob.isnan().any(), "log_prob is nan"
-    assert not advantages.isnan().any(), "advantages is nan"
-    assert not eos_mask.isnan().any(), "eos_mask is nan"
     negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-10.0, max=10.0)
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
 

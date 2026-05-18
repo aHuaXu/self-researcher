@@ -220,12 +220,16 @@ class ActorRolloutRefWorker(Worker):
                 actor_module_class = AutoModelForCausalLM
 
             # Ulysses + remove-padding is validated in verl tests with flash_attention_2.
-            # Using sdpa here can blow up memory on long gathered sequences in compute_log_prob.
+            # On pre-Ampere GPUs (e.g., V100), flash_attention_2 is unsupported.
             attn_implementation = 'sdpa'
             if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
-                attn_implementation = 'flash_attention_2'
-                if self.rank == 0:
-                    print('Use attn_implementation=flash_attention_2 for Ulysses + remove-padding')
+                major, _ = torch.cuda.get_device_capability()
+                if major >= 8:
+                    attn_implementation = 'flash_attention_2'
+                    if self.rank == 0:
+                        print('Use attn_implementation=flash_attention_2 for Ulysses + remove-padding')
+                elif self.rank == 0:
+                    print('Use attn_implementation=sdpa for Ulysses + remove-padding on pre-Ampere GPU')
 
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,

@@ -25,7 +25,13 @@ from torch import nn
 
 try:
     from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
-    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
+    # This Triton kernel emits native .bf16 PTX which requires sm_80+.
+    # Disable on pre-Ampere GPUs (e.g. V100 = sm_70) to avoid PTX codegen error.
+    if torch.cuda.is_available():
+        _major, _ = torch.cuda.get_device_capability()
+        FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = _major >= 8
+    else:
+        FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 except ImportError:
     FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
 

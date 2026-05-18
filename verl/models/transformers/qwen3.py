@@ -25,6 +25,15 @@ from verl.utils.ulysses import gather_heads_scatter_seq, gather_seq_scatter_head
 logger = logging.get_logger(__name__)
 
 
+def _flash_attention_2_is_supported() -> bool:
+    if "flash_attention_2" not in ALL_ATTENTION_FUNCTIONS:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8
+
+
 def qwen3_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -77,12 +86,18 @@ def qwen3_attn_forward(
                 "falling back to causal path by ignoring attention_mask."
             )
             attention_mask = None
-            if attn_impl == "sdpa" and "flash_attention_2" in ALL_ATTENTION_FUNCTIONS:
-                attn_impl = "flash_attention_2"
-                logger.warning_once(
-                    "Qwen3 Ulysses: switching attention interface from sdpa to flash_attention_2 "
-                    "to avoid sdpa O(seq^2) memory blowup on gathered sequence."
-                )
+            if attn_impl == "sdpa":
+                if _flash_attention_2_is_supported():
+                    attn_impl = "flash_attention_2"
+                    logger.warning_once(
+                        "Qwen3 Ulysses: switching attention interface from sdpa to flash_attention_2 "
+                        "to avoid sdpa O(seq^2) memory blowup on gathered sequence."
+                    )
+                else:
+                    logger.warning_once(
+                        "Qwen3 Ulysses: keep sdpa because flash_attention_2 is unsupported "
+                        "on current GPU (requires Ampere+)."
+                    )
 
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
