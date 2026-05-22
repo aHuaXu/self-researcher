@@ -64,7 +64,7 @@ def preprocess_text(text: str) -> str:
 
 
 
-NO_TOOL_USE_PENALTY_FACTOR = 0.5
+NO_TOOL_PENALTY = -0.3
 
 
 def compute_score(solution_str, ground_truth, val_type='f1') -> float:
@@ -75,6 +75,8 @@ def compute_score(solution_str, ground_truth, val_type='f1') -> float:
     has_tool_call = "<tool_call>" in solution_str_lower
 
     if not check_tags_balance(solution_str_lower):
+        if has_tool_call:
+            return 0.0
         return -1.0
 
     try:
@@ -83,6 +85,8 @@ def compute_score(solution_str, ground_truth, val_type='f1') -> float:
             answer_content = answer_match.group(1).strip()
             answer_content = preprocess_text(answer_content)
         else:
+            if has_tool_call:
+                return 0.0
             return -1.0
     except Exception as e:
         print(f"Error extracting answer content: {e}")
@@ -115,7 +119,7 @@ def compute_score(solution_str, ground_truth, val_type='f1') -> float:
                 f1 = 2 * (precision * recall) / (precision + recall)
                 max_score = max(max_score, f1)
 
-    if not has_tool_call and max_score > 0:
-        max_score *= NO_TOOL_USE_PENALTY_FACTOR
+    if not has_tool_call:
+        return NO_TOOL_PENALTY
 
     return max_score
