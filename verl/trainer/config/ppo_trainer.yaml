@@ -207,8 +207,6 @@ multi_agent:
       max_tokens: 1024
     executor:
       max_turns: 10
-    writer:
-      max_tokens: 4096
 
   reward:
     judge_model: ""
