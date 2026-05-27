@@ -1,5 +1,7 @@
 """Prompts for the Planner agent in dual-agent (Planner + Executor) pipeline."""
 
+from dataclasses import dataclass, field
+
 PLANNER_SYSTEM_PROMPT = """You are a research planning assistant. Given a complex question, decompose it into a minimal set of ordered sub-questions that, when answered sequentially, will lead to the final answer.
 
 Rules:
@@ -56,7 +58,17 @@ def get_planner_prompt(
     ]
 
 
-def parse_plan(text: str) -> list[dict]:
+@dataclass
+class SubTask:
+    """A single sub-task parsed from the planner's output."""
+
+    index: int  # 1-based sub-question number
+    sub_question: str  # The sub-question text to research
+    deps: list[int] = field(default_factory=list)  # Indices of dependency sub-questions (empty = INDEPENDENT)
+    is_final: bool = False  # True for the last sub-question that produces the final answer
+
+
+def parse_plan(text: str) -> list[SubTask]:
     """Parse planner output into structured sub-questions.
 
     Expected format inside <plan>...</plan>:
@@ -64,7 +76,7 @@ def parse_plan(text: str) -> list[dict]:
         2. [DEPENDS:1] Based on X, what is Y?
 
     Returns:
-        List of dicts with keys: index, sub_question, deps, is_final
+        List of SubTask instances.
     """
     import re
 
@@ -73,7 +85,7 @@ def parse_plan(text: str) -> list[dict]:
         return []
 
     plan_text = plan_match.group(1).strip()
-    items = []
+    items: list[SubTask] = []
 
     pattern = re.compile(
         r"(\d+)\.\s*\[(INDEPENDENT|DEPENDS:[0-9,]+)\]\s*(.+)",
@@ -98,14 +110,13 @@ def parse_plan(text: str) -> list[dict]:
             dep_nums = dep_tag.replace("DEPENDS:", "")
             deps = [int(d.strip()) for d in dep_nums.split(",") if d.strip()]
 
-        items.append({
-            "index": index,
-            "sub_question": sub_question,
-            "deps": deps,
-            "is_final": False,
-        })
+        items.append(SubTask(
+            index=index,
+            sub_question=sub_question,
+            deps=deps,
+        ))
 
     if items:
-        items[-1]["is_final"] = True
+        items[-1].is_final = True
 
     return items
