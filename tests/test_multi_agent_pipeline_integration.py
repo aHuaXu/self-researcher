@@ -1,10 +1,10 @@
-"""Integration tests verifying data format consistency across the multi-agent pipeline.
+"""Integration tests verifying data format consistency across the dual-agent pipeline.
 
-These tests verify that the output of one stage matches what the next stage expects,
-focusing on three known risk areas:
-1. planner_rules() can't parse planner outputs that follow the prompt's example format
-2. executor_rules() expects {tool, result} dicts but _build_exec_trajectories produces {todo_idx, trajectory}
-3. MultiAgentRewardManager expects exec_actual_turns/exec_max_turns but run_multi_agent_loop doesn't provide them
+These tests verify that the output of one stage matches what the next stage expects:
+1. planner_rules() can parse planner output in the new <plan> format
+2. executor_rules() expects {tool, result} dicts
+3. MultiAgentRewardManager expects specific non_tensor_batch fields
+4. MultiAgentResult dataclass fields match what ray_trainer expects
 """
 
 import importlib.util
@@ -18,7 +18,6 @@ import pytest
 
 # ---------------------------------------------------------------------------
 # Import rule_reward via importlib to avoid collision with mocked verl module
-# (test_multi_agent_generation.py mocks sys.modules["verl"] during collection)
 # ---------------------------------------------------------------------------
 import importlib.util as _ilu
 
@@ -29,13 +28,12 @@ _rr_path = os.path.join(
 _rr_spec = _ilu.spec_from_file_location("rule_reward", os.path.abspath(_rr_path))
 _rr_mod = _ilu.module_from_spec(_rr_spec)
 _rr_spec.loader.exec_module(_rr_mod)
-_parse_tasks = _rr_mod._parse_tasks
+_parse_plan_tasks = _rr_mod._parse_plan_tasks
 executor_rules = _rr_mod.executor_rules
 planner_rules = _rr_mod.planner_rules
 
 # ---------------------------------------------------------------------------
 # Bootstrap: mock heavy imports so we can load multi_agent_generation.py
-# without requiring ray, vllm, tensordict, or the full scrl.handler chain.
 # ---------------------------------------------------------------------------
 
 
@@ -60,7 +58,6 @@ class _FakeDataProto:
         return 0
 
 
-# Ensure verl/verl.protocol in sys.modules point to our fake DataProto
 _verl_mod = sys.modules.get("verl")
 _verl_proto_mod = sys.modules.get("verl.protocol")
 if _verl_mod is not None:
@@ -113,244 +110,141 @@ sys.modules[_spec.name] = _mod
 _spec.loader.exec_module(_mod)
 
 MultiAgentGenerationManager = _mod.MultiAgentGenerationManager
+MultiAgentResult = _mod.MultiAgentResult
+schedule_waves = _mod.schedule_waves
 
-
-def _make_manager():
-    mgr = object.__new__(MultiAgentGenerationManager)
-    mgr.tokenizer = MagicMock(pad_token_id=0, pad_token="<pad>")
-    mgr.tensor_fn = MagicMock()
-    mgr.config = MagicMock()
-    mgr.lora_save_dir = './tmp_lora_adapters'
-    return mgr
+# Import SubTask from planner prompt
+_planner_path = os.path.join(
+    os.path.dirname(__file__), os.pardir,
+    "research_agent", "prompts", "planner.py",
+)
+_planner_spec = _ilu.spec_from_file_location("planner_prompt", os.path.abspath(_planner_path))
+_planner_mod = _ilu.module_from_spec(_planner_spec)
+_planner_spec.loader.exec_module(_planner_mod)
+SubTask = _planner_mod.SubTask
+parse_plan = _planner_mod.parse_plan
 
 
 # ===========================================================================
-# Issue 1: planner_rules._parse_tasks 要求 "Sub-topic:" 前缀，
-#           但 planner prompt 示例输出不带这个前缀
+# Issue 1: planner_rules can parse planner's actual output format
 # ===========================================================================
 
 
 class TestPlannerOutputFormatConsistency:
-    """Verify that planner_rules can parse the planner's actual output format."""
+    """Verify planner_rules can parse the planner's actual output format."""
 
-    def test_planner_prompt_example_format(self):
-        """The planner prompt example uses '1. [HIGH] Description' without 'Sub-topic:' prefix.
-        _parse_tasks should be able to parse this format."""
-        # This is the format shown in planner.py PLANNER_SYSTEM_PROMPT example
+    def test_new_plan_format_parseable(self):
+        """The new <plan> format with [INDEPENDENT]/[DEPENDS:N] should be parseable."""
         plan_text = (
-            "1. [HIGH] The history and evolution of quantum computing\n"
-            "2. [MEDIUM] Current applications of quantum computing in industry\n"
-            "3. [LOW] Future outlook and emerging trends"
+            "<plan>\n"
+            "1. [INDEPENDENT] What is the capital of France?\n"
+            "2. [INDEPENDENT] What is the population of France?\n"
+            "3. [DEPENDS:1,2] Summarize the key facts about France.\n"
+            "</plan>"
         )
-        tasks = _parse_tasks(plan_text)
-        # BUG: _parse_tasks requires "Sub-topic:" or "子主题：" prefix, so this returns []
-        assert len(tasks) > 0, (
-            f"_parse_tasks cannot parse planner's example format! "
-            f"Got {tasks}. The regex requires 'Sub-topic:' prefix but "
-            f"planner prompt example doesn't use it."
-        )
+        tasks = _parse_plan_tasks(plan_text)
+        assert len(tasks) == 3
+        assert tasks[0]["tag"] == "INDEPENDENT"
+        assert tasks[2]["tag"] == "DEPENDS:1,2"
 
-    def test_planner_rules_with_example_format(self):
-        """planner_rules should return a non-zero score for well-formed plans."""
+    def test_planner_rules_scores_valid_plan(self):
+        """planner_rules should return a non-zero score for a valid plan."""
         plan_text = (
-            "1. [HIGH] The history and evolution of quantum computing\n"
-            "2. [MEDIUM] Current applications of quantum computing in industry\n"
-            "3. [LOW] Future outlook and emerging trends"
+            "<plan>\n"
+            "1. [INDEPENDENT] What is the capital of France?\n"
+            "2. [INDEPENDENT] What is the GDP of Germany?\n"
+            "3. [DEPENDS:1,2] Compare the two countries economically.\n"
+            "</plan>"
         )
         score = planner_rules(plan_text)
-        # BUG: Returns 0.0 because _parse_tasks can't parse this format
-        assert score > 0.0, (
-            f"planner_rules returned {score} for a valid plan. "
-            f"This means the planner LoRA gets no rule-based reward signal."
-        )
+        assert score > 0.0
 
-    def test_subtopic_prefix_format_works(self):
-        """Verify the format that _parse_tasks CAN currently handle."""
+    def test_parse_plan_matches_parse_plan_tasks(self):
+        """parse_plan (generation) and _parse_plan_tasks (reward) should agree."""
         plan_text = (
-            "1. [HIGH] Sub-topic: The history of quantum computing\n"
-            "2. [MEDIUM] Sub-topic: Current applications in industry\n"
-            "3. [LOW] Sub-topic: Future outlook and trends"
+            "<plan>\n"
+            "1. [INDEPENDENT] History of quantum computing\n"
+            "2. [DEPENDS:1] Current state of quantum hardware\n"
+            "3. [DEPENDS:1,2] Future outlook for quantum computing\n"
+            "</plan>"
         )
-        tasks = _parse_tasks(plan_text)
-        # This format works because it has "Sub-topic:" prefix
-        assert len(tasks) == 3
+        parsed_subtasks = parse_plan(plan_text)
+        parsed_reward_tasks = _parse_plan_tasks(plan_text)
 
-    def test_parse_todos_vs_parse_tasks_consistency(self):
-        """_parse_todos (multi_agent_generation) and _parse_tasks (rule_reward)
-        should agree on what constitutes a valid planner output."""
-        mgr = _make_manager()
-        # Planner prompt example format
-        plan_text = (
-            "1. [HIGH] Climate change impacts on agriculture\n"
-            "2. [MEDIUM] Renewable energy solutions\n"
-            "3. [LOW] Policy frameworks for sustainability"
-        )
-        # _parse_todos can handle this format (used during generation)
-        parsed_todos = mgr._parse_todos(plan_text)
-        # _parse_tasks should also handle it (used during reward)
-        parsed_tasks = _parse_tasks(plan_text)
-
-        assert len(parsed_todos) > 0, "_parse_todos failed"
-        assert len(parsed_tasks) > 0, (
-            f"_parse_tasks returned [] but _parse_todos returned {len(parsed_todos)} items. "
-            f"Format mismatch between generation and reward!"
-        )
+        assert len(parsed_subtasks) == len(parsed_reward_tasks) == 3
 
 
 # ===========================================================================
-# Issue 2: executor_rules 期望 List[Dict] 里有 tool/result，
-#           但 _build_exec_trajectories 产出 todo_idx/trajectory
+# Issue 2: executor_rules format compatibility
 # ===========================================================================
 
 
-class TestExecutorTrajectoryFormatConsistency:
-    """Verify executor_rules can consume _build_exec_trajectories output."""
+class TestExecutorRulesFormatConsistency:
+    """Verify executor_rules with expected trajectory format."""
 
-    def test_build_exec_trajectories_output_format(self):
-        """Check _build_exec_trajectories produces structured tool/result dicts."""
-        mgr = _make_manager()
-        exec_msgs = [
-            '<think>searching</think><tool_call>{"name":"web_search","arguments":{"query":["AI"]}}</tool_call>\n<observation>results here</observation>\n<think>ok</think><answer>AI is cool</answer>',
-            '<think>reading</think><tool_call>{"name":"browse_webpage","arguments":{"url_list":["http://x.com"]}}</tool_call>\n<observation>page content here with lots of text</observation>\n<think>done</think><answer>Found info</answer>',
-        ]
-        mapping = [0, 0]
-        trajectories = mgr._build_exec_trajectories(exec_msgs, mapping, 1)
-
-        # trajectories[0] should have 2 parsed tool steps (one from each exec msg)
-        assert len(trajectories[0]) == 2
-        first_entry = trajectories[0][0]
-        assert "tool" in first_entry
-        assert "result" in first_entry
-        assert first_entry["tool"] == "web_search"
-        assert trajectories[0][1]["tool"] == "browse_webpage"
-
-    def test_executor_rules_with_actual_trajectory_format(self):
-        """executor_rules expects dicts with 'tool' and 'result' keys.
-        But _build_exec_trajectories produces dicts with 'todo_idx' and 'trajectory'."""
-        mgr = _make_manager()
-        exec_msgs = [
-            '<think>searching</think><tool_call>{"name":"web_search","arguments":{"query":["AI"]}}</tool_call>\n<observation>search results about AI</observation>\n<think>browsing</think><tool_call>{"name":"browse_webpage","arguments":{"url_list":["http://x.com"]}}</tool_call>\n<observation>page content with lots of useful information about artificial intelligence</observation>\n<think>done</think><answer>AI answer</answer>',
-        ]
-        mapping = [0]
-        trajectories = mgr._build_exec_trajectories(exec_msgs, mapping, 1)
-
-        # Feed this to executor_rules - this is what actually happens in the pipeline
-        score = executor_rules(trajectories[0], max_turns=10, actual_turns=3)
-
-        # BUG: score will be 0.0 because executor_rules looks for step.get("tool")
-        # but entries have "todo_idx" and "trajectory" keys, not "tool" and "result"
-        assert score > 0.0, (
-            f"executor_rules returned {score} for trajectory from _build_exec_trajectories. "
-            f"Format mismatch: executor_rules expects [{{'tool': ..., 'result': ...}}] "
-            f"but got [{trajectories[0][0].keys()}]"
-        )
-
-    def test_executor_rules_with_expected_format(self):
-        """Verify executor_rules works with its expected format (for reference)."""
-        # This is what executor_rules actually expects
+    def test_executor_rules_with_valid_trajectory(self):
+        """executor_rules should score > 0 for a good trajectory."""
         trajectory = [
             {"tool": "web_search", "result": "Found 10 results about AI safety"},
             {"tool": "browse_webpage", "result": "A" * 100},
         ]
         score = executor_rules(trajectory, max_turns=10, actual_turns=3)
-        assert score == 1.0, f"executor_rules returned {score} for ideal trajectory"
+        assert score == 1.0
+
+    def test_executor_rules_empty_trajectory(self):
+        """Empty trajectory should get turn efficiency bonus only."""
+        score = executor_rules([], max_turns=10, actual_turns=3)
+        assert score == 0.25  # Only turn efficiency
 
 
 # ===========================================================================
-# exec_actual_turns / exec_max_turns are populated by ray_trainer.py (L1061-1068)
-# between run_multi_agent_loop and MultiAgentRewardManager, so no gap exists.
+# Issue 3: MultiAgentResult has all fields the trainer needs
 # ===========================================================================
 
 
-class TestMetadataFieldCompleteness:
-    """Verify the fields that ray_trainer.py bridges are computed correctly."""
+class TestMultiAgentResultFields:
+    """Verify MultiAgentResult dataclass has the fields ray_trainer expects."""
 
-    def test_exec_actual_turns_derived_from_trajectories(self):
-        """ray_trainer.py computes exec_actual_turns = [len(traj) for traj in exec_trajectories].
-        Verify this logic produces correct values."""
-        exec_trajectories = [
-            [{"tool": "web_search", "result": "r1"}, {"tool": "browse_webpage", "result": "r2"}],
-            [{"tool": "web_search", "result": "r3"}],
-            [],
+    def test_has_required_fields(self):
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(MultiAgentResult)}
+        required = {
+            "planner_outputs", "executor_outputs", "queries",
+            "plan_texts", "parsed_plans", "final_answers",
+            "all_findings", "todo_mapping",
+        }
+        assert required.issubset(field_names)
+
+    def test_no_writer_field(self):
+        import dataclasses
+        field_names = {f.name for f in dataclasses.fields(MultiAgentResult)}
+        assert "writer_outputs" not in field_names
+
+
+# ===========================================================================
+# Issue 4: DAG scheduling matches what executor expects
+# ===========================================================================
+
+
+class TestDAGSchedulingIntegration:
+    """Verify schedule_waves output is compatible with executor DAG runner."""
+
+    def test_schedule_waves_independent_tasks(self):
+        tasks = [
+            SubTask(index=1, sub_question="Q1", deps=[]),
+            SubTask(index=2, sub_question="Q2", deps=[]),
+            SubTask(index=3, sub_question="Q3", deps=[1, 2], is_final=True),
         ]
-        actual_turns = [len(traj) for traj in exec_trajectories]
-        assert actual_turns == [2, 1, 0]
+        waves = schedule_waves(tasks)
+        assert len(waves) == 2
+        assert len(waves[0]) == 2  # Q1, Q2 in parallel
+        assert len(waves[1]) == 1  # Q3 depends on both
 
-
-# ===========================================================================
-# Bonus: end-to-end format flow validation
-# ===========================================================================
-
-
-class TestEndToEndFormatFlow:
-    """Validate the full data format flow from planner to reward."""
-
-    def test_planner_output_flows_to_executor(self):
-        """Planner output → _parse_todos → _build_executor_batch should work."""
-        mgr = _make_manager()
-        # Simulate planner output (following prompt example format)
-        planner_output = (
-            "<todos>\n"
-            "1. [HIGH] The impact of climate change on global food security\n"
-            "2. [MEDIUM] Adaptation strategies in developing countries\n"
-            "3. [LOW] Policy responses and international cooperation\n"
-            "</todos>"
-        )
-        todos = mgr._parse_todos(planner_output)
-        assert len(todos) >= 3, f"_parse_todos returned {len(todos)} items"
-        assert all("sub_topic" in t for t in todos), "Missing sub_topic key"
-
-    def test_executor_output_flows_to_writer(self):
-        """Executor findings → _group_findings → writer batch should be coherent."""
-        mgr = _make_manager()
-        exec_msgs = [
-            "<think>researching</think><answer>Food production declined by 5%</answer>",
-            "<think>investigating</think><answer>Crop rotation helps adapt</answer>",
+    def test_schedule_waves_fully_sequential(self):
+        tasks = [
+            SubTask(index=1, sub_question="Q1", deps=[]),
+            SubTask(index=2, sub_question="Q2", deps=[1]),
+            SubTask(index=3, sub_question="Q3", deps=[2], is_final=True),
         ]
-        mapping = [0, 0]
-        findings = mgr._group_findings(exec_msgs, mapping, 1)
-
-        assert len(findings) == 1
-        assert "Food production declined by 5%" in findings[0]
-        assert "Crop rotation helps adapt" in findings[0]
-
-    def test_full_format_chain(self):
-        """Complete format verification: planner → executor → writer → reward."""
-        mgr = _make_manager()
-        question = "What is the impact of AI on healthcare?"
-
-        # Stage 1: Planner output
-        planner_output = (
-            "1. [HIGH] AI-powered diagnostics and imaging\n"
-            "2. [MEDIUM] Drug discovery acceleration\n"
-            "3. [LOW] Administrative automation"
-        )
-        todos = mgr._parse_todos(planner_output)
-        assert len(todos) == 3
-
-        # Stage 2: Executor outputs (one per TODO)
-        exec_msgs = [
-            "<think>searching AI diagnostics</think><answer>AI detects cancer with 95% accuracy</answer>",
-            "<think>searching drug discovery</think><answer>AI reduced drug discovery time by 40%</answer>",
-            "<think>searching admin</think><answer>NLP automates 60% of paperwork</answer>",
-        ]
-        mapping = [0, 0, 0]  # All belong to question 0
-        findings = mgr._group_findings(exec_msgs, mapping, 1)
-        assert "95% accuracy" in findings[0]
-
-        # Stage 3: Writer receives plan + findings
-        writer_input = (
-            f"=== Research Plan ===\n{planner_output}\n\n"
-            f"=== Research Findings ===\n{findings[0]}"
-        )
-        assert "Research Plan" in writer_input
-        assert "Research Findings" in writer_input
-
-        # Reward: verify format compatibility
-        trajectories = mgr._build_exec_trajectories(exec_msgs, mapping, 1)
-        # This is what goes to executor_rules:
-        for entry in trajectories[0]:
-            # executor_rules will call step.get("tool") on these entries
-            assert "tool" in entry or "todo_idx" in entry, (
-                "Trajectory entry format unclear"
-            )
+        waves = schedule_waves(tasks)
+        assert len(waves) == 3
