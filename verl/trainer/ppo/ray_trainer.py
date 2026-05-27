@@ -1040,7 +1040,7 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     if _multi_agent_enabled:
                         # =============================================================
-                        # Multi-agent training branch (Planner -> Executor -> Writer)
+                        # Multi-agent training branch (Planner -> Executor DAG)
                         # =============================================================
                         from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 

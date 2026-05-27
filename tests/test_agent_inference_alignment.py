@@ -43,11 +43,6 @@ def executor_format_todo_context(todo_list):
     return "\n".join(lines)
 
 
-def writer_build_findings_block(findings_text: str, plan_text: str = ""):
-    """Mirror of ReportWriter.write() findings_block construction (research_agent/agents/writer.py)."""
-    if plan_text:
-        return f"=== Research Plan ===\n{plan_text}\n\n=== Research Findings ===\n{findings_text}"
-    return findings_text
 
 
 # ---------------------------------------------------------------------------
@@ -108,34 +103,6 @@ class TestPlannerParseTodos:
         assert todos[1]["sub_topic"] == "Error correction"
         for t in todos:
             assert set(t.keys()) == {"index", "priority", "sub_topic"}
-
-
-# ---------------------------------------------------------------------------
-# Writer input format
-# ---------------------------------------------------------------------------
-
-class TestWriterInput:
-    """Writer must receive plan_text + findings, matching training format."""
-
-    def test_with_plan_text(self):
-        block = writer_build_findings_block("Finding A", plan_text="1. [HIGH] Research A")
-        assert "=== Research Plan ===" in block
-        assert "1. [HIGH] Research A" in block
-        assert "=== Research Findings ===" in block
-        assert "Finding A" in block
-
-    def test_without_plan_text(self):
-        block = writer_build_findings_block("Finding A")
-        assert "=== Research Plan ===" not in block
-        assert block == "Finding A"
-
-    def test_format_matches_training(self):
-        """Training builds: '=== Research Plan ===\\n{plan}\\n\\n=== Research Findings ===\\n{findings}'"""
-        plan = "1. [HIGH] Topic"
-        findings = "Some findings"
-        block = writer_build_findings_block(findings, plan_text=plan)
-        expected = f"=== Research Plan ===\n{plan}\n\n=== Research Findings ===\n{findings}"
-        assert block == expected
 
 
 # ---------------------------------------------------------------------------
