@@ -1059,13 +1059,21 @@ class RayPPOTrainer(object):
                             )
 
                         # --- Multi-agent Reward ---
+                        orig_reward_models = batch.non_tensor_batch['reward_model']
+                        if grpo_n > 1:
+                            golden_answers = np.repeat(orig_reward_models, grpo_n, axis=0)
+                            golden_answers = [
+                                item['ground_truth'] for item in golden_answers
+                            ]
+                        else:
+                            golden_answers = [
+                                item['ground_truth'] for item in orig_reward_models
+                            ]
+
                         reward_data = DataProto()
                         reward_data.non_tensor_batch = {
                             'final_answers': rollout_result.final_answers,
-                            'golden_answers': [
-                                gen_batch.non_tensor_batch['reward_model'][i]['ground_truth']
-                                for i in range(len(rollout_result.queries))
-                            ],
+                            'golden_answers': golden_answers,
                             'plan_texts': rollout_result.plan_texts,
                             'exec_trajectories': [[] for _ in rollout_result.queries],
                             'exec_actual_turns': [0] * len(rollout_result.queries),
@@ -1144,32 +1152,37 @@ class RayPPOTrainer(object):
                             agent_output.batch['token_level_rewards'] = reward_tensor
                             agent_output.batch['token_level_scores'] = reward_tensor
 
+                            # Executor TODO count may not divide world_size; pad for DP chunk.
+                            agent_output_padded, pad_size = pad_dataproto_to_divisor(
+                                agent_output, self.actor_rollout_wg.world_size
+                            )
+
                             # Compute old_log_probs via forward pass with correct LoRA adapter
-                            agent_output.meta_info['lora_name'] = agent_name
+                            agent_output_padded.meta_info['lora_name'] = agent_name
                             with _timer(f'old_log_prob_{agent_name}', timing_raw):
                                 with torch.no_grad():
-                                    log_prob_output = self.actor_rollout_wg.compute_log_prob(agent_output)
-                                agent_output = agent_output.union(log_prob_output)
+                                    log_prob_output = self.actor_rollout_wg.compute_log_prob(agent_output_padded)
+                                agent_output_padded = agent_output_padded.union(log_prob_output)
 
                             # Compute ref_log_probs if KL loss is enabled
                             if self.config.actor_rollout_ref.actor.use_kl_loss and \
                                     hasattr(self, 'ref_policy_wg') and self.ref_policy_wg is not None:
                                 with _timer(f'ref_log_prob_{agent_name}', timing_raw):
                                     with torch.no_grad():
-                                        ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(agent_output)
-                                agent_output = agent_output.union(ref_log_prob_output)
+                                        ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(agent_output_padded)
+                                agent_output_padded = agent_output_padded.union(ref_log_prob_output)
 
                             # Set meta_info required for the actor update
-                            agent_output.meta_info['global_token_num'] = (
-                                torch.sum(agent_output.batch['attention_mask'], dim=-1).tolist()
+                            agent_output_padded.meta_info['global_token_num'] = (
+                                torch.sum(agent_output_padded.batch['attention_mask'], dim=-1).tolist()
                             )
-                            agent_output.meta_info['temperature'] = (
+                            agent_output_padded.meta_info['temperature'] = (
                                 self.config.actor_rollout_ref.rollout.temperature
                             )
 
                             # Update only this agent's LoRA
                             with _timer(f'update_actor_{agent_name}', timing_raw):
-                                actor_output = self.actor_rollout_wg.update_actor(agent_output)
+                                actor_output = self.actor_rollout_wg.update_actor(agent_output_padded)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                             # Prefix per-agent metrics
                             for mk, mv in actor_output_metrics.items():

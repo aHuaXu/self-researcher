@@ -302,3 +302,74 @@ export RAY_memory_monitor_refresh_ms=0
 | `verl/workers/actor/dp_actor.py` | `update_policy` 开头加 `empty_cache()`；`_optimizer_step` 支持 JIT load/offload 回调 |
 | `verl/trainer/main_ppo.py` | `Role.RefPolicy` 按 `use_kl_loss` 条件注册，`false` 时彻底跳过 ref worker |
 | `scripts/train/grpo_qwen2.5_7b.sh` | 集成 ray stop/start；加各环境变量；限制 `max_model_len`；`gpu_memory_utilization=0.10`；`enable_gradient_checkpointing=true` |
+
+---
+
+## Dual-Agent Smoke Test（2026-05-30）
+
+详见 `docs/design/dual_agent_smoke_test.md`。摘要如下。
+
+### 问题 14：CUDA 驱动 / nvidia-uvm 损坏
+
+**现象**：`torch.cuda.is_available()` 为 False，`/dev/nvidia-uvm` I/O error  
+**修复**：需管理员 `sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm`
+
+### 问题 15：cachetools 与 vLLM LoRA 不兼容
+
+**现象**：`AttributeError: 'LoRALRUCache' object has no attribute '_LRUCache__update'`  
+**修复**：`pip install cachetools==5.5.2`
+
+### 问题 16：Multi-agent reward KeyError
+
+**现象**：rollout 完成后 `KeyError: 'reward_model'`  
+**修复**：`ray_trainer.py` 从 `batch` 而非 `gen_batch` 读 golden answer
+
+### 问题 17：LoRA hybrid engine Planner OOM
+
+**现象**：64 条 Planner prompt 同时 generate，GPU 31GB 占满  
+**修复**：smoke test 降 batch；`fsdp_vllm.py` state_dict offload + FSDP 及时 offload
+
+### 问题 18：Planner 输出全 `!` 乱码
+
+**现象**：rollout JSON 中 planner output 为重复 `!`  
+**原因**：vLLM 权重 offload 用 `empty_like` 未初始化  
+**修复**：`vllm_rollout_spmd.py` / `fsdp_vllm.py` 改用 `clone()`
+
+### 问题 19：Executor 多轮 generate CPU tensor 错误
+
+**现象**：Planner 成功后 Executor 第一次 tool turn 报 `was on cpu`  
+**修复**：`__enter__` 中 load_dtensor 前将 vLLM params `.cuda()`；rollout 前仍 `load_fsdp_model_to_gpu`
+
+### 问题 20：Executor 多 wave DataProto.concat 序列长度不一致
+
+**现象**：global step 1 Executor DAG 完成后 crash  
+`RuntimeError: Expected size 647 but got size 800 for tensor number 1 in the list`  
+**堆栈**：`multi_agent_generation._run_executor_dag` → `DataProto.concat(all_exec_output_parts)`
+
+**原因**：各 DAG wave 独立 `run_llm_loop`，prompt/response 长度不同，batch tensor dim=1 不一致无法 concat。
+
+**修复**：concat 前按 key 将各 wave 输出 pad 到统一 max seq len（见 `multi_agent_generation._pad_dataproto_for_concat`）。
+
+### 问题 21：SearXNG 未启动
+
+**现象**：Executor search `Connection refused` on `localhost:8888`  
+**原因**：`.env` 配置 `SEARCH_ENGINE=searxng`，但 SearXNG 进程未运行（与 Hydra `search_engine=online_search` 无关）  
+**修复**：`bash /home/zjx/ahua_llm/searxng/start.sh`，验证 HTTP 200
+
+### 问题 22：Executor batch 无法被 4 GPU 整除
+
+**现象**：`executor_step_1.json` + `DualAgentReward` 后 crash  
+`AssertionError: only support equal chunk. Got size of DataProto 31 and chunk 4`  
+**修复**：`ray_trainer.py` multi-agent 路径 update 前 `pad_dataproto_to_divisor`
+
+## Dual-Agent 代码修改汇总
+
+| 文件 | 修改内容 |
+|---|---|
+| `verl/trainer/ppo/ray_trainer.py` | multi-agent golden answer 从 `batch` 读取并 repeat |
+| `verl/workers/sharding_manager/fsdp_vllm.py` | LoRA state_dict offload；FSDP offload；权重 clone；vLLM params cuda |
+| `verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py` | init offload 用 clone |
+| `verl/workers/fsdp_workers.py` | lora_config 增加 base_model |
+| `scrl/llm_agent/multi_agent_generation.py` | Executor 多 wave concat 前 pad 序列长度 |
+| `scripts/train/grpo_dual_agent.sh` | GPU 0-3；total_training_steps=2；降 batch |
+| `docs/design/dual_agent_smoke_test.md` | smoke test 设计与变更记录 |

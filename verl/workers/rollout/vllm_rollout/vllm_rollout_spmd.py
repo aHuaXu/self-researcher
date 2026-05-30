@@ -132,7 +132,7 @@ class vLLMRollout(BaseRollout):
         # Offload vLLM model weights to CPU to free GPU for FSDP training
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         for param in model.parameters():
-            param.data = torch.empty_like(param, device='cpu')
+            param.data = param.data.detach().cpu().clone()
         torch.cuda.empty_cache()
         free_mem, total_mem = torch.cuda.mem_get_info()
         logger.warning(f"[DEBUG MEM] After initial vLLM offload: free={free_mem/1e9:.2f}GiB, "

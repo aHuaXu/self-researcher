@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 
 from verl import DataProto
+from verl.utils.torch_functional import pad_sequence_to_length
 from scrl.llm_agent.generation import LLMGenerationManager, GenerationConfig
 
 from research_agent.prompts.planner import get_planner_prompt, parse_plan, SubTask
@@ -30,6 +31,53 @@ from research_agent.prompts.executor import (
     format_prior_findings,
     EXECUTOR_TOOLS,
 )
+
+
+def _pad_dataproto_for_concat(parts: List[DataProto], pad_token_id: int) -> List[DataProto]:
+    """Pad batch tensors to a common seq length so DataProto.concat(dim=0) succeeds."""
+    if len(parts) <= 1:
+        return parts
+
+    batch_parts = [p for p in parts if p.batch is not None]
+    if not batch_parts:
+        return parts
+
+    max_lens: Dict[str, int] = {}
+    for part in batch_parts:
+        for key, tensor in part.batch.items():
+            if tensor.ndim < 2:
+                continue
+            max_lens[key] = max(max_lens.get(key, 0), tensor.shape[1])
+
+    padded_parts: List[DataProto] = []
+    for part in parts:
+        if part.batch is None:
+            padded_parts.append(part)
+            continue
+
+        padded_tensors = {}
+        for key, tensor in part.batch.items():
+            if key not in max_lens or tensor.ndim < 2:
+                padded_tensors[key] = tensor
+                continue
+            target_len = max_lens[key]
+            if key == "attention_mask" or key == "position_ids":
+                pad_val = 0
+            else:
+                pad_val = pad_token_id
+            padded_tensors[key] = pad_sequence_to_length(
+                tensor, target_len, pad_val, left_pad=False
+            )
+
+        padded_parts.append(
+            DataProto.from_dict(
+                padded_tensors,
+                non_tensors=part.non_tensor_batch,
+                meta_info=part.meta_info,
+            )
+        )
+
+    return padded_parts
 
 
 @dataclass
@@ -269,7 +317,13 @@ class MultiAgentGenerationManager(LLMGenerationManager):
 
         # Combine all wave outputs into a single DataProto
         if all_exec_output_parts:
-            exec_outputs = DataProto.concat(all_exec_output_parts)
+            pad_token_id = self.tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+            padded_parts = _pad_dataproto_for_concat(
+                all_exec_output_parts, pad_token_id
+            )
+            exec_outputs = DataProto.concat(padded_parts)
         else:
             exec_outputs = DataProto.from_dict({
                 "input_ids": torch.zeros((0, 1), dtype=torch.long),

@@ -15,9 +15,16 @@ query 本身没有唯一标准答案，你怎么判断一个 query 是好 query�
 	
 6. 多轮搜索怎么控制停止条件？
 怎么避免模型无限搜索，或者过早停止？
+
+my answer：
+- 设置最大的max_turns
+- 过早停止/不搜索直接回答 -> 不搜索工具固定-0.3
 	
 7. 检索结果和模型参数知识冲突时，训练目标是什么？
 永远相信检索？还是根据 source reliability 判断？
+
+my answer：
+- todo：要求输出
 	
 8. 你们的 verifier 怎么做？
 LLM judge、NLI、规则、人工标注、还是 learned reward model？各自误差怎么处理？
