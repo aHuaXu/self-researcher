@@ -31,7 +31,7 @@ export NCCL_P2P_DISABLE=1
 export project_name="deepresearcher"
 export experiment_name="qwen2.5_7b_grpo"
 
-BASE=/home/zjx/ahua_llm/self-researcher
+BASE=/home/zjx/self_llm/self-researcher
 cd ${BASE}
 
 # Load repo-root .env (SERPER_API_KEY, JUDGE_API_KEY / LLM_API_KEY, etc.) if present

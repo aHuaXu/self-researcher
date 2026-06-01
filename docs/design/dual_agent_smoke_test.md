@@ -135,10 +135,10 @@ pip install cachetools==5.5.2
 
 **修复**：启动本地 SearXNG
 ```bash
-bash /home/zjx/ahua_llm/searxng/start.sh
+bash /home/zjx/self_llm/searxng/start.sh
 curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8888/search?q=test&format=json'  # 期望 200
 ```
-- 安装目录：`/home/zjx/ahua_llm/searxng/`
+- 安装目录：`/home/zjx/self_llm/searxng/`
 - 绑定：`127.0.0.1:8888`
 - 2026-05-31 已启动，PID 2071025，搜索 API 验证通过
 
@@ -160,13 +160,13 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8888/search?q=test&fo
 1. 本地更新代码 + 本文档 → rsync 到服务器
 2. 训练前检查 GPU 0–3 空闲、CUDA 可用
 3. 确认 `cachetools==5.5.2`
-4. **启动 SearXNG**：`bash /home/zjx/ahua_llm/searxng/start.sh`（`.env` 使用 `SEARCH_ENGINE=searxng` 时必需）
+4. **启动 SearXNG**：`bash /home/zjx/self_llm/searxng/start.sh`（`.env` 使用 `SEARCH_ENGINE=searxng` 时必需）
 5. 启动 `bash scripts/train/grpo_dual_agent.sh`
 5. 每 30s 监控 `dual_agent_smoke.log`，异常即停
 6. 检查 `outputs/deepresearcher/qwen3_4b_dual_agent_ws4/rollout/` 下 planner/executor JSON
 
 ## 日志位置
 
-- 训练 stdout：`/home/zjx/ahua_llm/self-researcher/deepresearcher_qwen3_4b_dual_agent_ws4.log`
-- smoke 监控：`/home/zjx/ahua_llm/self-researcher/dual_agent_smoke.log`
+- 训练 stdout：`/home/zjx/self_llm/self-researcher/deepresearcher_qwen3_4b_dual_agent_ws4.log`
+- smoke 监控：`/home/zjx/self_llm/self-researcher/dual_agent_smoke.log`
 - Rollout JSON：`outputs/deepresearcher/qwen3_4b_dual_agent_ws4/rollout/`

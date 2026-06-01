@@ -38,8 +38,8 @@ def make_tiny_model():
 
 def find_local_tokenizer():
     candidates = [
-        '/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-0.5B-Instruct',
-        '/home/zjx/ahua_llm/self-researcher/models/Qwen2.5-3B-Instruct',
+        '/home/zjx/self_llm/self-researcher/models/Qwen2.5-0.5B-Instruct',
+        '/home/zjx/self_llm/self-researcher/models/Qwen2.5-3B-Instruct',
         os.path.expanduser('~/models/Qwen2.5-0.5B-Instruct'),
     ]
     for p in candidates:

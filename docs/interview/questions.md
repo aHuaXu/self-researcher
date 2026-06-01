@@ -24,7 +24,7 @@ my answer：
 永远相信检索？还是根据 source reliability 判断？
 
 my answer：
-- todo：要求输出
+<!-- - todo：要求输出 -->
 	
 8. 你们的 verifier 怎么做？
 LLM judge、NLI、规则、人工标注、还是 learned reward model？各自误差怎么处理？

@@ -314,3 +314,247 @@ reward = F1(final_answer, golden_answer)   # 主信号，不关心答案来自�
 
 **面试建议表述：**
 > "我们的训练目标不是永远信检索，而是 F1 对齐标注答案 + 必须调用工具。冲突消解目前没有显式 reliability scorer，主要靠 multi-hop 多轮搜索和 dual-agent 分解隐式涌现。如果要系统化，我会加 conflict/outdated 合成数据做 curriculum，再配合 faithfulness reward，把『猜对』和『搜对且证据成立』区分开。"
+
+---
+
+## 8. 你们的 verifier 怎么做？
+
+**核心立场：当前训练 reward 只有「F1 + 格式规则 + rule reward」三层，全部是确定性、可复现的函数；没有 LLM judge、NLI、learned RM。**
+
+### 训练期实际走哪条代码
+
+**单 Agent（Phase 0）：**
+
+```
+main_ppo.py → NaiveRewardManager → format_and_f1.compute_score
+```
+
+**Dual-Agent（Phase 1）：**
+
+```
+ray_trainer.py → MultiAgentRewardManager → compute_f1_reward + planner_rules + executor_rules
+```
+
+`MultiAgentRewardManager` 文件头注释明确写了：**No LLM Judge dependency**。
+
+训练脚本 `grpo_qwen3_4b.sh` / `grpo_dual_agent.sh` 均未设置 `reward_model.enable=True`，learned RM 未启用。
+
+### Verifier 分层（仅限训练 reward 路径）
+
+| 层级 | 实现 | 代码位置 | 权重 |
+|------|------|----------|------|
+| Outcome | Token-level F1 | `multi_agent.py:compute_f1_reward` / `format_and_f1.py:compute_score` | 主信号（1-α / 1-β） |
+| Format | 标签配对 + `<answer>` 提取 + no-tool penalty | `format_and_f1.py`（**仅单 Agent 路径**） | 格式错 -1.0；无 tool_call -0.3 |
+| Process | `planner_rules` / `executor_rules` | `rule_reward.py` | α=0.2, β=0.3 |
+
+Dual-Agent 的 outcome verifier 只对 executor 的 `final_answer` 做 F1，**不走** `format_and_f1` 的 no-tool penalty 逻辑。
+
+### 各 verifier 的误差处理
+
+**1. F1（主 verifier）**
+
+- 预处理：小写、去标点、`split()` 后 token set 算 precision/recall
+- 支持 `<|answer_split|>` 多答案取 max F1
+- **语义等价但措辞不同**（如中英文混用）→ F1 偏低，**当前无补偿机制**，靠 GRPO group 相对排序缓解
+- **多余 token** → precision 被稀释；prompt 要求 `<answer>` 内只写最终答案
+
+**2. 格式规则（单 Agent only）**
+
+```70:125:verl/utils/reward_score/format_and_f1.py
+def compute_score(solution_str, ground_truth, val_type='f1') -> float:
+    ...
+    if not has_tool_call:
+        return NO_TOOL_PENALTY  # -0.3
+    return max_score
+```
+
+- 确定性规则，误差可忽略
+- 不对称：搜了但格式错 → 0；没搜 → -0.3
+
+**3. Rule reward（Dual-Agent 过程 verifier）**
+
+```98:123:verl/utils/reward_score/rule_reward.py
+def executor_rules(trajectory, max_turns, actual_turns) -> float:
+    # 搜索非空 len>10 / 有 browse / browse 内容 len>50 / 未撞 max_turns
+```
+
+| 误差 | 处理 |
+|------|------|
+| 搜到垃圾也算非空 → 假阳性 | β=0.3 权重低，F1 仍是主信号 |
+| 规则太粗 | 设计目标是 dense 中间信号，非精确过程评判 |
+
+### 明确没用上的（面试也要主动说）
+
+| 类型 | 状态 | 说明 |
+|------|------|------|
+| LLM judge | **未接入训练** | `research_agent_design.md` 规划 Writer 阶段用冻结 judge 打报告分，`llm_judge.py` 未实现 |
+| NLI | **未实现** | Q5/Q7 讨论的 future work |
+| Learned RM | **未启用** | verl 有 `reward_model.enable` 接口，训练脚本未开 |
+| MBE | **不在本项目 reward 路径** | 仅存在于上游遗留脚本 `evaluate/cacluate_metrics.py`，API 为占位符 `"YOUR API BASE URL"`，与 `main_ppo` / `MultiAgentRewardManager` 无调用关系 |
+
+`ray_trainer.py` 验证阶段虽调用 `val_type='llm'`，但 `format_and_f1.compute_score` 只处理 `f1` 和 `em`，**`llm` 类型无对应实现，实际等同 F1**。
+
+### GRPO 如何吸收 F1 噪声
+
+同 query 采样 n 条 rollout → group 内 `(reward - mean) / std` → 绝对 F1 误差转为相对排序。全组都错 → advantage ≈ 0。
+
+### 未来演进
+
+| 场景 | Verifier |
+|------|----------|
+| 有标答 QA（当前） | F1 + rules |
+| 无标答研究报告 | 冻结 LLM judge（设计文档，未实现） |
+| Grounding | NLI / citation verify（future work） |
+
+**面试建议表述：**
+> "我们训练期的 verifier 很克制：outcome 是 token F1 对齐 golden answer，process 是 planner/executor 的 rule reward，单 Agent 阶段额外有格式规则和 no-tool penalty。全部是确定性函数，可复现、无 API 依赖。LLM judge、NLI、learned RM 都没进 RL 主循环——judge 噪声大、不可复现，不适合做每 step reward。上游 evaluate 脚本里有 MBE 代码，但 API 未配置、也不接训练 pipeline，我们实际没用。如果扩展到无标答开放任务，才会考虑冻结 LLM judge。"
+
+---
+
+## 9. 训练数据怎么构造？
+
+### 项目实际用到的数据集
+
+| 文件 | 脚本 | 含哪些 source |
+|------|------|---------------|
+| `train.parquet`（80K） | `grpo_qwen3_4b.sh` 等 | hotpotqa、2wiki、**nq**、tq |
+| `dev.parquet`（875） | 同上 val | 以上 4 个 + popqa、musique、Bamboogle |
+| `deepresearch_phase{1,2}.parquet` | `grpo_dual_agent.sh` | DeepResearch-9K（L1/L2 或 L2/L3） |
+
+构造：`scripts/prepare_deepresearch_data.py` 从 HF 拉 DeepResearch-9K，只取 question + final answer；rollout 实时 web 搜索，不 replay teacher trajectory。Reward 统一 token F1（单 Agent 另加 no-tool penalty -0.3）。
+
+未接入训练：`multi-research.parquet`（24 条 open-ended 研究题，无 GT）。
+
+### 面试四类的代表性数据集 & 项目是否使用
+
+| 类型 | 代表性数据集 | 项目是否使用 |
+|------|-------------|-------------|
+| **真实用户 query** | **NQ**（Google 搜索）、DuReader（中文搜索）、ELI5（Reddit） | **部分**：legacy train 里 **nq 占 12.5%**；Dual-Agent 路径无 |
+| **Synthetic multi-hop** | **HotpotQA**、2WikiMultihop、MuSiQue、**DeepResearch-9K** | **是**：hotpotqa + 2wiki（train 75%）；musique/Bamboogle（dev）；DeepResearch-9K（Dual-Agent） |
+| **Counterfactual outdated facts** | **FreshQA**、**HoH** | **否**（0%） |
+| **Conflict documents** | **ConflictQA**、ConfRAG、Conflicts | **否**（0%） |
+
+另：**TriviaQA**（tq）在 legacy train 占 12.5%，属 trivia benchmark，GT 用 `<|answer_split|>` 多短答取 max F1，不归入上面四类。
+
+### Outdated / Conflict 未使用，构造方式怎么答
+
+三类构造路径（面试常追问，我们 **0% 使用**）：
+
+1. **Memory–context conflict（ConflictQA）**：参数侧常用 **LLM 闭卷当代理**（`memory_answer` + `parametric_memory`），再配 Wikipedia `counter_memory`；不是从权重读「过期」，是构造「闭卷 vs 外部 evidence」冲突对。
+2. **Outdated facts（FreshQA / HoH）**：更依赖 **Wikipedia 时间 diff** 和 **FreshQA 式 time-sensitive 标注**（先定当前 GT，再配旧 snapshot / 旧文档当过时 evidence）。
+3. **多源 conflict（ConfRAG / Conflicts）**：**真实检索 + 人工**标多网页矛盾 viewpoint；LLM 仅轻量辅助。
+
+Outdated 与 ConflictQA 有重叠（如 CEO 闭卷答旧名、检索是新名），但 outdated **强调时间**，ConflictQA **强调信谁**（闭卷错也可能是记错）。
+
+### 面试建议表述
+
+> "训练数据两条线：Phase 0 用 train.parquet（HotpotQA+2Wiki 75%、NQ 12.5%、TriviaQA 12.5%），Dual-Agent 用 DeepResearch-9K 分 phase curriculum，F1 reward。四类里我们只覆盖 multi-hop 和部分真实 NQ，outdated 和 conflict 都是 0%。若要做：**ConflictQA 这类 memory–context 冲突，参数侧常用 LLM 闭卷当代理来构造；outdated 更依赖 Wikipedia 时间 diff 和 FreshQA 式 time-sensitive 标注；多源 conflict 则靠真实检索加人工。** 我们现用现成 benchmark，不需要这套构造 pipeline。"
+
+---
+
+## 10. 线上怎么做 routing？
+
+**现状：项目没有 per-query router**；搜不搜由 GRPO rollout 隐式决定（Q2）。no-tool penalty（-0.3）是训练 bias，**线上不应 all-in Agentic**。
+
+代码里只有 **部署级** 切换（`generation.py` + `search_engine`）：
+
+| `search_engine` | 工具 | 路径 |
+|-----------------|------|------|
+| `rag` | Wiki 检索（`TOOLS_FOR_WIKI`） | 普通 RAG：单轮检索 + 生成 |
+| `online_search` | `web_search` + `browse_webpage` | Agentic Search：多轮搜 + 深读 |
+
+训练脚本用 `online_search`；默认 yaml 为 `rag`。**完整 routing = query 级 `route()` 决定进哪条 pipeline。**
+
+### 什么场景需要 routing
+
+Routing 解决 **成本/延迟**，不是「模型会不会搜」（那是训练的事）。
+
+| 路径 | 典型场景 | 例子 |
+|------|----------|------|
+| **不搜** | 静态常识、定义、简单推理、闲聊 | 「Python 里 list 和 tuple 区别」 |
+| **普通 RAG** | 单跳事实、企业 KB 可覆盖 | 「我司 XX 产品退款政策」（内部文档） |
+| **Agentic Search** | multi-hop、time-sensitive、开放研究 | HotpotQA 类；「2025 年 X 公司 CEO」；对比分析报告 |
+
+**和我们数据的关系**：HotpotQA/DeepResearch-9K → Agentic；NQ 里不少单跳 → 可 RAG/不搜。
+
+### 怎么实现：三层 cascade
+
+```
+Query → [L1 规则/小 classifier] → direct | rag | agentic（不确定）
+              ↓ 低置信
+         [L2 闭卷置信度 / 小 LLM]
+              ↓ 仍不确定
+         [L3 Agentic Search]（训好的 policy，max_turns 限制）
+```
+
+| 层 | 手段 | 延迟 |
+|----|------|------|
+| L1 | 规则（「最新/2025/对比」→ agentic；短问非时效 → direct）；或 BERT 三分类 | ms 级 |
+| L2 | 闭卷生成 + 置信度；KB 检索 top1 分数 > 阈值 → rag | ~100ms |
+| L3 | `search_engine=online_search`，Dual-Agent 可选 | 秒级 |
+
+**和项目衔接**：`route(query)` 返回 `direct/rag/agentic` → `direct` 无工具生成；`rag` 设 `search_engine=rag`；`agentic` 设 `online_search` 调 `MultiAgentGenerationManager`。
+
+### 和训练的关系
+
+- **训练**：RL 学 Agentic policy 能力；无 router 标注
+- **线上**：router 决定 **何时调用** 这套能力；二者解耦
+
+### 面试建议表述
+
+> "Routing 用在成本和延迟：静态题不搜、单跳 RAG、multi-hop/时效走 Agentic。我们训练用 GRPO 学 search trigger，no-tool penalty 不能照搬线上。代码里已有 rag vs online_search 两条 pipeline，缺的是 query 级 router。实现上三层 cascade：规则或小 classifier 分流，不确定再闭卷看置信度，最后才上 Agentic。Routing 和训练解耦——训的是能力，router 决定什么时候调用。"
+
+---
+
+## 11. latency 和 cost 怎么优化？
+
+### 我们真实训练里的两个瓶颈
+
+**瓶颈 1：Rollout 按 turn 串行，GPU 等工具**
+
+`run_llm_loop` 每轮固定顺序：
+
+```
+for turn in range(max_turns):
+    vLLM generate（GPU）→ parse → execute_predictions（网络/IO）→ 拼 observation → 下一轮
+```
+
+工具执行期间 **vLLM 空闲**；一轮里所有样本都搜完才进入下一轮 generate（`executor_train_flow.md` 亦写明同步调用）。
+
+**已有缓解（同 turn 跨样本并行，非跨 turn）：** `execute_predictions` 用 `ThreadPoolExecutor`——`web_search` 最多 5 并发、`browse_webpage` 最多 4（`TOOL_WEB_SEARCH_MAX_WORKERS` / `TOOL_BROWSE_MAX_WORKERS`）。**turn 之间仍串行。**
+
+**瓶颈 2：生成与训练串联**
+
+`ray_trainer.py` 每 step：
+
+```
+gen（含多轮 tool）→ compute_log_prob → reward/adv → update_actor（FSDP）
+```
+
+生成和训练 **不能 overlap**；FSDP↔vLLM 还需 `FSDPVLLMShardingManager` 权重同步/切换模式，进一步拉长 step 时间。
+
+### 项目里已有的 cost/latency 手段
+
+| 手段 | 实现 | 作用 |
+|------|------|------|
+| **Retrieval budget** | `max_turns=5`；`web_search` 每 call 最多 3 个 query | 限制搜索深度 |
+| **Early stopping** | 输出 `<answer>` 即从 `activate_list` 移除 | 已答样本不再 generate |
+| **Cache** | `search.py` 的 `api_result_dict`，同 query 7 天内复用 | 减 Serper API 调用 |
+| **Truncate** | `TOOL_CONTENT_MAX_CHARS=3000` | 减 context 膨胀、下轮 gen 更快 |
+| **并行搜索** | 同 turn 多样本 ThreadPool | 减 wall-clock，但 GPU 仍等整批 tool 完成 |
+| **Routing（未做）** | Q10 | 简单题不进 Agentic，从根上减 tool 次数 |
+
+### 针对两大瓶颈的可做优化
+
+| 方向 | 做法 |
+|------|------|
+| **减 tool 等待** | 降 `max_turns` / `agent_grpo.n`；少 browse（browse 最慢）；训练期用小 batch |
+| **异步 tool** | 工具放独立 worker 进程/线程池，generate 与 tool IO overlap（需改 rollout 调度，当前未做） |
+| **Pipeline 训练** | step N 训练时异步启动 step N+1 rollout（需双缓冲 + 额外 GPU 或 offload infer） |
+| **训推分离 GPU** | 部分卡专职 vLLM rollout，部分卡 FSDP 训练，避免模式切换（成本高） |
+| **Query reuse** | 同 session 相似 query 走 cache（已有）；Planner 子任务间复用 finding 减重复搜 |
+| **Early stopping 加强** | 训练期也可考虑「连续无效搜索 turn 提前停」（rule，未实现） |
+
+### 面试建议表述
+
+> "我们训练 latency 主要卡在两点：一是 rollout 按 turn 串行——vLLM generate 完要等同步 tool，GPU 空等 Serper/browse；同 turn 内已用线程池并行多样本，但 turn 之间仍串行。二是生成和训练串联，每 step 先完整 rollout 再 FSDP update，还有 FSDP-vLLM 权重切换开销。已有手段是 max_turns、early stop、搜索 cache、截断 tool 内容、同 turn 并行搜。进一步优化我会：routing 减少不必要的 Agentic；降 browse 频率；探索训推 pipeline 或 tool worker 异步化。线上还有 retrieval budget 和 query cache；训练侧 cost 靠小 batch 和少轮 GRPO 采样控制。"

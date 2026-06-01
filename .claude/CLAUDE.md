@@ -34,8 +34,8 @@
 ## 远程服务器配置
 
 - 服务器: zjx@10.35.2.238
-- 项目目录: /home/zjx/ahua_llm/self-researcher
+- 项目目录: /home/zjx/self_llm/self-researcher
 - Conda 环境: deepresearcher
 - 激活命令: `source /home/zjx/anaconda3/bin/conda activate deepresearcher`
-- **只允许修改 /home/zjx/ahua_llm/self-researcher 目录下的文件**
+- **只允许修改 /home/zjx/self_llm/self-researcher 目录下的文件**
 - **训练前必须检查 GPU 使用情况，确保使用的 GPU 均为空闲状态，不影响他人任务**

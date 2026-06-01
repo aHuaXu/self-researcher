@@ -354,7 +354,7 @@ export RAY_memory_monitor_refresh_ms=0
 
 **现象**：Executor search `Connection refused` on `localhost:8888`  
 **原因**：`.env` 配置 `SEARCH_ENGINE=searxng`，但 SearXNG 进程未运行（与 Hydra `search_engine=online_search` 无关）  
-**修复**：`bash /home/zjx/ahua_llm/searxng/start.sh`，验证 HTTP 200
+**修复**：`bash /home/zjx/self_llm/searxng/start.sh`，验证 HTTP 200
 
 ### 问题 22：Executor batch 无法被 4 GPU 整除
 
