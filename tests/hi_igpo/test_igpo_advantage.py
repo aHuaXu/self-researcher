@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from verl.trainer.ppo.core_algos import compute_igpo_turn_advantage
 
@@ -101,6 +102,16 @@ def test_turn_group_singleton_falls_back_to_prompt():
     assert not torch.isnan(adv).any()
     assert torch.allclose(adv[0], torch.tensor([0.92, 0.92, 0.82, 0.82, 1.02, 1.02, 0.5, 0.5]), atol=1e-6)
     assert torch.allclose(adv[1], torch.tensor([-0.4, -0.4, -0.3, -0.3, -0.5, -0.5, 0., 0.]), atol=1e-6)
+
+
+def test_index_accepts_numpy_array():
+    # ray_trainer passes index from data.non_tensor_batch (numpy). Must not raise on torch.unique.
+    tlr, mask, boundary, _ = _two_traj_6tok()
+    index_np = np.array([0, 0])
+    adv, _ = compute_igpo_turn_advantage(
+        tlr, response_mask=mask, index=index_np, turn_boundary_mask=boundary,
+        ig_group_mode="global", info_gain_norm_mode="separate", norm_by_std=False, gamma=1.0)
+    assert torch.allclose(adv[0], torch.tensor([0.4, 0.4, 0.35, 0.35, 0.5, 0.5]), atol=1e-6)
 
 
 def test_turn_group_separate_norm_by_std():

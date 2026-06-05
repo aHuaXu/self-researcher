@@ -384,6 +384,9 @@ def compute_igpo_turn_advantage(
     # For ig_group_mode="global": one unique group per index value.
     # For ig_group_mode="turn_group": IG turns are further grouped by (index, turn-index);
     #   the (bs,) group_ids here are still prompt-level (used for F1 normalization and fallback).
+    # index may arrive as a numpy array (data.non_tensor_batch) — coerce to a long tensor.
+    if not torch.is_tensor(index):
+        index = torch.as_tensor([int(x) for x in index], device=device, dtype=torch.long)
     unique_prompts, inverse = torch.unique(index, return_inverse=True)
     group_ids = inverse           # (bs,)  consecutive 0-based group ids
     num_groups = unique_prompts.shape[0]
