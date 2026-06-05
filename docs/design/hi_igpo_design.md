@@ -56,6 +56,10 @@ for t = 1 .. T_p (T_p ≤ max_planner_turns):
 - **Executor**:内层多轮 agent(复用现有 `LLMGenerationManager.run_llm_loop`)。
 - **限制**:`T_p ≤ 5` 控成本;Executor 每子任务沿用现有 `max_turns`。
 - 相比 DAG:失去并行、轨迹变长(串行),但换来 Planner 的自适应决策(适时停止/换方向)与原生的分层信用。
+- **最终答案归 Planner**:Executor 只产中间 `findings_t`;Planner 攒够信息后自己输出 `<answer>`(F1 对它算)。
+- **`findings_t` 的内容(定:两者都要)**:Executor 把 `子任务_t` 当成小问题跑搜索循环,返回
+  **(a) 它对该子任务的 `<answer>`(简洁结论)+ (b) 沿途检索到的关键证据**。中间过程信息更全,
+  避免只取简短 `<answer>` 丢信息;`findings_t` 灌回 Planner 上下文(`response_mask=0`,不训),供下一轮决策与 belief。
 
 ## 4. 信念与信息增益(双层共享一条 belief 轨迹)
 
@@ -122,6 +126,13 @@ P_t = exp( (1/L) · Σ_j log π_θ(a_j | q, findings_{≤t}, a_{<j}) )
 ### 5.3 Executor(内层)
 - 主线(Phase 2b)**冻结**,不更新 LoRA,仅复用其执行产生 observation 供 belief 计算。
 - "Executor 内层 turn-level IG 训练 + 联合优化"随 Phase 2a 标记为 **future work**(§10)。
+
+> **⚠ 待讨论(核心流程跑通后再回看):Phase-1 模型当 Executor 的角色不匹配。**
+> Phase-1 训出的是"对**原问题**端到端出答案"的研究 agent,**没专门训"执行一个子任务并返回有用 findings"这个角色**;
+> 略过 Phase 2a 是赌它"够用"(已会多轮检索)。潜在风险:① QA 模型给子任务的 `<answer>` 可能太短/丢信息
+> →靠 `findings_t` 取(a)+(b) 两者缓解(§3);② 子任务文本与训练时的"原问题"分布有偏移,Executor 表现可能打折。
+> **回填选项(若 findings 质量太差导致 IG 信号弱)**:(i) 轻量做 Phase 2a 给 Executor 内层加 IG 训练;
+> 或 (ii) 不训练、只给 Executor 换一套"执行子任务"的 prompt,让产出更适合当 findings。**先把核心交替式流程跑通,再据 IG 信号强弱决定是否回填。**
 
 ## 6. 训练流程(两个有效阶段)
 
