@@ -25,6 +25,74 @@ from collections import defaultdict
 import verl.utils.torch_functional as verl_F
 
 
+def _compute_turn_level_advantage(
+    normalized_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: float,
+    bsz: int,
+    seq_len: int,
+    device: torch.device,
+    turn_boundary_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Turn-level discounted accumulation + broadcast to all tokens in each turn.
+
+    Ported from IGPO `/tmp/IGPO_ref/verl/trainer/ppo/core_algos.py` (line 28).
+    Used internally by compute_igpo_turn_advantage.
+
+    Args:
+        normalized_rewards: (bsz, seq_len) already-normalized token-level rewards.
+            Only turn-end positions carry non-zero values.
+        response_mask: (bsz, seq_len) 1 for valid response tokens, 0 for padding.
+        gamma: discount factor for turn-level accumulation.
+        bsz: batch size.
+        seq_len: sequence length.
+        device: torch device.
+        turn_boundary_mask: (bsz, seq_len) optional; marks turn-end positions.
+            When provided, used instead of `normalized_rewards != 0` heuristic to
+            avoid missing turns whose normalized reward happens to be zero.
+
+    Returns:
+        discounted_returns: (bsz, seq_len) turn advantage broadcast to every
+            token in the corresponding turn.
+    """
+    discounted_returns = torch.zeros(bsz, seq_len, device=device, dtype=normalized_rewards.dtype)
+
+    for sample_idx in range(bsz):
+        sample_rewards = normalized_rewards[sample_idx]   # (seq_len,)
+        sample_mask    = response_mask[sample_idx]         # (seq_len,)
+
+        # Step 1: identify turn-end positions
+        if turn_boundary_mask is not None:
+            reward_positions = turn_boundary_mask[sample_idx].nonzero(as_tuple=True)[0].tolist()
+        else:
+            reward_positions = (sample_rewards != 0).nonzero(as_tuple=True)[0].tolist()
+
+        if len(reward_positions) == 0:
+            continue
+
+        # Step 2: backward discounted accumulation
+        turn_data = []
+        next_turn_adv = 0.0
+        for pos in reversed(reward_positions):
+            turn_reward = sample_rewards[pos].item()
+            turn_adv    = turn_reward + gamma * next_turn_adv
+            turn_data.append((pos, turn_adv))
+            next_turn_adv = turn_adv
+        turn_data.reverse()   # forward order
+
+        # Step 3: broadcast advantage to all tokens in the turn
+        # Turn i covers [prev_end, reward_pos] (inclusive on both ends)
+        prev_end = 0
+        for reward_pos, adv in turn_data:
+            for t in range(prev_end, reward_pos + 1):
+                if sample_mask[t] == 1:
+                    discounted_returns[sample_idx, t] = adv
+            prev_end = reward_pos + 1
+
+    return discounted_returns
+
+
 class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:
@@ -199,6 +267,188 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
 
     return scores, scores
+
+
+def compute_igpo_turn_advantage(
+    turn_records: dict,
+    bs: int,
+    response_len: int,
+    gamma: float = 1.0,
+    ig_group_mode: str = "global",
+    info_gain_norm_mode: str = "separate",
+    norm_by_std: bool = True,
+    min_group_size: int = 2,
+    epsilon: float = 1e-6,
+):
+    """
+    Compute IGPO turn-level advantage from per-turn records.
+
+    Port of IGPO `compute_grpo_outcome_advantage` + `_compute_turn_level_advantage`.
+    Translates the per-turn `turn_records` dict (this repo's unified representation)
+    into token-level (bs, response_len) tensors, then applies IGPO's
+    normalize -> discounted accumulate -> scatter logic.
+
+    Args:
+        turn_records: dict with torch.Tensor fields of length N (number of turns total):
+            turn_reward  (float): per-turn reward value
+            prompt_id    (long):  prompt group id for global normalization
+            traj_id      (long):  trajectory id (maps to sample_row in batch)
+            turn_pos     (long):  turn index within trajectory
+            is_outcome   (bool):  True for the final F1 turn, False for IG turns
+            sample_row   (long):  row index in the (bs, response_len) output tensors
+            span_start   (long):  token start position of this turn (inclusive)
+            span_end     (long):  token end position of this turn (exclusive)
+        bs: batch size
+        response_len: response sequence length
+        gamma: discount factor for turn-level accumulation (default 1.0)
+        ig_group_mode: "global" = normalize across all trajectories sharing a prompt_id.
+            "turn_group" is reserved for Task 2 (raises NotImplementedError).
+        info_gain_norm_mode: "separate" = F1 and IG pools normalized independently;
+            "joint" = F1 + IG pooled together.
+        norm_by_std: whether to divide by group std (IGPO default True)
+        min_group_size: minimum group size to apply std normalization (currently informational)
+        epsilon: small constant for division stability
+
+    Returns:
+        advantages: torch.Tensor (bs, response_len)
+        returns:    torch.Tensor (bs, response_len)  — identical to advantages
+    """
+    if ig_group_mode != "global":
+        raise NotImplementedError(
+            f"ig_group_mode='{ig_group_mode}' is not implemented yet. Only 'global' is supported in Task 1."
+        )
+
+    # ---------- Step A: Unpack turn_records ----------
+    turn_reward = turn_records["turn_reward"]   # (N,) float
+    prompt_id   = turn_records["prompt_id"]     # (N,) long
+    is_outcome  = turn_records["is_outcome"]    # (N,) bool
+    sample_row  = turn_records["sample_row"]    # (N,) long — row in (bs, L)
+    span_start  = turn_records["span_start"]    # (N,) long
+    span_end    = turn_records["span_end"]      # (N,) long
+
+    device = turn_reward.device
+    N = turn_reward.shape[0]
+
+    # ---------- Step B: Build token-level reward tensor (bs, response_len) ----------
+    # Place each turn's reward at its last token position (span_end - 1),
+    # matching IGPO convention: turn end token carries the reward.
+    token_level_rewards = torch.zeros(bs, response_len, device=device, dtype=turn_reward.dtype)
+    response_mask = torch.zeros(bs, response_len, device=device, dtype=torch.long)
+
+    for i in range(N):
+        row  = sample_row[i].item()
+        s    = span_start[i].item()
+        e    = span_end[i].item()    # exclusive
+        # reward goes to the last token of the span
+        token_level_rewards[row, e - 1] = turn_reward[i]
+        # mark span as valid response tokens
+        response_mask[row, s:e] = 1
+
+    # ---------- Step C: Build masks — f1_mask and ig_mask ----------
+    # f1_mask: positions where is_outcome turns land (last token of outcome spans)
+    # ig_mask: positions where IG turns land (last token of IG spans)
+    f1_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
+    ig_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
+
+    for i in range(N):
+        row = sample_row[i].item()
+        e   = span_end[i].item()
+        if is_outcome[i].item():
+            f1_mask[row, e - 1] = True
+        else:
+            ig_mask[row, e - 1] = True
+
+    # ---------- Step D: Build group_ids (bs,) from prompt_id ----------
+    # For ig_group_mode="global": one unique group per prompt_id value.
+    # We need one prompt_id per sample_row; use the first turn belonging to each row.
+    # All turns of the same sample share the same prompt_id by construction.
+    row_prompt = torch.zeros(bs, device=device, dtype=torch.long)
+    for i in range(N):
+        row_prompt[sample_row[i].item()] = prompt_id[i]
+
+    unique_prompts, inverse = torch.unique(row_prompt, return_inverse=True)
+    group_ids = inverse           # (bs,)  consecutive 0-based group ids
+    num_groups = unique_prompts.shape[0]
+
+    # Expand to (bs, response_len) for scatter ops
+    group_ids_expanded = group_ids.unsqueeze(1).expand(-1, response_len)  # (bs, L)
+
+    # ---------- Step E: Compute group statistics ----------
+    def compute_group_stats(mask):
+        """Compute per-group mean and std at masked positions."""
+        flat_mask     = mask.view(-1)                          # (bs*L,)
+        flat_rewards  = token_level_rewards.view(-1)          # (bs*L,)
+        flat_gids     = group_ids_expanded.reshape(-1)        # (bs*L,)
+
+        valid_idx = flat_mask.nonzero(as_tuple=True)[0]
+        if valid_idx.numel() == 0:
+            return (
+                torch.zeros(num_groups, device=device),
+                torch.ones(num_groups, device=device),
+            )
+
+        valid_rewards = flat_rewards[valid_idx]
+        valid_gids    = flat_gids[valid_idx]
+
+        group_sum   = torch.zeros(num_groups, device=device).scatter_add_(0, valid_gids, valid_rewards)
+        group_count = torch.zeros(num_groups, device=device).scatter_add_(
+            0, valid_gids, torch.ones_like(valid_rewards)
+        )
+        group_mean  = group_sum / group_count.clamp(min=1.0)
+
+        expanded_mean = group_mean[valid_gids]
+        sq_diff       = (valid_rewards - expanded_mean) ** 2
+        group_sq_sum  = torch.zeros(num_groups, device=device).scatter_add_(0, valid_gids, sq_diff)
+        group_var     = group_sq_sum / group_count.clamp(min=1.0)
+        group_std     = torch.sqrt(group_var + 1e-8)
+        group_std     = torch.where(group_count <= 1, torch.ones_like(group_std), group_std)
+
+        return group_mean, group_std
+
+    # ---------- Step F: Normalize ----------
+    normalized_rewards = torch.zeros_like(token_level_rewards)
+
+    if info_gain_norm_mode == "separate":
+        # F1 part
+        f1_mean, f1_std = compute_group_stats(f1_mask)
+        f1_mean_map = f1_mean[group_ids_expanded]
+        f1_std_map  = f1_std[group_ids_expanded]
+        norm_f1 = token_level_rewards - f1_mean_map
+        if norm_by_std:
+            norm_f1 = norm_f1 / (f1_std_map + epsilon)
+        normalized_rewards = torch.where(f1_mask, norm_f1, normalized_rewards)
+
+        # IG part
+        ig_mean, ig_std = compute_group_stats(ig_mask)
+        ig_mean_map = ig_mean[group_ids_expanded]
+        ig_std_map  = ig_std[group_ids_expanded]
+        norm_ig = token_level_rewards - ig_mean_map
+        if norm_by_std:
+            norm_ig = norm_ig / (ig_std_map + epsilon)
+        normalized_rewards = torch.where(ig_mask, norm_ig, normalized_rewards)
+
+    else:  # joint
+        joint_mask = f1_mask | ig_mask
+        g_mean, g_std = compute_group_stats(joint_mask)
+        mean_map = g_mean[group_ids_expanded]
+        std_map  = g_std[group_ids_expanded]
+        norm_val = token_level_rewards - mean_map
+        if norm_by_std:
+            norm_val = norm_val / (std_map + epsilon)
+        normalized_rewards = torch.where(joint_mask, norm_val, normalized_rewards)
+
+    # ---------- Step G: Turn-level discounted accumulation + scatter ----------
+    discounted_returns = _compute_turn_level_advantage(
+        normalized_rewards=normalized_rewards,
+        response_mask=response_mask,
+        gamma=gamma,
+        bsz=bs,
+        seq_len=response_len,
+        device=device,
+        turn_boundary_mask=f1_mask | ig_mask,
+    )
+
+    return discounted_returns, discounted_returns
 
 
 def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Tensor, eos_mask: torch.Tensor,
