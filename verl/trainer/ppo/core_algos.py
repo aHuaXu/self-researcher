@@ -269,6 +269,39 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+def _grouped_mean_std(
+    values: torch.Tensor,
+    group_id: torch.Tensor,
+    norm_by_std: bool,
+    eps: float = 1e-6,
+):
+    """
+    Compute per-group mean and std for a flat list of values.
+
+    Args:
+        values:    (M,) float tensor
+        group_id:  (M,) long tensor — consecutive group indices
+        norm_by_std: if False, std is always 1.0 (no std division)
+        eps:       stability constant (unused here, caller adds it on division)
+
+    Returns:
+        mean: (M,) float — group mean broadcast back to each element
+        std:  (M,) float — group std (1.0 if norm_by_std=False or group size ≤ 1)
+        size: (M,) float — group size broadcast back to each element
+    """
+    mean = torch.zeros_like(values)
+    std  = torch.ones_like(values)
+    size = torch.ones_like(values)
+    for g in torch.unique(group_id):
+        m = group_id == g
+        v = values[m]
+        mean[m] = v.mean()
+        size[m] = float(v.numel())
+        if norm_by_std and v.numel() > 1:
+            std[m] = v.std(unbiased=False)
+    return mean, std, size
+
+
 def compute_igpo_turn_advantage(
     turn_records: dict,
     bs: int,
@@ -301,26 +334,28 @@ def compute_igpo_turn_advantage(
         bs: batch size
         response_len: response sequence length
         gamma: discount factor for turn-level accumulation (default 1.0)
-        ig_group_mode: "global" = normalize across all trajectories sharing a prompt_id.
-            "turn_group" is reserved for Task 2 (raises NotImplementedError).
+        ig_group_mode: "global" = normalize IG turns across all trajectories sharing a prompt_id.
+            "turn_group" = normalize IG turns by (prompt_id, turn_pos) group; groups with fewer
+            than min_group_size samples fall back to the prompt-level statistics.
         info_gain_norm_mode: "separate" = F1 and IG pools normalized independently;
             "joint" = F1 + IG pooled together.
         norm_by_std: whether to divide by group std (IGPO default True)
-        min_group_size: minimum group size to apply std normalization (currently informational)
+        min_group_size: for turn_group mode, groups smaller than this fall back to prompt-level stats
         epsilon: small constant for division stability
 
     Returns:
         advantages: torch.Tensor (bs, response_len)
         returns:    torch.Tensor (bs, response_len)  — identical to advantages
     """
-    if ig_group_mode != "global":
-        raise NotImplementedError(
-            f"ig_group_mode='{ig_group_mode}' is not implemented yet. Only 'global' is supported in Task 1."
+    if ig_group_mode not in ("global", "turn_group"):
+        raise ValueError(
+            f"ig_group_mode='{ig_group_mode}' is not supported. Use 'global' or 'turn_group'."
         )
 
     # ---------- Step A: Unpack turn_records ----------
     turn_reward = turn_records["turn_reward"]   # (N,) float
     prompt_id   = turn_records["prompt_id"]     # (N,) long
+    turn_pos    = turn_records["turn_pos"]      # (N,) long — turn index within trajectory
     is_outcome  = turn_records["is_outcome"]    # (N,) bool
     sample_row  = turn_records["sample_row"]    # (N,) long — row in (bs, L)
     span_start  = turn_records["span_start"]    # (N,) long
@@ -357,6 +392,9 @@ def compute_igpo_turn_advantage(
     # it from token position alone.
     f1_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
     ig_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
+    # token_turn_pos: for each IG token drop-point (span_end-1), store its turn_pos.
+    # Only meaningful at ig_mask positions; used by turn_group normalization.
+    token_turn_pos = torch.zeros(bs, response_len, device=device, dtype=torch.long)
 
     for i in range(N):
         row = sample_row[i].item()
@@ -365,9 +403,12 @@ def compute_igpo_turn_advantage(
             f1_mask[row, e - 1] = True
         else:
             ig_mask[row, e - 1] = True
+            token_turn_pos[row, e - 1] = turn_pos[i]
 
     # ---------- Step D: Build group_ids (bs,) from prompt_id ----------
     # For ig_group_mode="global": one unique group per prompt_id value.
+    # For ig_group_mode="turn_group": IG turns are further grouped by (prompt_id, turn_pos);
+    #   the (bs,) group_ids here are still prompt-level (used for F1 normalization and fallback).
     # We need one prompt_id per sample_row; use the first turn belonging to each row.
     # All turns of the same sample share the same prompt_id by construction.
     row_prompt = torch.zeros(bs, device=device, dtype=torch.long)
@@ -427,13 +468,55 @@ def compute_igpo_turn_advantage(
         normalized_rewards = torch.where(f1_mask, norm_f1, normalized_rewards)
 
         # IG part
-        ig_mean, ig_std = compute_group_stats(ig_mask)
-        ig_mean_map = ig_mean[group_ids_expanded]
-        ig_std_map  = ig_std[group_ids_expanded]
-        norm_ig = token_level_rewards - ig_mean_map
-        if norm_by_std:
-            norm_ig = norm_ig / (ig_std_map + epsilon)
-        normalized_rewards = torch.where(ig_mask, norm_ig, normalized_rewards)
+        if ig_group_mode == "global":
+            # Global: normalize all IG turns sharing a prompt_id together (IGPO default)
+            ig_mean, ig_std = compute_group_stats(ig_mask)
+            ig_mean_map = ig_mean[group_ids_expanded]
+            ig_std_map  = ig_std[group_ids_expanded]
+            norm_ig = token_level_rewards - ig_mean_map
+            if norm_by_std:
+                norm_ig = norm_ig / (ig_std_map + epsilon)
+            normalized_rewards = torch.where(ig_mask, norm_ig, normalized_rewards)
+        else:
+            # turn_group: normalize IG turns by (prompt_id, turn_pos) group
+            # Extract values at IG drop-points
+            flat_ig_mask   = ig_mask.view(-1)
+            ig_valid_idx   = flat_ig_mask.nonzero(as_tuple=True)[0]
+
+            if ig_valid_idx.numel() > 0:
+                flat_rewards      = token_level_rewards.view(-1)
+                flat_row_prompt   = group_ids.unsqueeze(1).expand(-1, response_len).reshape(-1)
+                flat_turn_pos     = token_turn_pos.view(-1)
+
+                ig_rewards    = flat_rewards[ig_valid_idx]       # (M,) rewards at IG positions
+                ig_prompt_ids = flat_row_prompt[ig_valid_idx]    # (M,) prompt group ids
+                ig_turn_pos   = flat_turn_pos[ig_valid_idx]      # (M,) turn positions
+
+                # Build fine-grained turn-group ids from (prompt_id, turn_pos) pairs
+                tg_keys = torch.stack([ig_prompt_ids, ig_turn_pos], dim=1)  # (M, 2)
+                _, tg_ids = torch.unique(tg_keys, dim=0, return_inverse=True)  # (M,)
+
+                # Compute turn-group mean/std
+                tg_mean, tg_std, tg_size = _grouped_mean_std(ig_rewards, tg_ids, norm_by_std, eps=epsilon)
+
+                # Compute prompt-level (global) mean/std for fallback
+                g_mean, g_std, _ = _grouped_mean_std(ig_rewards, ig_prompt_ids, norm_by_std, eps=epsilon)
+
+                # Apply fallback: where turn-group size < min_group_size, use prompt-level stats
+                fallback = tg_size < min_group_size
+                final_mean = torch.where(fallback, g_mean, tg_mean)
+                final_std  = torch.where(fallback, g_std, tg_std)
+
+                # Compute normalized values at IG positions
+                norm_ig_values = ig_rewards - final_mean
+                if norm_by_std:
+                    norm_ig_values = norm_ig_values / (final_std + epsilon)
+
+                # Scatter back to (bs, response_len) at IG drop-points
+                norm_ig_flat = torch.zeros(bs * response_len, device=device, dtype=token_level_rewards.dtype)
+                norm_ig_flat[ig_valid_idx] = norm_ig_values
+                norm_ig = norm_ig_flat.view(bs, response_len)
+                normalized_rewards = torch.where(ig_mask, norm_ig, normalized_rewards)
 
     else:  # joint
         joint_mask = f1_mask | ig_mask
