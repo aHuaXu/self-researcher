@@ -280,7 +280,11 @@ def compute_vectorized_gt_logprob(
     print(f"[PREALIGNED VECTORIZED] Calling compute_log_prob ONCE...")
     merged_log_probs_result = actor_rollout_wg.compute_log_prob(merged_batch)
     merged_old_log_probs = merged_log_probs_result.batch['old_log_probs']
-    merged_entropys = merged_log_probs_result.batch['entropys']
+    # This repo's compute_log_prob returns only old_log_probs (no 'entropys'); entropys here is
+    # purely diagnostic (gt_entropys_per_turn), not used by the IG computation. Fall back to zeros.
+    merged_entropys = merged_log_probs_result.batch.get('entropys', None)
+    if merged_entropys is None:
+        merged_entropys = torch.zeros_like(merged_old_log_probs)
     
     print(f"[PREALIGNED VECTORIZED] compute_log_prob completed, shape={merged_old_log_probs.shape}")
     
