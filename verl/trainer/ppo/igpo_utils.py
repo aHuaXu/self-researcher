@@ -3,6 +3,47 @@ from typing import Sequence
 import torch
 
 
+def compute_igpo_token_level_scores(data, tokenizer, info_gain_rewards, val_type="f1"):
+    """Build IGPO token-level reward tensor (bs, response_len) from per-sample IG.
+
+    Mirrors NaiveRewardManager's decode→score loop, but uses info_gain.compute_score
+    so each sample gets per-turn IG at turn-end tokens + F1 at the final turn. Must be
+    called while `data` rows still align with `info_gain_rewards` (i.e. after
+    repeat+union but BEFORE _balance_batch reorders the batch); the resulting tensor
+    then rides along through balancing as a normal batch field.
+    """
+    from verl.utils.reward_score import info_gain
+
+    reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+    for i in range(len(data)):
+        item = data[i]
+        prompt_ids = item.batch['prompts']
+        prompt_length = prompt_ids.shape[-1]
+        response_ids = item.batch['responses']
+        valid_response_length = int(item.batch['attention_mask'][prompt_length:].sum())
+        if valid_response_length == 0:
+            continue
+        valid_response_ids = response_ids[:valid_response_length]
+        response_str = tokenizer.decode(valid_response_ids)
+
+        ground_truth = item.non_tensor_batch['reward_model']['ground_truth']
+        data_source = item.non_tensor_batch['data_source']
+        ig = info_gain_rewards[i] if (info_gain_rewards is not None and i < len(info_gain_rewards)) else []
+
+        scores = info_gain.compute_score(
+            solution_str=response_str,
+            ground_truth=ground_truth,
+            data_source=data_source,
+            val_type=val_type,
+            info_gain_reward=list(ig),
+            tokenizer=tokenizer,
+        )
+        n = min(len(scores), valid_response_length)
+        for j in range(n):
+            reward_tensor[i, j] = float(scores[j])
+    return reward_tensor
+
+
 def extract_ground_truths_for_igpo(reward_models: Sequence[dict], repeat_times: int = 1) -> list[dict]:
     """Extract `ground_truth` entries in the shape expected by igpo_generation."""
     if repeat_times < 1:

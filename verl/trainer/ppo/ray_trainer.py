@@ -1013,6 +1013,43 @@ class RayPPOTrainer(object):
             is_validation=False,
         )
 
+        # --- Hi-IGPO single-agent initialization (conditional) ---
+        # adv_estimator=igpo (and NOT multi-agent) → use the ported IGPO generation
+        # manager (run_llm_loop returns per-turn info_gain_rewards) + token-level IG reward.
+        _igpo_enabled = (
+            str(self.config.algorithm.adv_estimator) == AdvantageEstimator.IGPO.value
+            and not (getattr(self.config, 'multi_agent', None) and self.config.multi_agent.enable)
+        )
+        igpo_generation_manager = None
+        if _igpo_enabled:
+            from scrl.llm_agent.igpo_generation import (
+                LLMGenerationManager as IGPOGenerationManager,
+                GenerationConfig as IGPOGenerationConfig,
+            )
+            from scrl.llm_agent.vectorized_gt_logprob import init_from_config as init_vectorized_config
+            from verl.trainer.ppo.igpo_utils import compute_igpo_token_level_scores  # noqa: F401 (used below)
+
+            # Enable vectorized GT belief if +algorithm.use_vectorized_gt_logprob=true
+            init_vectorized_config(self.config)
+            igpo_gen_config = IGPOGenerationConfig(
+                max_turns=self.config.max_turns,
+                num_gpus=self.config.trainer.n_gpus_per_node,
+                model_name=self.config.actor_rollout_ref.model.path,
+                n=self.config.agent_grpo.n,
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name,
+                search_engine=self.config.search_engine,
+                nnodes=self.config.trainer.nnodes,
+                info_gain_type=getattr(self.config.algorithm, 'info_gain_type', 'log_prob_diff'),
+            )
+            igpo_generation_manager = IGPOGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=igpo_gen_config,
+                is_validation=False,
+            )
+            print(f"[IGPO] single-agent IGPO enabled (info_gain_type={igpo_gen_config.info_gain_type})", flush=True)
+
         # --- Multi-agent initialization (conditional) ---
         if getattr(self.config, 'multi_agent', None) and self.config.multi_agent.enable:
             from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
@@ -1253,8 +1290,25 @@ class RayPPOTrainer(object):
 
                                     del gen_baseline_batch, gen_baseline_output
                         else:
+                            igpo_info_gain_rewards = None
                             if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                                 assert False, 'REMAX is not supported for search'
+                            elif _igpo_enabled:
+                                with _timer('gen', timing_raw):
+                                    igpo_generation_manager.timing_raw = timing_raw
+                                    # IGPO run_llm_loop returns per-turn info_gain_rewards; it expands
+                                    # ground_truths by config.n internally (aligns with batch.repeat below).
+                                    gen_str_list, gen_batch_output, igpo_info_gain_rewards = igpo_generation_manager.run_llm_loop(
+                                        gen_batch=gen_batch,
+                                        global_steps=self.global_steps,
+                                        ground_truths=list(batch.non_tensor_batch['reward_model']),
+                                    )
+                                for key in gen_batch_output.batch.keys():
+                                    gen_batch_output.batch[key] = gen_batch_output.batch[key].long()
+
+                                with torch.no_grad():
+                                    output = self.actor_rollout_wg.compute_log_prob(gen_batch_output)
+                                    gen_batch_output = gen_batch_output.union(output)
                             else:
                                 with _timer('gen', timing_raw):
                                     generation_manager.timing_raw = timing_raw
@@ -1277,6 +1331,15 @@ class RayPPOTrainer(object):
                         batch = batch.repeat(repeat_times=self.config.agent_grpo.n, interleave=True)
                         batch = batch.union(gen_batch_output)
 
+                        # IGPO: scatter per-turn IG + final F1 into token_level_scores NOW, while
+                        # batch rows still align with igpo_info_gain_rewards (before _balance_batch
+                        # reorders). Stored as a batch field so it rides through balancing; the
+                        # adv section below skips self.reward_fn for IGPO.
+                        if _igpo_enabled:
+                            batch.batch['token_level_scores'] = compute_igpo_token_level_scores(
+                                batch, self.tokenizer, igpo_info_gain_rewards, val_type='f1'
+                            )
+
                         # balance the number of valid tokens on each dp rank.
                         # Note that this breaks the order of data inside the batch.
                         # Please take care when you implement group based adv computation such as GRPO and rloo
@@ -1294,7 +1357,8 @@ class RayPPOTrainer(object):
                         # 跳过old_log_probs的检查，防止下面assert报错
                         # AssertionError: old_log_probs in tensor_dict1 and tensor_dict2 are not the same object
                         for key in batch.batch.keys():
-                            if key != 'old_log_probs':
+                            # token_level_scores (IGPO IG/F1) is float — must NOT be cast to long.
+                            if key not in ('old_log_probs', 'token_level_scores'):
                                 batch.batch[key] = batch.batch[key].long()
 
                         if self.use_reference_policy:
@@ -1312,23 +1376,30 @@ class RayPPOTrainer(object):
                             # compute scores. Support both model and function-based.
                             # We first compute the scores using reward model. Then, we call reward_fn to combine
                             # the results from reward model and rule-based results.
-                            if self.use_rm:
-                                # we first compute reward model score
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(reward_tensor)
-
-                            # we combine with rule-based rm
-                            reward_tensor = self.reward_fn(batch)
-                            batch.batch['token_level_scores'] = reward_tensor
-
-                            # compute rewards. apply_kl_penalty if available
-                            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                                batch, kl_metrics = apply_kl_penalty(batch,
-                                                                     kl_ctrl=self.kl_ctrl,
-                                                                     kl_penalty=self.config.algorithm.kl_penalty)
-                                metrics.update(kl_metrics)
-                            else:
+                            if _igpo_enabled:
+                                # token_level_scores already set above (IGPO IG/F1 scatter, pre-balance).
+                                # Do NOT apply KL-in-reward: it would make ~every token non-zero and
+                                # break turn-boundary inference (reward!=0) in compute_igpo_turn_advantage.
+                                # KL regularization, if any, goes through the actor's use_kl_loss.
                                 batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                            else:
+                                if self.use_rm:
+                                    # we first compute reward model score
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                    batch = batch.union(reward_tensor)
+
+                                # we combine with rule-based rm
+                                reward_tensor = self.reward_fn(batch)
+                                batch.batch['token_level_scores'] = reward_tensor
+
+                                # compute rewards. apply_kl_penalty if available
+                                if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                                    batch, kl_metrics = apply_kl_penalty(batch,
+                                                                         kl_ctrl=self.kl_ctrl,
+                                                                         kl_penalty=self.config.algorithm.kl_penalty)
+                                    metrics.update(kl_metrics)
+                                else:
+                                    batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                             # compute advantages, executed on the driver process
                             # batch = compute_advantage(batch,
