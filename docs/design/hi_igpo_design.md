@@ -187,7 +187,7 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
 >
 > 手工拼接 ~400 行还要调和签名/返回,既不小也极易与 IGPO 产生细微偏差,违背"流程一致"前提。
 >
-> **取而代之:把 IGPO 的 `generation.py` 整文件搬为 `scrl/llm_agent/igpo_generation.py`(只改 import / 对齐本仓库 verl 的 DataProto·tokenizer 接口,不改其数学与控制流),做成一条 `adv_estimator=igpo` 时才走的并行路径。现有 `scrl/llm_agent/generation.py` 与 `multi_agent_generation.py` 零改动,继续承载 DAG / 双 agent 基线。**
+> **取而代之:把 IGPO 的 `generation.py` 整文件搬为 `scrl/llm_agent/igpo_generation.py`(只改 import / 对齐本仓库 verl 的 DataProto·tokenizer 接口,不改其数学与控制流),做成一条 `adv_estimator=igpo` 时才走的并行路径。现有 `scrl/llm_agent/generation.py` 零改动(仍作冻结 Executor 的内层 rollout)。`multi_agent_generation.py`(一次性 DAG)**已废弃删除**——multi-agent 路径改由交替式 `interleaved_generation.py` 承载。**
 >
 > - 一致性:单 agent 跑的就是 IGPO 原代码三件套(`igpo_generation.py` + `vectorized_gt_logprob.py` + `compute_igpo_turn_advantage`),可逐函数核对。
 > - 改动面:几乎全是新增文件;现有代码只新增一个"按 `adv_estimator` 选 generation manager"的选择器开关。基线路径回归不破。
@@ -234,14 +234,15 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
 
 ## 8. 实验与消融(论文主线)
 
-固定架构 = 交替式,**消融奖励与归一化**(干净对照):
+固定架构 = 交替式(**一次性 DAG 已废弃,multi-agent 路径即交替生成**),**消融奖励与归一化**(干净对照):
 
-1. **基线 A**:DAG + 共享 F1(当前代码)。
-2. **基线 B**:单 agent IGPO(Phase 1)。
-3. **Hi-IGPO + global 归一化**:交替式 + Planner turn-level IG,原生 IGPO 全局归一化。
-4. **Hi-IGPO + turn_group 归一化(主方法)**:在 3 基础上换 A²TGPO 的 (prompt, turn-index) 归一化。
-5. **消融**:`info_gain_norm_mode` separate vs joint;自适应 turn 级 clipping on/off。
-6. **(可选)架构对比**:交替式 vs 一次性 DAG。
+1. **基线 B**:单 agent IGPO(Phase 1)。
+2. **Hi-IGPO + global 归一化**:交替式 + Planner turn-level IG,原生 IGPO 全局归一化。
+3. **Hi-IGPO + turn_group 归一化(主方法)**:在 2 基础上换 A²TGPO 的 (prompt, turn-index) 归一化。
+4. **消融**:`info_gain_norm_mode` separate vs joint;自适应 turn 级 clipping on/off。
+
+> 注:原"DAG + 共享 F1"基线 A 已**移除**(决定放弃 DAG,multi-agent 直接=交替式)。对照主要落在
+> 单 agent IGPO(B)↔ 交替式 Hi-IGPO,以及归一化/separate-joint 的消融轴。
 
 **指标**:hard QA 的 F1/EM;收敛速度 / 数据效率;平均 Planner 轮数(看是否学会适时停止)。
 **规模**:Qwen3-4B,小 batch,`grpo_n` 4~8,各变体从同一 warm start 分叉。
@@ -249,8 +250,8 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
 ## 9. 风险与回退
 
 - **最大风险**:交替式重写碰现有较脆弱的 multi-agent rollout(OOM / 权重同步 / 长度对齐,见
-  `docs/design/dual_agent_smoke_test.md`)。**回退**:若 Phase 2b 交替式跑不通,退回"保留 DAG + P-fine
-  (把子任务 IG 回传到提出它的 planner token 段)",仍保留信用分配创新。
+  `docs/design/dual_agent_smoke_test.md`)。**回退**:DAG 已废弃、不再作为回退;若 Phase 2b 交替式跑不通,
+  回退到 **Phase 1 单 agent IGPO**(已验证可跑通)作为可发表的最小成果,交替式作为加分项继续 debug。
 - **成本**:串行变长。**对策**:严格限 `T_p`、小 batch、先在 2-step smoke 上验证。
 - **非平稳**:靠冻结 Executor(Phase 2b)规避。
 - **数值**:belief/优势复用 IGPO 已验证实现降低风险;Phase 1 先验证数值正确再进 Phase 2b。
