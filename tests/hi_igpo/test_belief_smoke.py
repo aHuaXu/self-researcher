@@ -44,7 +44,9 @@ def test_belief_in_unit_interval_and_increases_with_answer_in_context():
     )
 
     tok, model = _load()
-    computer = VectorizedGTLogProbComputer(tok, VectorizedGTConfig())
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    config = VectorizedGTConfig(pad_token_id=pad_id, eos_token_id=tok.eos_token_id)
+    computer = VectorizedGTLogProbComputer(tok, config)
 
     question = "What is the capital of France?"
     golden = "Paris"
@@ -63,7 +65,9 @@ def test_belief_in_unit_interval_and_increases_with_answer_in_context():
             gt_log_probs, _ = computer.compute_all_turns_vectorized(
                 model, ids, attn, pos, golden, turn_end_positions=[ids.shape[0] - 1]
             )
-        bel = torch.exp(gt_log_probs[0].mean()).item()
+        assert len(gt_log_probs) >= 1, f"no per-turn log probs returned for {name}"
+        lp = torch.as_tensor(gt_log_probs[0], dtype=torch.float32)
+        bel = torch.exp(lp.mean()).item()
         assert 0.0 < bel < 1.0, f"belief out of (0,1): {name}={bel}"
         beliefs[name] = bel
 
