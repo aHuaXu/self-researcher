@@ -49,6 +49,15 @@ def set_vectorized_enabled(enabled: bool):
     print(f"[IGPO] Vectorized GT LogProb: {'ENABLED' if enabled else 'DISABLED'}")
 
 
+# Bridge text inserted between the rollout context and the golden answer when
+# teacher-forcing the GT for belief. This repo trains with THINKING OFF (no
+# <think>...</think>; reasoning is plain text before <answer>), so the PREFIX must
+# NOT contain </think> — otherwise belief is computed on an out-of-distribution
+# template the model was never trained on. (IGPO upstream uses </think>; dropped here.)
+DEFAULT_GT_ANSWER_PREFIX = "\nNow there's enough information to answer\n<answer>\n"
+DEFAULT_GT_ANSWER_SUFFIX = "\n</answer><|im_end|>"
+
+
 @dataclass
 class VectorizedGTConfig:
     """Configuration for vectorized GT log prob computation."""
@@ -59,6 +68,10 @@ class VectorizedGTConfig:
     # Tolerance for validation comparison
     validation_rtol: float = 1e-4
     validation_atol: float = 1e-6
+    # GT answer bridge text (see DEFAULT_GT_ANSWER_* above). Configurable so the
+    # answer template can match whatever format the policy actually emits.
+    gt_answer_prefix: str = DEFAULT_GT_ANSWER_PREFIX
+    gt_answer_suffix: str = DEFAULT_GT_ANSWER_SUFFIX
 
 
 class VectorizedGTLogProbComputer:
@@ -98,8 +111,8 @@ class VectorizedGTLogProbComputer:
         Returns:
             gt_tokens: Tensor of shape (gt_len,)
         """
-        PREFIX = "\nNow there's enough information to answer\n</think>\n<answer>\n"
-        SUFFIX = "\n</answer><|im_end|>"
+        PREFIX = self.config.gt_answer_prefix
+        SUFFIX = self.config.gt_answer_suffix
         
         full_text = f"{PREFIX}{ground_truth_text}{SUFFIX}"
         encoding = self.tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
@@ -118,8 +131,8 @@ class VectorizedGTLogProbComputer:
         Returns:
             (start_idx, end_idx): Token indices of the answer portion
         """
-        PREFIX = "\nNow there's enough information to answer\n</think>\n<answer>\n"
-        SUFFIX = "\n</answer><|im_end|>"
+        PREFIX = self.config.gt_answer_prefix
+        SUFFIX = self.config.gt_answer_suffix
         
         full_text = f"{PREFIX}{ground_truth_text}{SUFFIX}"
         encoding = self.tokenizer(full_text, return_tensors="pt", return_offsets_mapping=True)

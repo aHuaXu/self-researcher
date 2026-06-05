@@ -51,10 +51,10 @@ def test_belief_in_unit_interval_and_increases_with_answer_in_context():
     question = "What is the capital of France?"
     golden = "Paris"
 
-    # belief 的 tokenize_ground_truth 用 PREFIX="...\n</think>\n<answer>\n" 拼 golden,
-    # 它假设上下文是"模型思考中(<think> 已开未闭)"。所以上下文必须以 <think> 开头、不闭合,
-    # 拼上 PREFIX 后才是良构的 <think>...</think><answer>golden</answer>。
-    head = f"<think>\nQuestion: {question}\n"
+    # 本项目 THINKING OFF:reasoning 是 <answer> 前的纯文本,无 <think> 标签。
+    # belief 的 PREFIX 已配置为 no-think("...\n<answer>\n"),所以上下文用纯文本即可,
+    # 拼上 PREFIX 后是良构的 <reasoning>...<answer>golden</answer>。
+    head = f"Question: {question}\n"
     ctx_with = head + "Findings: The capital of France is Paris."
     ctx_without = head + "Findings: Bananas are rich in potassium."
 

@@ -27,6 +27,8 @@ from scrl.llm_agent.vectorized_gt_logprob import (
     is_vectorized_enabled,
     VectorizedGTConfig,
     VectorizedGTLogProbComputer,
+    DEFAULT_GT_ANSWER_PREFIX,
+    DEFAULT_GT_ANSWER_SUFFIX,
 )
 import math
 
@@ -522,8 +524,8 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
 
         # Use offset_mapping to precisely calculate ground truth token range
         # Avoid index offset caused by subword tokenization boundary effects
-        PREFIX = "\nNow there's enough information to answer\n</think>\n<answer>\n"
-        SUFFIX = "\n</answer><|im_end|>"
+        PREFIX = DEFAULT_GT_ANSWER_PREFIX
+        SUFFIX = DEFAULT_GT_ANSWER_SUFFIX
         
         pseudo_resps_with_gt = []
         gt_idx = []
@@ -871,8 +873,8 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 else:
                     messages_list[tool_call_list[i]['idx']].append(
                         {
-                            "role": "assistant", 
-                            "content": "<think>" + tool_call_list[i]['think'] + "</think>", 
+                            "role": "assistant",
+                            "content": tool_call_list[i]['think'],   # no-think: raw reasoning, matches this repo's generation.py
                             "tool_calls": [
                                             {
                                                 "type": "function", 
