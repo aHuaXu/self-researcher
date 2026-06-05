@@ -51,23 +51,29 @@ def test_belief_in_unit_interval_and_increases_with_answer_in_context():
     question = "What is the capital of France?"
     golden = "Paris"
 
-    # 两个上下文:一个含答案线索,一个无关
-    ctx_with = question + "\nFindings: The capital of France is Paris.\n"
-    ctx_without = question + "\nFindings: Bananas are rich in potassium.\n"
+    # belief 的 tokenize_ground_truth 用 PREFIX="...\n</think>\n<answer>\n" 拼 golden,
+    # 它假设上下文是"模型思考中(<think> 已开未闭)"。所以上下文必须以 <think> 开头、不闭合,
+    # 拼上 PREFIX 后才是良构的 <think>...</think><answer>golden</answer>。
+    head = f"<think>\nQuestion: {question}\n"
+    ctx_with = head + "Findings: The capital of France is Paris."
+    ctx_without = head + "Findings: Bananas are rich in potassium."
 
     beliefs = {}
     for name, ctx in [("with", ctx_with), ("without", ctx_without)]:
-        ids = tok(ctx, return_tensors="pt").input_ids[0].cuda()
+        ids = tok(ctx, return_tensors="pt", add_special_tokens=False).input_ids[0].cuda()
         attn = torch.ones_like(ids)
         pos = torch.arange(ids.shape[0], device=ids.device)
+        gt_start, gt_end = computer.get_gt_answer_token_range(golden)
         # 单 turn:turn_end_positions = [序列末]
         with torch.no_grad():
-            gt_log_probs, _ = computer.compute_all_turns_vectorized(
+            gt_log_probs, gt_ranges = computer.compute_all_turns_vectorized(
                 model, ids, attn, pos, golden, turn_end_positions=[ids.shape[0] - 1]
             )
         assert len(gt_log_probs) >= 1, f"no per-turn log probs returned for {name}"
         lp = torch.as_tensor(gt_log_probs[0], dtype=torch.float32)
         bel = torch.exp(lp.mean()).item()
+        print(f"[belief] {name:8s} bel={bel:.6f}  ctx_tokens={ids.shape[0]} "
+              f"answer_range={(gt_start, gt_end)} ranges={gt_ranges} logp={lp.tolist()}")
         assert 0.0 < bel < 1.0, f"belief out of (0,1): {name}={bel}"
         beliefs[name] = bel
 
