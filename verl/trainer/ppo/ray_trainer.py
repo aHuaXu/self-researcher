@@ -40,6 +40,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from scrl.llm_agent.generation import LLMGenerationManager, GenerationConfig
+from verl.trainer.ppo.igpo_utils import is_critic_free_adv_estimator
 WorkerType = Type[Worker]
 
 
@@ -426,10 +427,7 @@ class RayPPOTrainer(object):
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
-        elif self.config.algorithm.adv_estimator in [
-                AdvantageEstimator.GRPO, AdvantageEstimator.REINFORCE_PLUS_PLUS, AdvantageEstimator.REMAX,
-                AdvantageEstimator.RLOO
-        ]:
+        elif is_critic_free_adv_estimator(self.config.algorithm.adv_estimator):
             self.use_critic = False
         else:
             raise NotImplementedError
