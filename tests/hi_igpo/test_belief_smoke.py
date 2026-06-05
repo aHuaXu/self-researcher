@@ -1,0 +1,72 @@
+"""
+Belief (ground-truth log-prob) smoke test — Task 3.
+
+belief 计算依赖真实 HF 模型(Qwen3-4B)+ GPU,本地 .venv-test(CPU、无 transformers)
+跑不了,故本测试在缺 CUDA / transformers / 模型路径时自动 skip,在**服务器** GPU 环境手验。
+
+服务器验证步骤(对应计划 Task 3 Step 3):
+  1. 设环境变量指向本地模型:export IGPO_BELIEF_TEST_MODEL=/path/to/Qwen3-4B-Instruct
+  2. conda activate deepresearcher && python -m pytest tests/hi_igpo/test_belief_smoke.py -v
+  3. 断言:每个 Bel_t ∈ (0,1);含 golden 答案的上下文 belief > 无关上下文 belief(方向单调)。
+
+验证点(= IGPO belief 定义):
+  Bel_t = exp( mean_j log π(a_j | context_t, a_<j) )   # golden 答案的 token 几何平均概率
+  全程 torch.no_grad()(stop-gradient)。
+"""
+import os
+import pytest
+
+torch = pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
+
+_MODEL = os.getenv("IGPO_BELIEF_TEST_MODEL")
+
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="belief smoke needs GPU"),
+    pytest.mark.skipif(_MODEL is None, reason="set IGPO_BELIEF_TEST_MODEL to a local HF model path"),
+]
+
+
+def _load():
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(_MODEL, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        _MODEL, torch_dtype=torch.float16, trust_remote_code=True
+    ).cuda().eval()
+    return tok, model
+
+
+def test_belief_in_unit_interval_and_increases_with_answer_in_context():
+    """含答案的上下文应给出更高 belief;所有 belief 落在 (0,1)。"""
+    from scrl.llm_agent.vectorized_gt_logprob import (
+        VectorizedGTConfig,
+        VectorizedGTLogProbComputer,
+    )
+
+    tok, model = _load()
+    computer = VectorizedGTLogProbComputer(tok, VectorizedGTConfig())
+
+    question = "What is the capital of France?"
+    golden = "Paris"
+
+    # 两个上下文:一个含答案线索,一个无关
+    ctx_with = question + "\nFindings: The capital of France is Paris.\n"
+    ctx_without = question + "\nFindings: Bananas are rich in potassium.\n"
+
+    beliefs = {}
+    for name, ctx in [("with", ctx_with), ("without", ctx_without)]:
+        ids = tok(ctx, return_tensors="pt").input_ids[0].cuda()
+        attn = torch.ones_like(ids)
+        pos = torch.arange(ids.shape[0], device=ids.device)
+        # 单 turn:turn_end_positions = [序列末]
+        with torch.no_grad():
+            gt_log_probs, _ = computer.compute_all_turns_vectorized(
+                model, ids, attn, pos, golden, turn_end_positions=[ids.shape[0] - 1]
+            )
+        bel = torch.exp(gt_log_probs[0].mean()).item()
+        assert 0.0 < bel < 1.0, f"belief out of (0,1): {name}={bel}"
+        beliefs[name] = bel
+
+    assert beliefs["with"] > beliefs["without"], (
+        f"belief should be higher with answer in context: {beliefs}"
+    )
