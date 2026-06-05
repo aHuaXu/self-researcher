@@ -36,7 +36,8 @@ from dataclasses import dataclass
 from tensordict import TensorDict
 from scrl.llm_agent.tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
-from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+# API drift: this repo's verl names it get_eos_mask (IGPO renamed it get_response_mask); same signature.
+from verl.utils.torch_functional import get_eos_mask as get_response_mask, pad_2d_list_to_length
 import numpy as np
 import traceback
 import torch.nn.functional as F
