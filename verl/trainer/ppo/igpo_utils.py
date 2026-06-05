@@ -58,6 +58,37 @@ def extract_ground_truths_for_igpo(reward_models: Sequence[dict], repeat_times: 
     return ground_truths
 
 
+def scatter_planner_token_rewards(beliefs, f1, turn_end_positions, response_length):
+    """Phase 2b: scatter one Planner trajectory's per-turn IG + final F1 to token rewards.
+
+    beliefs = [Bel_0, ..., Bel_T] (initial belief + one per executed subtask). The per-turn
+    information gain is IG_t = beliefs[t+1] - beliefs[t] (T values), written at the Planner
+    turn-end tokens; F1 goes at the answer token. `turn_end_positions` therefore has T+1
+    entries: the T IG turn-ends followed by the answer (F1) position.
+
+    Returns (token_level_rewards: (L,), turn_boundary_mask: (L,)) — same token-level form as
+    the single-agent path, fed (after stacking to (bs, L)) to compute_igpo_turn_advantage.
+    """
+    beliefs = torch.as_tensor(list(beliefs), dtype=torch.float32)
+    igs = beliefs[1:] - beliefs[:-1]                       # (T,)
+    if len(turn_end_positions) != igs.numel() + 1:
+        raise ValueError(
+            f"turn_end_positions ({len(turn_end_positions)}) must equal #IG ({igs.numel()}) + 1 (answer)"
+        )
+    rewards = torch.zeros(response_length, dtype=torch.float32)
+    boundary = torch.zeros(response_length, dtype=torch.bool)
+    for pos in turn_end_positions:
+        if pos < 0 or pos >= response_length:
+            raise ValueError(f"turn end position {pos} out of response length {response_length}")
+    for t, pos in enumerate(turn_end_positions[:-1]):
+        rewards[pos] = igs[t]
+        boundary[pos] = True
+    f1_pos = turn_end_positions[-1]
+    rewards[f1_pos] = float(f1)
+    boundary[f1_pos] = True
+    return rewards, boundary
+
+
 def is_critic_free_adv_estimator(adv_estimator) -> bool:
     """Return whether an advantage estimator should skip critic construction."""
     return str(adv_estimator) in {

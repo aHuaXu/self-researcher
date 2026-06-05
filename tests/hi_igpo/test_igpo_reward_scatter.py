@@ -47,6 +47,24 @@ def test_igpo_adv_estimator_is_critic_free():
     assert is_critic_free_adv_estimator("igpo")
 
 
+def test_scatter_planner_token_rewards_from_beliefs():
+    from verl.trainer.ppo.igpo_utils import scatter_planner_token_rewards
+    # beliefs Bel_0..Bel_3 -> IG=[0.3, 0.05, 0.45]; F1=1.0 at answer end.
+    beliefs = [0.1, 0.4, 0.45, 0.9]
+    rewards, boundary = scatter_planner_token_rewards(
+        beliefs=beliefs, f1=1.0, turn_end_positions=[1, 3, 5, 7], response_length=8)
+    expect = torch.zeros(8); expect[1] = 0.3; expect[3] = 0.05; expect[5] = 0.45; expect[7] = 1.0
+    assert torch.allclose(rewards, expect, atol=1e-6)
+    assert boundary.tolist() == [False, True, False, True, False, True, False, True]
+
+
+def test_scatter_planner_rejects_misaligned_positions():
+    from verl.trainer.ppo.igpo_utils import scatter_planner_token_rewards
+    with pytest.raises(ValueError):
+        scatter_planner_token_rewards(beliefs=[0.1, 0.4, 0.9], f1=1.0,
+                                      turn_end_positions=[1, 3], response_length=6)  # need 2 IG + 1 = 3
+
+
 def test_extract_ground_truths_for_igpo_repeats_reward_model_entries():
     reward_models = [
         {"ground_truth": "alpha"},
