@@ -70,10 +70,14 @@ def test_belief_in_unit_interval_and_increases_with_answer_in_context():
                 model, ids, attn, pos, golden, turn_end_positions=[ids.shape[0] - 1]
             )
         assert len(gt_log_probs) >= 1, f"no per-turn log probs returned for {name}"
-        lp = torch.as_tensor(gt_log_probs[0], dtype=torch.float32)
+        # gt_log_probs[0] 是整段 GT(PREFIX+答案+SUFFIX)的逐 token logp;
+        # belief = P(答案 token),必须用 gt_ranges[0] 切到答案区间再取均值。
+        lp_full = torch.as_tensor(gt_log_probs[0], dtype=torch.float32)
+        a_start, a_end = gt_ranges[0]
+        lp = lp_full[a_start:a_end]
         bel = torch.exp(lp.mean()).item()
         print(f"[belief] {name:8s} bel={bel:.6f}  ctx_tokens={ids.shape[0]} "
-              f"answer_range={(gt_start, gt_end)} ranges={gt_ranges} logp={lp.tolist()}")
+              f"answer_range={(a_start, a_end)} full_logp={lp_full.tolist()} answer_logp={lp.tolist()}")
         assert 0.0 < bel < 1.0, f"belief out of (0,1): {name}={bel}"
         beliefs[name] = bel
 
