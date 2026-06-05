@@ -347,6 +347,14 @@ def compute_igpo_turn_advantage(
     # ---------- Step C: Build masks — f1_mask and ig_mask ----------
     # f1_mask: positions where is_outcome turns land (last token of outcome spans)
     # ig_mask: positions where IG turns land (last token of IG spans)
+    #
+    # NOTE: This implementation uses the explicit `is_outcome` field in turn_records
+    # to mark which turns are F1 (outcome) turns vs. IG (information-gain) turns,
+    # placing each turn's reward at position span_end-1 (the last token of the span).
+    # This is an intentional adaptation to the IGPO convention that "F1 reward lands
+    # on the last valid token of each row" — turn_records is a more flexible per-turn
+    # representation that makes the F1/IG distinction explicit rather than inferring
+    # it from token position alone.
     f1_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
     ig_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
 
