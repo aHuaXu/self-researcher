@@ -308,44 +308,46 @@ def _grouped_mean_std(
 
 
 def compute_igpo_turn_advantage(
-    turn_records: dict,
-    bs: int,
-    response_len: int,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: torch.Tensor,
+    turn_boundary_mask: torch.Tensor = None,
     gamma: float = 1.0,
-    ig_group_mode: str = "global",
     info_gain_norm_mode: str = "separate",
-    norm_by_std: bool = True,
+    ig_group_mode: str = "global",
     min_group_size: int = 2,
+    norm_by_std: bool = True,
     epsilon: float = 1e-6,
 ):
     """
-    Compute IGPO turn-level advantage from per-turn records.
+    Compute IGPO turn-level advantage from IGPO-native token-level tensors.
 
     Port of IGPO `compute_grpo_outcome_advantage` + `_compute_turn_level_advantage`.
-    Translates the per-turn `turn_records` dict (this repo's unified representation)
-    into token-level (bs, response_len) tensors, then applies IGPO's
-    normalize -> discounted accumulate -> scatter logic.
+    Same signature/semantics as IGPO (only `ig_group_mode`/`min_group_size` are this
+    design's extensions; with `ig_group_mode='global'` the behaviour is identical to
+    IGPO). Applies IGPO's normalize -> discounted accumulate -> scatter logic.
+
+    Reward convention (= IGPO): IG rewards are written at each turn-end token; the F1
+    (outcome) reward is written at the last valid token of each row. `turn_boundary_mask`
+    marks ALL turn-end positions (IG turns + the F1 token); the function derives
+    `f1_mask` = last valid token per row and `ig_mask` = turn_boundary_mask & ~f1_mask.
+    No external per-turn structure is required.
 
     Args:
-        turn_records: dict with torch.Tensor fields of length N (number of turns total):
-            turn_reward  (float): per-turn reward value
-            prompt_id    (long):  prompt group id for global normalization
-            traj_id      (long):  trajectory id (maps to sample_row in batch)
-            turn_pos     (long):  turn index within trajectory
-            is_outcome   (bool):  True for the final F1 turn, False for IG turns
-            sample_row   (long):  row index in the (bs, response_len) output tensors
-            span_start   (long):  token start position of this turn (inclusive)
-            span_end     (long):  token end position of this turn (exclusive)
-        bs: batch size
-        response_len: response sequence length
+        token_level_rewards: (bs, L) per-token rewards. IG at turn-end tokens, F1 at last valid token.
+        response_mask: (bs, L) 1 for valid response tokens, 0 for padding.
+        index: (bs,) prompt group id, used for global normalization (and turn_group fallback).
+        turn_boundary_mask: (bs, L) optional; marks all turn-end positions (IG + F1). When None,
+            turn boundaries are inferred from `token_level_rewards != 0`.
         gamma: discount factor for turn-level accumulation (default 1.0)
-        ig_group_mode: "global" = normalize IG turns across all trajectories sharing a prompt_id.
-            "turn_group" = normalize IG turns by (prompt_id, turn_pos) group; groups with fewer
-            than min_group_size samples fall back to the prompt-level statistics.
         info_gain_norm_mode: "separate" = F1 and IG pools normalized independently;
             "joint" = F1 + IG pooled together.
-        norm_by_std: whether to divide by group std (IGPO default True)
+        ig_group_mode: "global" = normalize IG turns across all trajectories sharing an index
+            (IGPO default). "turn_group" = normalize IG turns by (index, turn-index) group, where
+            turn-index is derived from the order of IG boundaries within each row; groups with fewer
+            than min_group_size samples fall back to the index-level (prompt) statistics.
         min_group_size: for turn_group mode, groups smaller than this fall back to prompt-level stats
+        norm_by_std: whether to divide by group std (IGPO default True)
         epsilon: small constant for division stability
 
     Returns:
@@ -357,70 +359,32 @@ def compute_igpo_turn_advantage(
             f"ig_group_mode='{ig_group_mode}' is not supported. Use 'global' or 'turn_group'."
         )
 
-    # ---------- Step A: Unpack turn_records ----------
-    turn_reward = turn_records["turn_reward"]   # (N,) float
-    prompt_id   = turn_records["prompt_id"]     # (N,) long
-    turn_pos    = turn_records["turn_pos"]      # (N,) long — turn index within trajectory
-    is_outcome  = turn_records["is_outcome"]    # (N,) bool
-    sample_row  = turn_records["sample_row"]    # (N,) long — row in (bs, L)
-    span_start  = turn_records["span_start"]    # (N,) long
-    span_end    = turn_records["span_end"]      # (N,) long
+    bs, response_len = token_level_rewards.shape
+    device = token_level_rewards.device
 
-    device = turn_reward.device
-    N = turn_reward.shape[0]
+    # ---------- Step C: Build masks — f1_mask, ig_mask, token_turn_pos ----------
+    # f1_mask: the last valid token of each row carries the F1 (outcome) reward (IGPO convention).
+    # ig_mask: all other turn-end positions carry IG rewards.
+    # token_turn_pos: turn-index of each IG drop-point, derived from the order of IG boundaries
+    #   within the row (cumsum of ig_mask). Only meaningful at ig_mask positions; used by turn_group.
+    positions = torch.arange(response_len, device=device).unsqueeze(0)        # (1, L)
+    last_valid = ((response_mask > 0).long() * positions).argmax(dim=1)       # (bs,) last valid token idx
+    f1_mask = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
+    f1_mask[torch.arange(bs, device=device), last_valid] = True
 
-    # ---------- Step B: Build token-level reward tensor (bs, response_len) ----------
-    # Place each turn's reward at its last token position (span_end - 1),
-    # matching IGPO convention: turn end token carries the reward.
-    token_level_rewards = torch.zeros(bs, response_len, device=device, dtype=turn_reward.dtype)
-    response_mask = torch.zeros(bs, response_len, device=device, dtype=torch.long)
+    if turn_boundary_mask is not None:
+        boundary = turn_boundary_mask.bool()
+    else:
+        boundary = token_level_rewards != 0
+    ig_mask = boundary & ~f1_mask
 
-    for i in range(N):
-        row  = sample_row[i].item()
-        s    = span_start[i].item()
-        e    = span_end[i].item()    # exclusive
-        # reward goes to the last token of the span
-        token_level_rewards[row, e - 1] = turn_reward[i]
-        # mark span as valid response tokens
-        response_mask[row, s:e] = 1
+    token_turn_pos = (ig_mask.long().cumsum(dim=1) - 1).clamp(min=0)          # (bs, L)
 
-    # ---------- Step C: Build masks — f1_mask and ig_mask ----------
-    # f1_mask: positions where is_outcome turns land (last token of outcome spans)
-    # ig_mask: positions where IG turns land (last token of IG spans)
-    #
-    # NOTE: This implementation uses the explicit `is_outcome` field in turn_records
-    # to mark which turns are F1 (outcome) turns vs. IG (information-gain) turns,
-    # placing each turn's reward at position span_end-1 (the last token of the span).
-    # This is an intentional adaptation to the IGPO convention that "F1 reward lands
-    # on the last valid token of each row" — turn_records is a more flexible per-turn
-    # representation that makes the F1/IG distinction explicit rather than inferring
-    # it from token position alone.
-    f1_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
-    ig_mask  = torch.zeros(bs, response_len, device=device, dtype=torch.bool)
-    # token_turn_pos: for each IG token drop-point (span_end-1), store its turn_pos.
-    # Only meaningful at ig_mask positions; used by turn_group normalization.
-    token_turn_pos = torch.zeros(bs, response_len, device=device, dtype=torch.long)
-
-    for i in range(N):
-        row = sample_row[i].item()
-        e   = span_end[i].item()
-        if is_outcome[i].item():
-            f1_mask[row, e - 1] = True
-        else:
-            ig_mask[row, e - 1] = True
-            token_turn_pos[row, e - 1] = turn_pos[i]
-
-    # ---------- Step D: Build group_ids (bs,) from prompt_id ----------
-    # For ig_group_mode="global": one unique group per prompt_id value.
-    # For ig_group_mode="turn_group": IG turns are further grouped by (prompt_id, turn_pos);
+    # ---------- Step D: Build group_ids (bs,) from index ----------
+    # For ig_group_mode="global": one unique group per index value.
+    # For ig_group_mode="turn_group": IG turns are further grouped by (index, turn-index);
     #   the (bs,) group_ids here are still prompt-level (used for F1 normalization and fallback).
-    # We need one prompt_id per sample_row; use the first turn belonging to each row.
-    # All turns of the same sample share the same prompt_id by construction.
-    row_prompt = torch.zeros(bs, device=device, dtype=torch.long)
-    for i in range(N):
-        row_prompt[sample_row[i].item()] = prompt_id[i]
-
-    unique_prompts, inverse = torch.unique(row_prompt, return_inverse=True)
+    unique_prompts, inverse = torch.unique(index, return_inverse=True)
     group_ids = inverse           # (bs,)  consecutive 0-based group ids
     num_groups = unique_prompts.shape[0]
 
