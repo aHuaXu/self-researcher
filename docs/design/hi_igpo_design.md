@@ -138,7 +138,7 @@ P_t = exp( (1/L) · Σ_j log π_θ(a_j | q, findings_{≤t}, a_{<j}) )
 ## 7. 实现策略:从 IGPO 移植 IG 核心(可执行步骤)
 
 IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一一对应。
-**不整库替换,按文件 diff/cherry-pick 增量移植。** 已核对的关键差异如下。
+**不整库替换,按文件移植**(优势/belief 整段复制;generation 整文件 port 成并行路径,见下)。已核对的关键差异如下。
 
 ### 7.0 已核对的源/目标差异
 
@@ -167,9 +167,39 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
 → 动作:把 IGPO 版 `compute_grpo_outcome_advantage` 与 `_compute_turn_level_advantage`
 移入本仓库 `core_algos.py`(保留旧函数或加 `adv_estimator` 分支),适配 `eos_mask`↔`response_mask` 命名。
 
-**生成逻辑(本仓库有,diff 出 IG 钩子):**
-- `scrl/llm_agent/generation.py`:diff IGPO 版,cherry-pick "每轮调用 belief → 算 `IG=log_prob_diff` →
-  写入 per-turn 奖励张量 + `turn_end_positions`" 的代码块。
+> **优势函数的输入表示(本次确认):保持 IGPO 原生 token 级签名,不引入 per-turn dict 适配层。**
+> 即 `(token_level_rewards:(bs,L), response_mask:(bs,L), index)`——IG 写在每个 turn 末 token、F1 写在
+> 最后一个有效 token,turn 边界从张量非零位置 / `turn_boundary_mask` 反推。这样**单 agent 与 Phase 2b
+> 的 Planner 共用同一个 token 级优势函数,逐函数等价于 IGPO**(§5.0)。本设计的 `turn_group`(§5.2)只作为
+> 该函数内部的一个**分组模式扩展**:turn-index 由每行 turn 边界的出现顺序现场推出(第 k 个 IG 边界 = turn k),
+> 同样不需要外部 per-turn 结构。
+
+**生成逻辑(本仓库与 IGPO 已分叉 → 整文件 port 成并行路径,不动现有文件):**
+
+> **设计原则(本次确认):单 agent 流程必须与 IGPO 项目逐函数一致。**
+> 因此生成路径**不 cherry-pick**——已核对两边 `generation.py` 结构分叉显著:
+>
+> | | 本仓库 `generation.py` | IGPO `generation.py` |
+> |---|---|---|
+> | 行数 | 590 | 1006(多 ~400 行 IG/pseudo-forward/vectorized 收集) |
+> | `run_llm_loop` 签名 | `(gen_batch, global_steps, lora_adapter_name) -> (Dict, Dict)` | `(gen_batch, global_steps, ground_truths) -> (str_list, tensor, info_gain_rewards)` |
+> | IG 钩子 | 无 | 每轮 `pseudo_generate_sequences` + belief + `info_gain_rewards` |
+>
+> 手工拼接 ~400 行还要调和签名/返回,既不小也极易与 IGPO 产生细微偏差,违背"流程一致"前提。
+>
+> **取而代之:把 IGPO 的 `generation.py` 整文件搬为 `scrl/llm_agent/igpo_generation.py`(只改 import / 对齐本仓库 verl 的 DataProto·tokenizer 接口,不改其数学与控制流),做成一条 `adv_estimator=igpo` 时才走的并行路径。现有 `scrl/llm_agent/generation.py` 与 `multi_agent_generation.py` 零改动,继续承载 DAG / 双 agent 基线。**
+>
+> - 一致性:单 agent 跑的就是 IGPO 原代码三件套(`igpo_generation.py` + `vectorized_gt_logprob.py` + `compute_igpo_turn_advantage`),可逐函数核对。
+> - 改动面:几乎全是新增文件;现有代码只新增一个"按 `adv_estimator` 选 generation manager"的选择器开关。基线路径回归不破。
+> - 代价:IGPO `generation.py` 依赖本仓库 verl 版本接口,搬来需对齐少量 import / API 漂移(同源,漂移小)。
+>
+> **工具层必须替换(已核对):IGPO 只有 `web_search`(走独立 `tools_server`/`MessageClient`),本项目是 `web_search` + `browse_webpage`(进程内直调 `research_agent.tools`)。**
+> 我们要的是 IGPO 的 **IG/belief/rollout 算法**,不是它的工具环境(工具属任务/数据,本项目是联网 research)。
+> 好在两边工具调用**格式一致**(都是 `<tool_call>{name,arguments}</tool_call>` + `<answer>`),且 `parse_response`
+> 返回 `[(is_stop, reasoning, answer/tool_call)]`、`execute_predictions(tool_call_list, total_number)` 返回
+> `{idx,question,think,tool_call,content}` —— **签名与返回结构两边相同**。故 port 时**只替换 `execute_predictions`
+> 与 `parse_response` 两个方法为本项目版本**(保留 browse_webpage、去掉 `self.client`/tools_server 依赖),
+> 其余 IG/belief/控制流原样保留。替换隔离在两个 drop-in 方法里,不动算法。
 
 **config 开关(来自 IGPO `train.sh`):**
 `+algorithm.info_gain_type=log_prob_diff`、`+algorithm.info_gain_norm_mode=separate`、`algorithm.gamma=1.0`。
@@ -184,7 +214,9 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
 3. **移植优势**:把 IGPO 的 `compute_grpo_outcome_advantage` + `_compute_turn_level_advantage` 并入
    `core_algos.py`,适配命名;在 `ray_trainer.py:compute_advantage` 增加 IGPO 分支,
    传 per-turn 奖励张量(非 sum)+ `gamma` + `info_gain_norm_mode`。
-4. **diff 生成逻辑**:cherry-pick IGPO `generation.py` 的 IG 钩子,使单 agent rollout 每轮算 IG 并写入奖励张量。
+4. **整文件 port 生成路径**:把 IGPO `generation.py` 搬为 `scrl/llm_agent/igpo_generation.py`(只改 import / 对齐
+   本仓库 verl 接口,不改数学与控制流);在 `ray_trainer` / 生成入口加"按 `adv_estimator=igpo` 选 manager"的选择器。
+   现有 `generation.py` 不动。**目标:单 agent rollout 跑的就是 IGPO 原代码,逐函数可核对。**
 5. **跑通单 agent IGPO(Phase 1)**:小规模 2-step smoke。验证 IG 非零、各 turn advantage 不同、无 NaN;
    抽一条样本手算 belief 轨迹核对。**此步通过 = IG 核心可信,再进多 agent。**
 6. **新增** `scrl/llm_agent/interleaved_generation.py`:交替式主循环(外层 Planner 循环 + 每轮 belief;
@@ -228,6 +260,11 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
 - Phase 2a:Executor 内层 turn-level IG 训练 → 联合优化。
 - 跨区间因果信用回流、Shapley 细粒度子任务分摊、熵去噪。
 - 无 ground-truth 的语义信息增益(Self-Induced Outcome Potential / Cycle-Consistent Search 思路)。
+- **超长程深度研究 + 真实浏览(对标 DR-Venus)**:IGPO 团队已把同一信息增益信用分配扩到 **200+ turn 的 deep research**
+  并训出 4B 的 **DR-Venus**(arXiv:2604.19859,代码在 inclusionAI/DR-Venus/RL),在 **BrowseComp / BrowseComp-ZH**
+  等高难 benchmark 上验证有效。我们当前基础 IGPO 仓库是 **snippet-only 多跳 QA** 版;后续可沿 DR-Venus 方向把
+  Hi-IGPO 的分层 IG 用到**带 `browse_webpage` 的长程开放网页研究**(我们已保留 browse 工具,IG 与工具无关 → 天然可延伸),
+  并在 BrowseComp 类 benchmark 上评测。属"换更难任务 / 更长 horizon"的纵深,与本设计的"分层信用"创新正交、可叠加。
 
 ## 附:远程同步
 
