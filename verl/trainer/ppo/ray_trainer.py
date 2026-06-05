@@ -65,6 +65,7 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS = 'reinforce_plus_plus'
     REMAX = 'remax'
     RLOO = 'rloo'
+    IGPO = 'igpo'  # Hi-IGPO turn-level info-gain advantage (single-agent / frozen-executor planner)
 
 
 @dataclass
@@ -200,6 +201,30 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
                                                                         index=index)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.IGPO:
+        # Hi-IGPO turn-level info-gain advantage. token_level_rewards carries per-turn IG at each
+        # turn-end token and F1 at the last valid token; turn_boundary_mask marks all turn-ends.
+        # Both are produced during generation (igpo_generation + info_gain scatter). With
+        # ig_group_mode='global' this is identical to IGPO's turn-level GRPO advantage.
+        token_level_rewards = data.batch['token_level_rewards']
+        # Group by the same prompt-group id GRPO uses in this repo.
+        index = data.non_tensor_batch['agent_grpo_idx']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        turn_boundary_mask = data.batch['turn_boundary_mask'] if 'turn_boundary_mask' in data.batch else None
+        advantages, returns = core_algos.compute_igpo_turn_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            turn_boundary_mask=turn_boundary_mask,
+            gamma=gamma,
+            info_gain_norm_mode=data.meta_info.get('info_gain_norm_mode', 'separate'),
+            ig_group_mode=data.meta_info.get('ig_group_mode', 'global'),
+        )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
