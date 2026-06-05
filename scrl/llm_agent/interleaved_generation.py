@@ -6,11 +6,19 @@ FROZEN Executor (Phase-1 model, no grad) to produce findings, which feed the nex
 Planner turn. After each Planner turn a belief Bel_t is computed; IG_t = Bel_t - Bel_{t-1}.
 
 `run_loop_pure` is the tensor-free control flow — unit-testable and the skeleton for the
-real `run_loop` (which wraps the same flow with DataProto / rollout / belief tensors).
+real `run_loop`. `run_loop` reuses MultiAgentGenerationManager's dual-LoRA rollout helpers
+(_build_planner_batch / _generate_with_gpu_padding(lora=) / run_llm_loop(lora=) /
+_tokenize_messages_to_batch / _decode_outputs) and is iterated on the server (GPU-only).
 """
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 class InterleavedGenerationManager:
+    """Pure-python control flow (no torch) — see run_loop_pure. The tensor rollout lives in
+    InterleavedRolloutManager (subclasses MultiAgentGenerationManager) below to avoid importing
+    heavy deps when only the control flow is needed (unit tests)."""
+
     def __init__(self, planner, executor, max_planner_turns=5, **kw):
         self.planner = planner
         self.executor = executor
@@ -19,13 +27,8 @@ class InterleavedGenerationManager:
     def run_loop_pure(self, question):
         """Pure-python control flow (no tensors). Returns the interleaved trace.
 
-        planner.step(ctx) -> (output_str, is_answer)
-        executor.run(subtask, ctx) -> findings_str
-
-        Returns dict:
-            answer:   final answer string (None if the Planner never answered within the cap)
-            subtasks: list of subtask strings the Planner proposed
-            findings: list of Executor findings (one per subtask, same order)
+        planner.step(ctx) -> (output_str, is_answer);  executor.run(subtask, ctx) -> findings_str
+        Returns dict(answer, subtasks, findings).
         """
         subtasks, findings = [], []
         answer = None
@@ -39,20 +42,117 @@ class InterleavedGenerationManager:
             findings.append(self.executor.run(out, ctx))
         return {"answer": answer, "subtasks": subtasks, "findings": findings}
 
-    def run_loop(self, batch):
-        """Real rollout (Task 5 Step 5 — server/GPU).
 
-        Wraps run_loop_pure's control flow with tensors:
-          - outer Planner turns generated via the actor (LoRA), one subtask or <answer> each;
-          - each subtask executed by the FROZEN Executor (reuse LLMGenerationManager.run_llm_loop,
-            requires_grad=False) to produce findings appended to the rolling context;
-          - after each Planner turn, compute Bel_t via compute_all_turns_vectorized;
-          - record each Planner turn's end-token position (turn_end_positions) + the Bel_t sequence.
-        Output: DataProto with the Planner sequence + turn_end_positions + beliefs, consumed by
-        Task 6 (scatter_planner_token_rewards) -> token_level_rewards / turn_boundary_mask, then
-        the same adv_estimator='igpo' advantage path. Does NOT emit turn_records.
-        """
-        raise NotImplementedError(
-            "run_loop (real rollout) is Task 5 Step 5 — implemented/validated on the server; "
-            "the tensor-free control flow lives in run_loop_pure."
-        )
+@dataclass
+class InterleavedTrace:
+    """Per-sample interleaved rollout record (assembled into tensors by run_loop)."""
+    question: str
+    planner_texts: List[str] = field(default_factory=list)   # planner generation per turn (trained)
+    subtasks: List[str] = field(default_factory=list)
+    findings: List[str] = field(default_factory=list)        # executor output per subtask (a:answer + b:evidence)
+    answer: Optional[str] = None
+    # token-level (filled during assembly): each planner turn's end-token position in the planner seq
+    turn_end_positions: List[int] = field(default_factory=list)
+    beliefs: List[float] = field(default_factory=list)       # Bel_0..Bel_T
+
+
+def _parse_planner_turn(text: str):
+    """(is_answer, payload). <answer>..</answer> -> answer; else the text is a subtask."""
+    if "<answer>" in text and "</answer>" in text:
+        return True, text.split("<answer>")[1].split("</answer>")[0].strip()
+    # else: treat reasoning+content as the subtask instruction (align with planner prompt on server)
+    return False, text.strip()
+
+
+def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_save_dir,
+                                      max_planner_turns=5, gt_computer=None):
+    """Factory: returns an InterleavedRolloutManager (defined lazily to avoid importing
+    MultiAgentGenerationManager / torch when only run_loop_pure is needed)."""
+    from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
+    from research_agent.prompts.planner import get_planner_prompt
+    from research_agent.prompts.executor import get_executor_prompt
+
+    class InterleavedRolloutManager(MultiAgentGenerationManager):
+        """Real interleaved rollout (WIP — iterated on server). Reuses the dual-LoRA helpers
+        of MultiAgentGenerationManager; replaces its one-shot DAG `run_multi_agent_loop`."""
+
+        def __init__(self):
+            super().__init__(tokenizer=tokenizer, actor_rollout_wg=actor_rollout_wg,
+                             config=config, lora_save_dir=lora_save_dir)
+            self.max_planner_turns = max_planner_turns
+            self.gt_computer = gt_computer
+
+        def run_loop(self, gen_batch, global_steps, ground_truths):
+            """Interleaved Planner(LoRA)<->frozen Executor rollout.
+
+            Returns (planner_output: DataProto, turn_end_positions: List[List[int]],
+                     beliefs: List[List[float]], answers: List[str]).
+            Consumed by Task 7: per-sample scatter_planner_token_rewards -> (bs,L)
+            token_level_rewards/turn_boundary_mask -> compute_igpo_turn_advantage.
+            """
+            import numpy as np  # noqa
+
+            questions = self._extract_questions(gen_batch)
+            n = len(questions)
+            traces = [InterleavedTrace(question=q) for q in questions]
+            # running planner chat per sample (question prompt + assistant/user turns)
+            planner_msgs: List[List[Dict]] = [list(get_planner_prompt(q)) for q in questions]
+            active = list(range(n))
+
+            for t in range(self.max_planner_turns):
+                if not active:
+                    break
+                # --- Planner: one generation for each active sample ---
+                batch = self._tokenize_messages_to_batch([planner_msgs[i] for i in active], gen_batch)
+                plan_out = self._generate_with_gpu_padding(batch, lora_adapter_name="planner")
+                texts = self._decode_outputs(plan_out)
+
+                next_active, subtask_rows = [], []
+                for k, i in enumerate(active):
+                    is_answer, payload = _parse_planner_turn(texts[k])
+                    traces[i].planner_texts.append(texts[k])
+                    planner_msgs[i].append({"role": "assistant", "content": texts[k]})
+                    if is_answer:
+                        traces[i].answer = payload
+                    else:
+                        traces[i].subtasks.append(payload)
+                        subtask_rows.append(i)
+                        next_active.append(i)
+
+                # --- Executor (FROZEN): run each subtask, inject findings back ---
+                if subtask_rows:
+                    exec_msgs = [get_executor_prompt(traces[i].subtasks[-1]) for i in subtask_rows]
+                    exec_batch = self._tokenize_messages_to_batch(
+                        exec_msgs, gen_batch, tools=getattr(self, "tools", None))
+                    _, exec_out = self.run_llm_loop(
+                        exec_batch, global_steps, lora_adapter_name="executor")
+                    findings = self._decode_outputs(exec_out)   # a:answer + b:evidence (per design §3)
+                    for j, i in enumerate(subtask_rows):
+                        traces[i].findings.append(findings[j])
+                        planner_msgs[i].append({"role": "user", "content": findings[j]})
+                active = next_active
+
+            # ---- Belief + tensor assembly (WIP: iterate on server) ----
+            # Per design §4/§5: build each sample's Planner sequence (planner_texts interleaved with
+            # findings observations; response_mask=1 only on planner_texts), record each planner turn's
+            # end-token position into trace.turn_end_positions, and compute Bel_0..Bel_T via
+            # self.gt_computer.compute_all_turns_vectorized(... ground_truth ...). IG_t = Bel diffs.
+            # Then Task 7 calls scatter_planner_token_rewards(beliefs, f1, turn_end_positions, L).
+            planner_output, turn_end_positions, beliefs, answers = self._assemble_planner_tensors(
+                traces, ground_truths, gen_batch)
+            return planner_output, turn_end_positions, beliefs, answers
+
+        def _assemble_planner_tensors(self, traces, ground_truths, gen_batch):
+            """Assemble the Planner sequence DataProto + turn_end_positions + beliefs.
+
+            WIP — the tensor bookkeeping (concat planner turns + findings observations into one
+            (bs, L) sequence with response_mask, recording turn-end token positions, and the
+            vectorized belief forward) is finalized against the live runtime on the server.
+            """
+            raise NotImplementedError(
+                "_assemble_planner_tensors: planner-sequence assembly + vectorized belief is the "
+                "server-iteration step (needs live DataProto/tokenizer/model). Control flow above "
+                "(planner<->frozen-executor interleave, findings injection) is complete."
+            )
+
+    return InterleavedRolloutManager()
