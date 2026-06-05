@@ -101,3 +101,36 @@ def test_turn_group_singleton_falls_back_to_global():
         norm_by_std=False, gamma=1.0, min_group_size=2)
     # 行0 t2 token span [4:6] 的优势 = 0.52
     assert torch.allclose(adv[0, 4:6], torch.tensor([0.52, 0.52]), atol=1e-6)
+
+
+def test_turn_group_separate_norm_by_std():
+    # 钉住 turn_group + norm_by_std=True 的生产默认路径。
+    # 使用与 test_turn_group_separate_matches_handcalc 相同的 6-turn 输入。
+    # 期望值(统一后公式手算,总体方差 + 1e-8):
+    #   IG t0 组 [0.3,0.1]: mean=0.2, var=0.01, std=sqrt(0.01+1e-8)≈0.1  → A=+1.0, B=-1.0
+    #   IG t1 组 [0.1,0.5]: mean=0.3, var=0.04, std=sqrt(0.04+1e-8)≈0.2  → A=-1.0, B=+1.0
+    #   F1  组  [1.0,0.0]: mean=0.5, var=0.25, std=sqrt(0.25+1e-8)≈0.5  → A=+1.0, B=-1.0
+    #   gamma=1 累加: A=[1.0+0.0+1.0, 0.0+1.0, 1.0] = [2.0, 1.0, 1.0]
+    #     → 从后往前:turn2=1.0, turn1=0.0+1.0=1.0 ? 不对,重新理清:
+    #     A 三个 turn 的归一化: IG_t0=+1.0, IG_t1=-1.0, F1=+1.0
+    #     backward: turn2_adv=1.0, turn1_adv=-1.0+1.0*1.0=0.0, turn0_adv=1.0+1.0*0.0=1.0
+    #     散到 span: [1.0,1.0, 0.0,0.0, 1.0,1.0]
+    #   B: IG_t0=-1.0, IG_t1=+1.0, F1=-1.0
+    #     turn2=-1.0, turn1=1.0+(-1.0)=0.0, turn0=-1.0+0.0=-1.0
+    #     散到 span: [-1.0,-1.0, 0.0,0.0, -1.0,-1.0]
+    rec = dict(
+        turn_reward=torch.tensor([0.3, 0.1, 1.0, 0.1, 0.5, 0.0]),
+        prompt_id  =torch.tensor([0, 0, 0, 0, 0, 0]),
+        traj_id    =torch.tensor([0, 0, 0, 1, 1, 1]),
+        turn_pos   =torch.tensor([0, 1, 2, 0, 1, 2]),
+        is_outcome =torch.tensor([False, False, True, False, False, True]),
+        sample_row =torch.tensor([0, 0, 0, 1, 1, 1]),
+        span_start =torch.tensor([0, 2, 4, 0, 2, 4]),
+        span_end   =torch.tensor([2, 4, 6, 2, 4, 6]),
+    )
+    adv, _ = compute_igpo_turn_advantage(
+        rec, bs=2, response_len=6,
+        ig_group_mode="turn_group", info_gain_norm_mode="separate",
+        norm_by_std=True, gamma=1.0)
+    assert torch.allclose(adv[0], torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0, 1.0]), atol=1e-4)
+    assert torch.allclose(adv[1], torch.tensor([-1.0, -1.0, 0.0, 0.0, -1.0, -1.0]), atol=1e-4)

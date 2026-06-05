@@ -273,16 +273,19 @@ def _grouped_mean_std(
     values: torch.Tensor,
     group_id: torch.Tensor,
     norm_by_std: bool,
-    eps: float = 1e-6,
 ):
     """
     Compute per-group mean and std for a flat list of values.
+
+    Uses the same std formula as compute_group_stats (population variance + 1e-8):
+        std = sqrt(mean((v - v.mean())**2) + 1e-8)
+    When group size <= 1, std = 1.0 (no normalization for singletons).
+    When norm_by_std=False, std is always 1.0.
 
     Args:
         values:    (M,) float tensor
         group_id:  (M,) long tensor — consecutive group indices
         norm_by_std: if False, std is always 1.0 (no std division)
-        eps:       stability constant (unused here, caller adds it on division)
 
     Returns:
         mean: (M,) float — group mean broadcast back to each element
@@ -291,14 +294,16 @@ def _grouped_mean_std(
     """
     mean = torch.zeros_like(values)
     std  = torch.ones_like(values)
-    size = torch.ones_like(values)
+    size = torch.zeros_like(values)  # zeros: unset elements won't be mistaken as size=1
     for g in torch.unique(group_id):
         m = group_id == g
         v = values[m]
         mean[m] = v.mean()
         size[m] = float(v.numel())
         if norm_by_std and v.numel() > 1:
-            std[m] = v.std(unbiased=False)
+            # Use same formula as compute_group_stats: population variance + 1e-8
+            var = ((v - v.mean()) ** 2).mean()
+            std[m] = torch.sqrt(var + 1e-8)
     return mean, std, size
 
 
@@ -497,12 +502,14 @@ def compute_igpo_turn_advantage(
                 _, tg_ids = torch.unique(tg_keys, dim=0, return_inverse=True)  # (M,)
 
                 # Compute turn-group mean/std
-                tg_mean, tg_std, tg_size = _grouped_mean_std(ig_rewards, tg_ids, norm_by_std, eps=epsilon)
+                tg_mean, tg_std, tg_size = _grouped_mean_std(ig_rewards, tg_ids, norm_by_std)
 
                 # Compute prompt-level (global) mean/std for fallback
-                g_mean, g_std, _ = _grouped_mean_std(ig_rewards, ig_prompt_ids, norm_by_std, eps=epsilon)
+                g_mean, g_std, _ = _grouped_mean_std(ig_rewards, ig_prompt_ids, norm_by_std)
 
-                # Apply fallback: where turn-group size < min_group_size, use prompt-level stats
+                # Apply fallback: where turn-group size < min_group_size, use prompt-level stats.
+                # The fallback uses prompt-level statistics (including the sample itself) —
+                # this is standard GRPO normalization semantics (not leave-one-out), which is the intended design.
                 fallback = tg_size < min_group_size
                 final_mean = torch.where(fallback, g_mean, tg_mean)
                 final_std  = torch.where(fallback, g_std, tg_std)
