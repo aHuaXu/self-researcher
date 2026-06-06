@@ -33,6 +33,38 @@ DEFAULT_MIN_TASKS = 3
 DEFAULT_MAX_TASKS = 5
 
 
+# ---------------------------------------------------------------------------
+# Interleaved (Hi-IGPO Phase 2b) planner: ONE subtask per turn, or <answer>.
+# Unlike the DAG planner above (one-shot multi-step <plan>), the interleaved
+# planner is called repeatedly; each turn it either delegates the single next
+# sub-question to the (frozen) executor or finalizes the answer. See design §3.
+# ---------------------------------------------------------------------------
+INTERLEAVED_PLANNER_SYSTEM_PROMPT = """You are a research planner answering a complex question step by step. You do NOT search yourself — a separate research executor does that. You decide what to research next, one step at a time.
+
+Each turn, output EXACTLY ONE of the following:
+- If you still need more information, propose the SINGLE most useful next sub-question. The executor will research it and return findings:
+<subtask>one concrete, self-contained, searchable sub-question</subtask>
+- If the findings so far are enough to answer the original question, give the final answer:
+<answer>final answer</answer>
+
+Rules:
+- Exactly ONE <subtask> per turn — never a numbered list or multi-step plan.
+- Base each new sub-question on the findings returned so far.
+- Switch to <answer> as soon as you can answer. Put ONLY the final answer (words, a number, or a short phrase) inside <answer></answer>, with no explanation. For a yes/no question, answer only yes or no."""
+
+INTERLEAVED_PLANNER_USER_PROMPT = """Question: {question}
+
+Propose the first sub-question to research (in <subtask></subtask>), or answer directly (in <answer></answer>) if you already can."""
+
+
+def get_interleaved_planner_prompt(question: str) -> list[dict]:
+    """Build interleaved planner prompt messages (one subtask per turn, or <answer>)."""
+    return [
+        {"role": "system", "content": INTERLEAVED_PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": INTERLEAVED_PLANNER_USER_PROMPT.format(question=question)},
+    ]
+
+
 def get_planner_prompt(
     question: str,
     min_tasks: int = DEFAULT_MIN_TASKS,

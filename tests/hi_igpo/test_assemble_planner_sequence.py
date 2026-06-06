@@ -14,7 +14,19 @@ are runtime/GPU and iterated on the server).
 """
 import pytest
 
-from scrl.llm_agent.interleaved_generation import assemble_planner_sequence
+from scrl.llm_agent.interleaved_generation import assemble_planner_sequence, _parse_planner_turn
+
+
+def test_parse_planner_turn_subtask_vs_answer():
+    # <answer> -> finalize
+    is_ans, payload = _parse_planner_turn("reasoning...\n<answer>Erling Haaland</answer>")
+    assert is_ans is True and payload == "Erling Haaland"
+    # <subtask> -> delegate one sub-question (content extracted, reasoning dropped)
+    is_ans, payload = _parse_planner_turn("Let me check.\n<subtask>Who scored most in 2021-22?</subtask>")
+    assert is_ans is False and payload == "Who scored most in 2021-22?"
+    # malformed (no tag) -> treat whole text as subtask, keep loop alive
+    is_ans, payload = _parse_planner_turn("just some text")
+    assert is_ans is False and payload == "just some text"
 
 
 def test_interleaves_planner_turns_with_findings_and_masks_observations():

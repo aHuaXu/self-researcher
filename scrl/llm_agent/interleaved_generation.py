@@ -97,10 +97,16 @@ def assemble_planner_sequence(planner_turn_ids, findings_ids):
 
 
 def _parse_planner_turn(text: str):
-    """(is_answer, payload). <answer>..</answer> -> answer; else the text is a subtask."""
+    """(is_answer, payload). <answer>..</answer> -> answer; <subtask>..</subtask> -> subtask.
+
+    Matches the interleaved planner prompt (get_interleaved_planner_prompt): each turn the planner
+    emits exactly one <subtask> to delegate, or <answer> to finalize. Falls back to treating the
+    whole text as a subtask if neither tag is present (malformed turn — keep the loop going).
+    """
     if "<answer>" in text and "</answer>" in text:
         return True, text.split("<answer>")[1].split("</answer>")[0].strip()
-    # else: treat reasoning+content as the subtask instruction (align with planner prompt on server)
+    if "<subtask>" in text and "</subtask>" in text:
+        return False, text.split("<subtask>")[1].split("</subtask>")[0].strip()
     return False, text.strip()
 
 
@@ -109,7 +115,7 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
     """Factory: returns an InterleavedRolloutManager (defined lazily to avoid importing
     MultiAgentGenerationManager / torch when only run_loop_pure is needed)."""
     from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
-    from research_agent.prompts.planner import get_planner_prompt
+    from research_agent.prompts.planner import get_interleaved_planner_prompt as get_planner_prompt
     from research_agent.prompts.executor import get_executor_prompt
 
     class InterleavedRolloutManager(MultiAgentGenerationManager):
@@ -315,7 +321,32 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
 
             planner_output, turn_end_positions, answers = self._assemble_planner_tensors(
                 traces, gen_batch)
+            self._dump_planner_rollout(traces, info_gain_rewards, turn_end_positions, global_steps)
             return planner_output, turn_end_positions, info_gain_rewards, answers
+
+        def _dump_planner_rollout(self, traces, info_gain_rewards, turn_end_positions, global_steps):
+            """Dump per-sample Planner trace (subtasks / findings / answer / per-turn IG) for
+            inspection — the Planner analogue of the executor's rollout_step_N.json."""
+            import os, json
+            if not (self.config.project_name and self.config.experiment_name):
+                return
+            out_dir = f"./outputs/{self.config.project_name}/{self.config.experiment_name}/rollout"
+            os.makedirs(out_dir, exist_ok=True)
+            rows = []
+            for i, tr in enumerate(traces):
+                rows.append({
+                    "idx": i,
+                    "question": tr.question,
+                    "subtasks": tr.subtasks,
+                    "findings": tr.findings,
+                    "answer": tr.answer,
+                    "num_planner_turns": len(tr.planner_texts),
+                    "info_gain_rewards": [float(x) for x in (info_gain_rewards[i] if i < len(info_gain_rewards) else [])],
+                    "turn_end_positions": turn_end_positions[i] if i < len(turn_end_positions) else [],
+                })
+            with open(f"{out_dir}/planner_rollout_step_{global_steps}.json", "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=2, ensure_ascii=False)
+            print(f"[Interleaved] planner_rollout_step_{global_steps}.json written ({len(rows)} samples)", flush=True)
 
         def _assemble_planner_tensors(self, traces, gen_batch):
             """Build the Planner training DataProto from traces (model-independent assembly).

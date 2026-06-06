@@ -11,6 +11,10 @@ set -euo pipefail
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+# Bound executor per-turn tool-observation length so multi-turn context stays < max_model_len.
+export TOOL_CONTENT_MAX_CHARS=${TOOL_CONTENT_MAX_CHARS:-1500}
+# Cap the compact finding injected into the Planner context (interleaved_generation._compact_findings).
+export PLANNER_FINDINGS_MAX_CHARS=${PLANNER_FINDINGS_MAX_CHARS:-1200}
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3,4,6,7}   # pick 4 IDLE gpus (check nvidia-smi!)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -55,11 +59,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.dtype=float16 \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.enable_chunked_prefill=false \
-    actor_rollout_ref.rollout.max_model_len=4200 \
+    actor_rollout_ref.rollout.max_model_len=6144 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
@@ -82,16 +86,16 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.test_freq=-1 \
     trainer.resume_mode=disable \
     multi_agent.enable=true \
-    multi_agent.max_planner_turns=5 \
+    multi_agent.max_planner_turns=4 \
     multi_agent.freeze_executor=true \
     multi_agent.base_model=${BASE}/models/Qwen3-4B-Instruct \
     multi_agent.lora_save_dir=${BASE}/tmp_lora_adapters \
     multi_agent.lora.rank=64 \
     multi_agent.lora.alpha=128 \
     multi_agent.lora.dropout=0.05 \
-    multi_agent.agents.executor.max_turns=5 \
+    multi_agent.agents.executor.max_turns=3 \
     agent_grpo.n=2 \
-    max_turns=5 \
+    max_turns=3 \
     search_engine=online_search \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=2 2>&1 | tee ${BASE}/${project_name}_${experiment_name}.log
+    trainer.total_training_steps=1 2>&1 | tee ${BASE}/${project_name}_${experiment_name}.log
