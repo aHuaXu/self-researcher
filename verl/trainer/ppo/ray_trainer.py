@@ -215,7 +215,12 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         responses = data.batch['responses']
         response_length = responses.size(-1)
         attention_mask = data.batch['attention_mask']
-        response_mask = attention_mask[:, -response_length:]
+        # Interleaved Planner (Phase 2b) supplies a loss_mask = 1 only on Planner tokens (findings
+        # observations excluded); single-agent has none -> fall back to full response attention.
+        if 'loss_mask' in data.batch:
+            response_mask = data.batch['loss_mask'][:, -response_length:]
+        else:
+            response_mask = attention_mask[:, -response_length:]
         turn_boundary_mask = data.batch['turn_boundary_mask'] if 'turn_boundary_mask' in data.batch else None
         advantages, returns = core_algos.compute_igpo_turn_advantage(
             token_level_rewards=token_level_rewards,
@@ -1052,29 +1057,30 @@ class RayPPOTrainer(object):
 
         # --- Multi-agent initialization (conditional) ---
         if getattr(self.config, 'multi_agent', None) and self.config.multi_agent.enable:
-            from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
-            from verl.workers.reward_manager.multi_agent import MultiAgentRewardManager
+            # Phase 2b: INTERLEAVED Planner(LoRA, trained) <-> frozen Executor (one-shot DAG removed).
+            # Planner is trained with turn-level info-gain (igpo) advantage; Executor LoRA is frozen
+            # (design §11: this is the freeze-Executor / lambda=1 corner of the joint-training frame).
+            from scrl.llm_agent.interleaved_generation import build_interleaved_rollout_manager
 
             lora_save_dir = self.config.multi_agent.get('lora_save_dir', './tmp_lora_adapters')
+            max_planner_turns = self.config.multi_agent.get('max_planner_turns', 5)
 
-            # Use n=1 for multi-agent: GRPO expansion is done externally
-            # via gen_batch.repeat() before entering run_multi_agent_loop.
+            # n=1: GRPO expansion is done externally via gen_batch.repeat() before run_loop.
             from copy import copy
             multi_agent_gen_config = copy(gen_config)
             multi_agent_gen_config.n = 1
 
-            multi_agent_gen = MultiAgentGenerationManager(
+            interleaved_gen = build_interleaved_rollout_manager(
                 tokenizer=self.tokenizer,
                 actor_rollout_wg=self.actor_rollout_wg,
                 config=multi_agent_gen_config,
                 lora_save_dir=lora_save_dir,
-            )
-            multi_agent_reward = MultiAgentRewardManager(
-                tokenizer=self.tokenizer,
-                config=self.config.multi_agent,
+                max_planner_turns=max_planner_turns,
             )
             _multi_agent_enabled = True
-            print(f"[MultiAgent] Multi-agent training enabled, adapters saved to: {lora_save_dir}", flush=True)
+            _freeze_executor = self.config.multi_agent.get('freeze_executor', True)
+            print(f"[Interleaved] Phase 2b enabled (freeze_executor={_freeze_executor}), "
+                  f"adapters: {lora_save_dir}", flush=True)
         else:
             _multi_agent_enabled = False
 
@@ -1100,9 +1106,14 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     if _multi_agent_enabled:
                         # =============================================================
-                        # Multi-agent training branch (Planner -> Executor DAG)
+                        # Interleaved Planner(LoRA) <-> frozen Executor — turn-level IGPO (Phase 2b)
+                        # ⚠ SERVER-ITERATED: runtime (Ray actor / GPU) touch-points are finalized
+                        # against the live engine; see design §11. Reuses the single-agent IGPO
+                        # downstream (scatter -> compute_igpo_turn_advantage), Planner LoRA only.
                         # =============================================================
-                        from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+                        from verl.trainer.ppo.core_algos import compute_igpo_turn_advantage
+                        from verl.trainer.ppo.igpo_utils import scatter_info_gain_rewards
+                        from verl.utils.reward_score.info_gain import compute_f1
 
                         # --- GRPO expansion: repeat each question n times ---
                         grpo_n = getattr(self.config.agent_grpo, 'n', 1)
@@ -1111,147 +1122,71 @@ class RayPPOTrainer(object):
                             gen_batch = gen_batch.repeat(repeat_times=grpo_n, interleave=True)
                         agent_grpo_idx = list(np.arange(orig_batch_size).repeat(grpo_n))
 
-                        # --- Multi-agent Rollout ---
-                        with _timer('gen', timing_raw):
-                            rollout_result = multi_agent_gen.run_multi_agent_loop(
-                                gen_batch, self.global_steps,
-                                agent_grpo_idx=agent_grpo_idx,
-                            )
-
-                        # --- Multi-agent Reward ---
-                        orig_reward_models = batch.non_tensor_batch['reward_model']
-                        if grpo_n > 1:
-                            golden_answers = np.repeat(orig_reward_models, grpo_n, axis=0)
-                            golden_answers = [
-                                item['ground_truth'] for item in golden_answers
-                            ]
+                        # ground truths + data sources aligned to the expanded gen_batch order
+                        orig_rms = batch.non_tensor_batch['reward_model']
+                        expanded_rms = np.repeat(orig_rms, grpo_n, axis=0) if grpo_n > 1 else orig_rms
+                        ground_truths = [{'ground_truth': rm['ground_truth']} for rm in expanded_rms]
+                        orig_ds = batch.non_tensor_batch.get('data_source', None)
+                        if orig_ds is not None:
+                            data_sources = list(np.repeat(orig_ds, grpo_n, axis=0)) if grpo_n > 1 else list(orig_ds)
                         else:
-                            golden_answers = [
-                                item['ground_truth'] for item in orig_reward_models
-                            ]
+                            data_sources = [None] * len(ground_truths)
 
-                        reward_data = DataProto()
-                        reward_data.non_tensor_batch = {
-                            'final_answers': rollout_result.final_answers,
-                            'golden_answers': golden_answers,
-                            'plan_texts': rollout_result.plan_texts,
-                            'exec_trajectories': [[] for _ in rollout_result.queries],
-                            'exec_actual_turns': [0] * len(rollout_result.queries),
-                        }
+                        # --- Interleaved rollout: Planner emits subtask/answer; frozen Executor runs subtasks.
+                        # Returns Planner training DataProto + per-turn IG (belief diffs via actor path). ---
+                        with _timer('gen', timing_raw):
+                            planner_output, turn_end_positions, info_gain_rewards, answers = \
+                                interleaved_gen.run_loop(gen_batch, self.global_steps, ground_truths)
 
+                        # --- Outcome F1 from the Planner's final answer (wrapped to match <answer> format) ---
+                        f1_scores = torch.tensor([
+                            compute_f1(f"<answer>{a}</answer>", gt['ground_truth'], ds, val_type='f1')
+                            for a, gt, ds in zip(answers, ground_truths, data_sources)
+                        ], dtype=torch.float32)
+
+                        # --- Scatter per-turn IG + final F1 to token rewards (response frame) ---
+                        L = planner_output.batch['responses'].shape[1]
+                        token_level_rewards, turn_boundary_mask = scatter_info_gain_rewards(
+                            info_gain_rewards, f1_scores, turn_end_positions, L)
+                        planner_output.batch['token_level_scores'] = token_level_rewards
+                        planner_output.batch['token_level_rewards'] = token_level_rewards
+                        planner_output.batch['turn_boundary_mask'] = turn_boundary_mask
+                        planner_output.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx, dtype=object)
+
+                        # --- Turn-level IGPO advantage (credited to Planner tokens only via loss_mask) ---
                         with _timer('adv', timing_raw):
-                            rewards = multi_agent_reward(reward_data)
-
-                        # --- Advantage computation + Update per agent ---
-                        todo_mapping = rollout_result.todo_mapping
-                        agent_outputs = {
-                            'planner': rollout_result.planner_outputs,
-                            'executor': rollout_result.executor_outputs,
-                        }
-                        agent_rewards_map = {
-                            'planner': rewards.planner,
-                            'executor': rewards.executor,
-                        }
-                        for agent_name in ['planner', 'executor']:
-                            agent_output = agent_outputs[agent_name]
-                            agent_rewards = agent_rewards_map[agent_name]
-
-                            if not hasattr(agent_output, 'batch') or 'responses' not in agent_output.batch:
-                                print(f"[MultiAgent] Skipping {agent_name}: no response data", flush=True)
-                                continue
-
-                            batch_size = agent_output.batch['responses'].shape[0]
-                            if batch_size == 0:
-                                print(f"[MultiAgent] Skipping {agent_name}: empty batch", flush=True)
-                                continue
-
-                            # Executor outputs one response per TODO, while rewards are per question.
-                            # Expand rewards using todo_mapping so len(agent_rewards) == batch_size.
-                            if agent_name == 'executor' and todo_mapping is not None:
-                                agent_rewards = [agent_rewards[todo_mapping[j]] for j in range(len(todo_mapping))]
-
-                            resp_len = agent_output.batch['responses'].shape[1]
-
-                            # Build token-level reward tensor (reward at last valid token)
-                            reward_tensor = torch.zeros(batch_size, resp_len)
-                            attention = agent_output.batch.get('attention_mask', None)
-                            for i in range(batch_size):
-                                if attention is not None:
-                                    valid_len = attention[i, -resp_len:].sum().item()
-                                else:
-                                    valid_len = resp_len
-                                valid_len = max(1, int(valid_len))
-                                reward_tensor[i, valid_len - 1] = agent_rewards[i]
-
-                            # EOS mask for advantage computation
-                            if attention is not None:
-                                eos_mask = attention[:, -resp_len:]
-                            else:
-                                eos_mask = torch.ones(batch_size, resp_len)
-
-                            # GRPO group index
-                            index = agent_output.non_tensor_batch.get('agent_grpo_idx', None)
-                            if index is None:
-                                index = torch.arange(batch_size)
-                            elif not isinstance(index, torch.Tensor):
-                                # DataProto requires non_tensor_batch dtype=object; convert to int64 first
-                                if isinstance(index, np.ndarray) and index.dtype == object:
-                                    index = torch.tensor(index.astype(np.int64), dtype=torch.long)
-                                else:
-                                    index = torch.tensor(index, dtype=torch.long)
-
-                            advantages, returns = compute_grpo_outcome_advantage(
-                                token_level_rewards=reward_tensor,
-                                eos_mask=eos_mask,
-                                index=index,
+                            advantages, returns = compute_igpo_turn_advantage(
+                                token_level_rewards=token_level_rewards,
+                                response_mask=planner_output.batch['loss_mask'],
+                                index=torch.tensor(agent_grpo_idx, dtype=torch.long),
+                                turn_boundary_mask=turn_boundary_mask,
+                                gamma=self.config.algorithm.gamma,
+                                info_gain_norm_mode=getattr(self.config.algorithm, 'info_gain_norm_mode', 'separate'),
+                                ig_group_mode=getattr(self.config.algorithm, 'ig_group_mode', 'global'),
                             )
+                            planner_output.batch['advantages'] = advantages
+                            planner_output.batch['returns'] = returns
 
-                            # Pack advantages into agent_output for update
-                            agent_output.batch['advantages'] = advantages
-                            agent_output.batch['returns'] = returns
-                            agent_output.batch['token_level_rewards'] = reward_tensor
-                            agent_output.batch['token_level_scores'] = reward_tensor
-
-                            # Executor TODO count may not divide world_size; pad for DP chunk.
-                            agent_output_padded, pad_size = pad_dataproto_to_divisor(
-                                agent_output, self.actor_rollout_wg.world_size
-                            )
-
-                            # Compute old_log_probs via forward pass with correct LoRA adapter
-                            agent_output_padded.meta_info['lora_name'] = agent_name
-                            with _timer(f'old_log_prob_{agent_name}', timing_raw):
-                                with torch.no_grad():
-                                    log_prob_output = self.actor_rollout_wg.compute_log_prob(agent_output_padded)
-                                agent_output_padded = agent_output_padded.union(log_prob_output)
-
-                            # Compute ref_log_probs if KL loss is enabled
-                            if self.config.actor_rollout_ref.actor.use_kl_loss and \
-                                    hasattr(self, 'ref_policy_wg') and self.ref_policy_wg is not None:
-                                with _timer(f'ref_log_prob_{agent_name}', timing_raw):
-                                    with torch.no_grad():
-                                        ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(agent_output_padded)
-                                agent_output_padded = agent_output_padded.union(ref_log_prob_output)
-
-                            # Set meta_info required for the actor update
-                            agent_output_padded.meta_info['global_token_num'] = (
-                                torch.sum(agent_output_padded.batch['attention_mask'], dim=-1).tolist()
-                            )
-                            agent_output_padded.meta_info['temperature'] = (
-                                self.config.actor_rollout_ref.rollout.temperature
-                            )
-
-                            # Update only this agent's LoRA
-                            with _timer(f'update_actor_{agent_name}', timing_raw):
-                                actor_output = self.actor_rollout_wg.update_actor(agent_output_padded)
-                            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                            # Prefix per-agent metrics
-                            for mk, mv in actor_output_metrics.items():
-                                metrics[f'{agent_name}/{mk}'] = mv
-
-                            # Log per-agent reward stats
-                            metrics[f'{agent_name}/reward/mean'] = np.mean(agent_rewards)
-                            metrics[f'{agent_name}/reward/max'] = np.max(agent_rewards)
-                            metrics[f'{agent_name}/reward/min'] = np.min(agent_rewards)
+                        # --- Update Planner LoRA only (Executor frozen = design §11 lambda=1 corner) ---
+                        planner_padded, _pad = pad_dataproto_to_divisor(
+                            planner_output, self.actor_rollout_wg.world_size)
+                        planner_padded.meta_info['lora_name'] = 'planner'
+                        with _timer('old_log_prob_planner', timing_raw):
+                            with torch.no_grad():
+                                lp = self.actor_rollout_wg.compute_log_prob(planner_padded)
+                            planner_padded = planner_padded.union(lp)
+                        planner_padded.meta_info['global_token_num'] = (
+                            torch.sum(planner_padded.batch['attention_mask'], dim=-1).tolist())
+                        planner_padded.meta_info['temperature'] = (
+                            self.config.actor_rollout_ref.rollout.temperature)
+                        with _timer('update_actor_planner', timing_raw):
+                            actor_output = self.actor_rollout_wg.update_actor(planner_padded)
+                        for mk, mv in reduce_metrics(actor_output.meta_info['metrics']).items():
+                            metrics[f'planner/{mk}'] = mv
+                        metrics['planner/f1/mean'] = float(f1_scores.mean())
+                        metrics['planner/f1/max'] = float(f1_scores.max())
+                        # Executor is FROZEN in Phase 2b; its rollout DataProto is available for Phase 2a
+                        # joint training (keep dual-rollout, design §11) but is not updated here.
 
                         # --- Validation (shared with single-agent path) ---
                         if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
