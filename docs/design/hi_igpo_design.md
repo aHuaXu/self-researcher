@@ -60,6 +60,14 @@ for t = 1 .. T_p (T_p ≤ max_planner_turns):
 - **`findings_t` 的内容(定:两者都要)**:Executor 把 `子任务_t` 当成小问题跑搜索循环,返回
   **(a) 它对该子任务的 `<answer>`(简洁结论)+ (b) 沿途检索到的关键证据**。中间过程信息更全,
   避免只取简短 `<answer>` 丢信息;`findings_t` 灌回 Planner 上下文(`response_mask=0`,不训),供下一轮决策与 belief。
+- **Executor 输入(定:隔离式 A)**:Executor 执行 `子任务_t` 时**只看 `子任务_t`(+ 原始 question 做锚定),不看历史 findings**。
+  理由:① 契合分解(Planner 持全局、把子任务写自包含;Executor 专注执行一个);② IG 信用更干净——`findings_t`
+  是"这个子任务带来的新信息",避免 Executor 重捞历史信息污染 IG_t 归因;③ 实现简单(Executor 无状态)。
+  需要前置结论时由 Planner 把它写进子任务描述(这是 Planner 要学的、IG 会奖励的能力)。
+- **架构(定:保留双 rollout,不复用单 agent 管线)**:Planner 与 Executor **各产独立 DataProto**(`planner_outputs` /
+  `executor_outputs`)。**不**把 Executor 降级成 `execute_predictions` 里的黑盒工具(那样会丢掉 Executor 的可训轨迹、
+  foreclose Phase 2a)。Phase 2b 只训 Planner、Executor 冻结,但**其 rollout 照样捕获保留**,Phase 2a 将来可直接在其上
+  加 IG/优势,不用改架构。Planner 的 IG 仍复用 `compute_all_turns_vectorized`(belief),但两条 rollout 分开管理。
 
 ## 4. 信念与信息增益(双层共享一条 belief 轨迹)
 
