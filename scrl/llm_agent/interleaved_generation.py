@@ -56,6 +56,46 @@ class InterleavedTrace:
     beliefs: List[float] = field(default_factory=list)       # Bel_0..Bel_T
 
 
+def assemble_planner_sequence(planner_turn_ids, findings_ids):
+    """Interleave Planner per-turn token ids with Executor findings into one response frame.
+
+    planner_turn_ids: List[List[int]] — token ids of each Planner generation turn, in order;
+        entries [0..T-1] are subtask turns, the LAST entry is the answer turn (T subtasks total).
+    findings_ids: List[List[int]] — Executor findings observation per subtask
+        (len == len(planner_turn_ids) - 1; the answer turn has no findings after it).
+
+    Layout (response frame), findings masked out of the loss:
+        [subtask_0][findings_0][subtask_1][findings_1]...[subtask_{T-1}][findings_{T-1}][answer]
+
+    Returns (response_ids, loss_mask, turn_end_positions):
+      - loss_mask: 1 on Planner tokens (trained), 0 on findings observations.
+      - turn_end_positions: last-token index of each Planner turn in the response frame,
+        ordered [subtask_0_end, ..., subtask_{T-1}_end, answer_end]; length == #subtasks + 1,
+        matching scatter_planner_token_rewards (T IG turn-ends + 1 F1/answer position).
+    """
+    if not planner_turn_ids:
+        raise ValueError("planner_turn_ids must contain at least the answer turn")
+    if len(findings_ids) != len(planner_turn_ids) - 1:
+        raise ValueError(
+            f"findings_ids ({len(findings_ids)}) must equal #subtask turns "
+            f"({len(planner_turn_ids) - 1}) = len(planner_turn_ids) - 1"
+        )
+
+    response_ids, loss_mask, turn_end_positions = [], [], []
+    for t, turn_ids in enumerate(planner_turn_ids):
+        if len(turn_ids) == 0:
+            raise ValueError(f"planner turn {t} is empty")
+        response_ids.extend(turn_ids)
+        loss_mask.extend([1] * len(turn_ids))
+        turn_end_positions.append(len(response_ids) - 1)   # last planner token of this turn
+        # findings observation follows every subtask turn (not the final answer turn)
+        if t < len(findings_ids):
+            obs = findings_ids[t]
+            response_ids.extend(obs)
+            loss_mask.extend([0] * len(obs))
+    return response_ids, loss_mask, turn_end_positions
+
+
 def _parse_planner_turn(text: str):
     """(is_answer, payload). <answer>..</answer> -> answer; else the text is a subtask."""
     if "<answer>" in text and "</answer>" in text:
