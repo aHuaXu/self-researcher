@@ -340,6 +340,20 @@ Phase 2a (目标)   : 解冻 Executor，双通道联合训。λ 先用固定值�
                     依托已保留的双 rollout 架构，rollout 流程不变。
 ```
 
+## 12. 验证状态(2026-06-22:Phase 2b 端到端通过)
+
+服务器 1-step smoke(4×V100)验证 **rollout 合理 + reward/advantage 完全符合预期**:
+- **真实多跳 rollout**:Planner 分解出单 subtask → 冻结 Executor 多轮检索出真实事实 → 注入回 Planner →
+  合成最终答案。例:`top scorer→Alan Shearer` → `£15M 买 Shearer 的俱乐部→Newcastle United` → 答 "Newcastle United"(=GT, f1=1.0);`Kiss of Araby 导演→Phil Rosen` → `Phil Rosen 死亡地→York Haven PA`。
+- **reward/advantage**:F1 散到答案末 token、IG 散到各 turn-end、`turn_group` 组内镜像归一化、
+  相同样本组→adv=0(GRPO 正解)、γ=1 后缀累加 —— 逐项核对正确。`f1/mean=0.281, max=1.0`。
+- **关键修复链**(均已提交):交替式 planner prompt(单 subtask/`<answer>`)→ 末轮 force-answer 预填 `<answer>`
+  → `_compact_findings` 取 `<answer>`/最后 assistant 块(不取原始 tool JSON 尾)→ `search_engine=rag` 单
+  web_search(IGPO 忠实)→ **`SEARXNG_ENGINE_PRIORITY=google,duckduckgo,brave`(弃垃圾源 bing)**。
+- **审计工具**:`planner_rollout_step_N.json`(逐轮 I/O)+ `advantage_audit_step_N.json`(散射位/值/优势)。
+- **训练动态注记**:`agent_grpo.n=2` 时两 rollout 易收敛同一正确答案 → 组内 adv=0 无梯度;真训练建议 n=4~8。
+- **剩余 future**:Phase 1 warm-start;Phase 2a Executor 解冻联合训练(§11);多步真训练 + benchmark 评测。
+
 ## 附:远程同步
 
 按 `CLAUDE.md`:先改本地 → rsync 到 `zjx@10.35.2.238:/home/zjx/self_llm/self-researcher`;
