@@ -286,6 +286,60 @@ IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一
   Hi-IGPO 的分层 IG 用到**带 `browse_webpage` 的长程开放网页研究**(我们已保留 browse 工具,IG 与工具无关 → 天然可延伸),
   并在 BrowseComp 类 benchmark 上评测。属"换更难任务 / 更长 horizon"的纵深,与本设计的"分层信用"创新正交、可叠加。
 
+## 11. 统一框架:冻结(2b)与联合训练(2a)是同一框架的两个取值
+
+把 Phase 2b 和 Phase 2a 看成**同一个联合训练框架**的两个取值,而不是两套独立设计。
+**rollout 生成流程完全不变**(交替生成 + 每 turn 算 `Bel_t` → `IG_t`);变的只有「IG 怎么分」和「谁更新参数」两个**正交旋钮**:
+
+- **旋钮 1 — IG 分配权重 λ**:planner 拿 `λ·IG_t`,executor 拿 `(1−λ)·IG_t`,各自 scatter 到
+  **自己那条 DataProto**(我们已保留的双 rollout)上,各算各的 group-relative turn advantage。
+- **旋钮 2 — executor 是否进 optimizer**(`freeze_executor`)。
+
+| 配置 | λ | executor 更新? | = |
+|---|---|---|---|
+| **Phase 2b(主线/现在)** | 1.0(IG 全给 planner) | ❌ 冻结 | 当前设计(§5.0) |
+| **Phase 2a(联合,future)** | (0,1) | ✅ | 一般情形 |
+| 退化校验 | 1.0 | — | + 单 agent ⇒ 原生 IGPO |
+
+**关键洞察:冻结是「executor 的 IG 份额无所谓」的角点**——它不进 optimizer,给它的 reward 算了也白算。
+所以代码上 2b 就是 `freeze_executor=True` 让 `scatter_planner_token_rewards` 吃下全部 IG;2a 只要把 λ 调出来、
+给 executor 那条 DataProto 也接上 advantage 即可,**无需重写数据流**。
+
+### 11.1 实证锚:冻结是下界档,不是终点
+**M-GRPO**(arXiv:2511.13288,vertical 多 agent deep research,benchmark = GAIA / XBench-DeepSearch / WebWalkerQA,
+与本项目同赛道)实测:**联合训练 > single-agent GRPO > multi-agent GRPO with frozen sub-agents**。
+即「冻结 Executor 的分布偏移固化」是被测出来的真实瓶颈,而非纯理论担忧。
+**边界条件**:**CODA 双脑**(arXiv:2508.20096)选择冻结 executor 反而好——但其 executor 是经海量 grounding 预训练、
+强泛化的成熟模型。冻结能成立的前提是**执行器本身足够通用**;我们 Phase-1 的 executor 只见过「一体化单 agent」的 plan 分布,
+恰好不满足 → 这正是 Phase 2a 要解的问题。
+
+### 11.2 λ 取什么:从固定标量到反事实
+「按权重分」里的权重本身就是 Phase 2a 的核心研究点,有一条升级谱(不破坏框架):
+```
+固定标量 λ   →   反事实估计 λ_t(CCPO 式,arXiv:2603.21563)   →   可学习 λ
+  省                我们已有 belief 机制,加一次反事实前向即可拆          贵
+```
+- 反事实拆分回答「这一跳 belief 上升,是 planner 问得准还是 executor 查得好」:
+  planner 贡献 `≈ Bel(task_t, findings_t) − Bel(弱化 task_t, findings_t)`;
+  executor 贡献 `≈ Bel(task_t, findings_t) − Bel(task_t, 弱化 findings_t)`。代价:每 turn 多一次 belief 前向。
+- **耦合点(务必同时上)**:`IG_t` 是 (task_t + executor findings) 的**联合产物**。冻结时全归 planner 无碍;
+  **一旦解冻,不拆 IG 就是 credit 串扰**(planner 因 executor 查得好而被奖励,反之亦然)。故「解冻 executor」与「IG 归因拆分」是一对。
+
+### 11.3 Phase 2a 才会撞上的工程坑(现在不做,留 TODO)
+- **executor advantage 的 group 归一化**:executor 每个 subtask 的调用次数不齐,需 M-GRPO 式
+  **trajectory-alignment**(padding/mask 成 fixed-size batch,不破坏 group baseline)。
+- 备选 credit-assignment 路线(与上面 λ 谱并行):**HiPER**(arXiv:2602.16165)的分层优势 HAE
+  (planner 优势 = subgoal 执行段聚合 return,executor = 段内细粒度;证明无偏 + 低方差)。
+
+### 11.4 渐进路线(不 foreclose)
+```
+Phase 2b (现状)   : freeze + λ=1，IG_t 全给 Planner。站得住的 baseline（M-GRPO 已证为下界档）。
+   │  低成本补丁    : ①离线缓存刷新 Executor；或 ②只惩罚"执行失效"的轻量正则（非无差别 KL，避免压制 planner 进化）。
+   ▼
+Phase 2a (目标)   : 解冻 Executor，双通道联合训。λ 先用固定值跑通，需要精度再升级到反事实拆分（11.2）。
+                    依托已保留的双 rollout 架构，rollout 流程不变。
+```
+
 ## 附:远程同步
 
 按 `CLAUDE.md`:先改本地 → rsync 到 `zjx@10.35.2.238:/home/zjx/self_llm/self-researcher`;
