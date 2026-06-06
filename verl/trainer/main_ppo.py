@@ -34,7 +34,10 @@ def run_ppo(config, compute_score=None):
     ray.get(main_task.remote(config, compute_score))
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+@ray.remote(num_cpus=1, max_retries=0)  # max_retries=0: a failed main_task must NOT auto-retry —
+# retrying reuses the same Ray cluster where the prior attempt's placement group still exists,
+# causing a 'global_poolverl_group already exists' cascade that masks the real error. Fail clean;
+# rely on trainer.resume_mode=auto + a manual relaunch to resume from the latest checkpoint.
 def main_task(config, compute_score=None):
     from verl.utils.fs import copy_to_local
     # print initial config
