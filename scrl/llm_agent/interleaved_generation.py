@@ -198,6 +198,25 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                 finding = finding[:cap] + "\n...[truncated]"
             return finding
 
+        def _tokenize_planner_prefill(self, messages_list, prefill):
+            """Like _tokenize_messages_to_batch but append `prefill` (e.g. "<answer>") after the
+            generation prompt — used to force the Planner to answer on the final turn."""
+            import torch
+            from verl import DataProto
+            strs = self.tokenizer.apply_chat_template(
+                messages_list, add_generation_prompt=True, tokenize=False)
+            strs = [s + prefill for s in strs]
+            tok = self.tokenizer(strs, return_tensors="pt", padding=True)
+            pad_mask = tok["input_ids"] != self.tokenizer.pad_token_id
+            order = pad_mask.to(torch.int64).argsort(dim=1, stable=True)   # left-pad
+            input_ids = tok["input_ids"].gather(1, order)
+            attn = tok["attention_mask"].gather(1, order)
+            return DataProto.from_dict({
+                "input_ids": input_ids,
+                "attention_mask": attn,
+                "position_ids": self.tensor_fn.create_position_ids(attn),
+            })
+
         def pseudo_generate_sequences(self, prompts, response):
             """Append GT-answer token ids to a rolling context -> belief pseudo DataProto.
             Copied from IGPOGenerationManager (not inherited via MultiAgentGenerationManager)."""
@@ -283,9 +302,21 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                 activate_lists_per_turn.append(list(range(n)))
 
                 # --- Planner: one generation per active sample ---
-                batch = self._tokenize_messages_to_batch([planner_msgs[i] for i in active], gen_batch)
+                # On the FINAL planner turn, FORCE an answer: prefill "<answer>" so the Planner
+                # finalizes (live F1) instead of proposing yet another subtask. The prefilled open
+                # tag is prepended back onto the decoded text so _parse_planner_turn sees a full
+                # <answer>…</answer>.
+                is_last_planner = (t == self.max_planner_turns - 1)
+                active_msgs = [planner_msgs[i] for i in active]
+                if is_last_planner:
+                    batch = self._tokenize_planner_prefill(active_msgs, "<answer>")
+                else:
+                    batch = self._tokenize_messages_to_batch(active_msgs, gen_batch)
                 plan_out = self._generate_with_gpu_padding(batch, lora_adapter_name="planner")
                 texts = self._decode_outputs(plan_out)
+                if is_last_planner:
+                    texts = ["<answer>" + tx for tx in texts]
+                    texts = [tx if "</answer>" in tx else tx + "</answer>" for tx in texts]
 
                 next_active, subtask_rows = [], []
                 for k, i in enumerate(active):

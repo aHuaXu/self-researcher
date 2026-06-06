@@ -35,6 +35,13 @@ class GenerationConfig:
     nnodes: int = 1
 
 
+# Force-answer prefill: appended after the generation prompt on the FINAL turn so the model is
+# constrained to emit an answer (it continues from "<answer>"). Guarantees every trajectory ends
+# with a parseable <answer>…</answer> (live F1 outcome + clean finding), instead of a dangling
+# tool_call / empty turn. Standard multi-turn search-RL practice.
+FORCE_ANSWER_PREFILL = "<answer>"
+
+
 TOOLS_FOR_WIKI = [
     {
         "type": "function",
@@ -454,6 +461,12 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 break
 
             rollings_active = self.tokenizer.apply_chat_template(activate_messages_list, add_generation_prompt=True, tools=self.tools, tokenize=False)
+            _is_last_turn = (step == self.config.max_turns - 1)
+            if _is_last_turn:
+                # FORCE ANSWER on the final turn: prefill "<answer>" so still-active samples emit a
+                # parseable answer instead of another tool_call (the prefill rides in the prompt, so
+                # the reconstructed string below contains the full <answer>…</answer>).
+                rollings_active = [r + FORCE_ANSWER_PREFILL for r in rollings_active]
             rollings_active = self.tokenizer(rollings_active, return_tensors="pt",padding=True)
 
             pad_mask = rollings_active['input_ids'] != self.tokenizer.pad_token_id
@@ -485,6 +498,19 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             gen_output = self._generate_with_gpu_padding(rollings_active, lora_adapter_name=lora_adapter_name)
             meta_info = gen_output.meta_info
             print(f"node {node_rank}, turn {step} gen_output {len(gen_output.batch['responses'])} datas")
+
+            if _is_last_turn:
+                # Prompt was prefilled with "<answer>": the generation IS the forced answer. Take it
+                # for ALL still-active samples (prompt already holds the open tag) and finish —
+                # skip parse_response/tool execution this turn.
+                for i in range(len(activate_list)):
+                    message_string_list[activate_list[i]] = (
+                        self.tokenizer.decode(rollings_active.batch['input_ids'][i], skip_special_tokens=False).replace("<|endoftext|>", "")
+                        + self.tokenizer.decode(gen_output.batch['responses'][i], skip_special_tokens=False).replace("<|endoftext|>", "")
+                    )
+                print(f"第{step}轮(最后一轮): 强制 {len(activate_list)} 条样本输出 <answer>", flush=True)
+                activate_list = []
+                break
 
             results = self.parse_response(gen_output.batch['responses'])
             assert len(results) == len(activate_list) # 每一轮更新后，结果数量和当前活跃的query数量一致

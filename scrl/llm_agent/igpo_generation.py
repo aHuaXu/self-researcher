@@ -47,6 +47,9 @@ import torch.nn.functional as F
 # and the swapped execute_predictions / parse_response methods.
 
 
+FORCE_ANSWER_PREFILL = "<answer>"   # prefill on the final turn to force a parseable answer
+
+
 TOOLS_FOR_WIKI = [
     {
         "type": "function",
@@ -644,8 +647,13 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                         raise  # Cannot recover, raise exception
     
             think = True
-            
-            if think:
+            _is_last_turn = (step == self.config.max_turns - 1)
+
+            if _is_last_turn:
+                # FORCE ANSWER on the final turn: prefill "<answer>" (skip <think>) so the sample
+                # emits a parseable answer instead of another tool_call -> live F1 outcome.
+                rollings_active = [rolling + FORCE_ANSWER_PREFILL for rolling in rollings_active]
+            elif think:
                 rollings_active = [rolling + "<think>" for rolling in rollings_active]
             else:
                 rollings_active = [rolling for rolling in rollings_active]
@@ -835,6 +843,18 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             
             meta_info = gen_output.meta_info
             print(f"node {node_rank}, turn {step} gen_output {len(gen_output.batch['responses'])} datas")
+
+            if _is_last_turn:
+                # Prompt was prefilled with "<answer>": take the generation as the forced answer for
+                # ALL still-active samples (prompt already holds the open tag) and finish the loop.
+                for i in range(len(activate_list)):
+                    message_string_list[activate_list[i]] = (
+                        self.tokenizer.decode(rollings_active.batch['input_ids'][i], skip_special_tokens=False).replace("<|endoftext|>", "")
+                        + self.tokenizer.decode(gen_output.batch['responses'][i], skip_special_tokens=False).replace("<|endoftext|>", "")
+                    )
+                print(f"[IGPO] turn {step} (last): forced {len(activate_list)} samples to <answer>", flush=True)
+                activate_list = []
+                break
 
             results = self.parse_response(gen_output.batch['responses'], think=think)
             assert len(results) == len(activate_list)  # After each round update, result count equals active query count
