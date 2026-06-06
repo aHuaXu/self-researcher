@@ -189,6 +189,10 @@ search_engine: rag
 # Multi-agent LoRA GRPO training (disabled by default)
 multi_agent:
   enable: false
+  # Phase 2b (interleaved Planner<->frozen Executor): outer Planner turn cap + freeze flag.
+  # freeze_executor=true is the design §11 lambda=1 corner (train Planner LoRA only).
+  max_planner_turns: 5
+  freeze_executor: true
   base_model: GAIR/DeepResearcher-7b
   lora_save_dir: ./tmp_lora_adapters
 

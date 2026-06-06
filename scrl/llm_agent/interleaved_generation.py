@@ -167,6 +167,53 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                                tok_end if tok_end is not None else len(token_ids)])
             return pseudo_resps_with_gt, gt_idx
 
+        def _compact_findings(self, exec_full: str) -> str:
+            """Compact a full executor transcript into a Planner-injectable finding.
+
+            Uses the executor's <answer> (design §3 part a) and, when present, a capped slice of the
+            reasoning/evidence before it (part b). Bounded by PLANNER_FINDINGS_MAX_CHARS so the
+            accumulating Planner context stays under max_model_len across turns.
+            """
+            import os
+            cap = int(os.getenv("PLANNER_FINDINGS_MAX_CHARS", "1200"))
+            answer = self._extract_answer(exec_full)   # <answer>..</answer> or fallback tail
+            finding = answer if answer else exec_full
+            if len(finding) > cap:
+                finding = finding[:cap] + "\n...[truncated]"
+            return finding
+
+        def pseudo_generate_sequences(self, prompts, response):
+            """Append GT-answer token ids to a rolling context -> belief pseudo DataProto.
+            Copied from IGPOGenerationManager (not inherited via MultiAgentGenerationManager)."""
+            import torch
+            from tensordict import TensorDict
+            from verl import DataProto
+            from verl.utils.torch_functional import (
+                get_eos_mask as get_response_mask, pad_2d_list_to_length,
+            )
+            idx = prompts.batch["input_ids"]
+            attention_mask = prompts.batch["attention_mask"]
+            position_ids = prompts.batch["position_ids"]
+            batch_size = idx.size(0)
+            eos_token_id = self.tokenizer.eos_token_id
+            non_tensor_batch = prompts.non_tensor_batch
+            response = pad_2d_list_to_length(response, self.tokenizer.pad_token_id).to(idx.device)
+            seq = torch.cat([idx, response], dim=-1)
+            response_length = response.size(1)
+            delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+            delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+            last_valid_pos_ids = (attention_mask.sum(dim=1, keepdim=True).long() - 1).clamp(min=0)
+            response_position_ids = last_valid_pos_ids + delta_position_id
+            position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+            response_attention_mask = get_response_mask(
+                response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+            attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+            batch = TensorDict(
+                {"prompts": idx, "responses": response, "input_ids": seq,
+                 "attention_mask": attention_mask, "position_ids": position_ids},
+                batch_size=batch_size)
+            return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
         def _planner_belief_pseudo(self, planner_msgs_active, pseudo_resps_active, gen_batch):
             """Tokenize the active Planner contexts (no tools) and append the GT answer via
             pseudo_generate_sequences -> one pseudo DataProto for this turn's belief forward."""
@@ -241,10 +288,13 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                         exec_msgs, gen_batch, tools=getattr(self, "tools", None))
                     _, exec_out = self.run_llm_loop(
                         exec_batch, global_steps, lora_adapter_name="executor")
-                    findings = self._decode_outputs(exec_out)   # a:answer + b:evidence (design §3)
+                    findings_full = self._decode_outputs(exec_out)   # full executor transcript
                     for j, i in enumerate(subtask_rows):
-                        traces[i].findings.append(findings[j])
-                        planner_msgs[i].append({"role": "user", "content": findings[j]})
+                        # Inject a COMPACT finding (executor answer + capped evidence), NOT the whole
+                        # multi-turn transcript — otherwise the Planner context blows past max_model_len.
+                        finding = self._compact_findings(findings_full[j])
+                        traces[i].findings.append(finding)
+                        planner_msgs[i].append({"role": "user", "content": finding})
                 active = next_active
 
             # ---- Belief: single batched actor forward over all collected turns (= IGPO path) ----
