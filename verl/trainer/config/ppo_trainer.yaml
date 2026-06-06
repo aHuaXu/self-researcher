@@ -193,6 +193,9 @@ multi_agent:
   # freeze_executor=true is the design §11 lambda=1 corner (train Planner LoRA only).
   max_planner_turns: 5
   freeze_executor: true
+  # Char cap on the compact executor finding injected into the Planner context
+  # (interleaved_generation._compact_findings). Phase 2b-specific behavior knob.
+  planner_findings_max_chars: 1200
   base_model: GAIR/DeepResearcher-7b
   lora_save_dir: ./tmp_lora_adapters
 

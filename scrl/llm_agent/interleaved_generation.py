@@ -111,7 +111,8 @@ def _parse_planner_turn(text: str):
 
 
 def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_save_dir,
-                                      max_planner_turns=5, gt_computer=None):
+                                      max_planner_turns=5, gt_computer=None,
+                                      planner_findings_max_chars=1200):
     """Factory: returns an InterleavedRolloutManager (defined lazily to avoid importing
     MultiAgentGenerationManager / torch when only run_loop_pure is needed)."""
     from scrl.llm_agent.multi_agent_generation import MultiAgentGenerationManager
@@ -136,6 +137,7 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                              config=config, lora_save_dir=lora_save_dir)
             self.max_planner_turns = max_planner_turns
             self.gt_computer = gt_computer   # offline belief smoke only; training uses actor path
+            self.planner_findings_max_chars = planner_findings_max_chars
 
         # -- GT answer wrapping for belief (mirror igpo_generation lines ~528-572) --------
         def _build_pseudo_gt(self, ground_truths):
@@ -182,8 +184,8 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
             JSON blob, which derails the Planner (observed: dictionary defs / unrelated event lists
             injected as "findings"). Bounded by PLANNER_FINDINGS_MAX_CHARS.
             """
-            import os, re
-            cap = int(os.getenv("PLANNER_FINDINGS_MAX_CHARS", "1200"))
+            import re
+            cap = self.planner_findings_max_chars
             m = re.search(r"<answer>(.*?)</answer>", exec_full, re.DOTALL)
             if m:
                 finding = m.group(1).strip()

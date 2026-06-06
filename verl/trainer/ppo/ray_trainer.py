@@ -1076,6 +1076,7 @@ class RayPPOTrainer(object):
                 config=multi_agent_gen_config,
                 lora_save_dir=lora_save_dir,
                 max_planner_turns=max_planner_turns,
+                planner_findings_max_chars=self.config.multi_agent.get('planner_findings_max_chars', 1200),
             )
             _multi_agent_enabled = True
             _freeze_executor = self.config.multi_agent.get('freeze_executor', True)

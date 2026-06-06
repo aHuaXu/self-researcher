@@ -12,9 +12,9 @@ set -euo pipefail
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # Bound executor per-turn tool-observation length so multi-turn context stays < max_model_len.
+# (tool/infra knob -> stays an env var, shared by single- and multi-agent rollout)
 export TOOL_CONTENT_MAX_CHARS=${TOOL_CONTENT_MAX_CHARS:-1500}
-# Cap the compact finding injected into the Planner context (interleaved_generation._compact_findings).
-export PLANNER_FINDINGS_MAX_CHARS=${PLANNER_FINDINGS_MAX_CHARS:-1200}
+# PLANNER_FINDINGS_MAX_CHARS is now Hydra config: multi_agent.planner_findings_max_chars (set below).
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3,4,6,7}   # pick 4 IDLE gpus (check nvidia-smi!)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -88,6 +88,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     multi_agent.enable=true \
     multi_agent.max_planner_turns=4 \
     multi_agent.freeze_executor=true \
+    multi_agent.planner_findings_max_chars=1200 \
     multi_agent.base_model=${BASE}/models/Qwen3-4B-Instruct \
     multi_agent.lora_save_dir=${BASE}/tmp_lora_adapters \
     multi_agent.lora.rank=64 \
