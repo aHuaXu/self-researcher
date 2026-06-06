@@ -1174,6 +1174,31 @@ class RayPPOTrainer(object):
                             planner_output.batch['advantages'] = advantages
                             planner_output.batch['returns'] = returns
 
+                        # --- Dump advantage/reward audit (verify scatter + turn-level credit) ---
+                        try:
+                            import os as _os, json as _json
+                            _audit = []
+                            for _i in range(token_level_rewards.shape[0]):
+                                _nz = (token_level_rewards[_i] != 0).nonzero(as_tuple=True)[0].tolist()
+                                _bd = turn_boundary_mask[_i].nonzero(as_tuple=True)[0].tolist()
+                                _audit.append({
+                                    "idx": _i,
+                                    "agent_grpo_idx": int(agent_grpo_idx[_i]),
+                                    "f1": float(f1_scores[_i]),
+                                    "reward_nonzero_pos": _nz,
+                                    "reward_nonzero_val": [round(float(token_level_rewards[_i, p]), 4) for p in _nz],
+                                    "turn_boundary_pos": _bd,
+                                    "adv_at_nonzero": [round(float(advantages[_i, p]), 4) for p in _nz],
+                                    "adv_sum": round(float(advantages[_i].sum()), 4),
+                                })
+                            _ad = f"./outputs/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}/rollout"
+                            _os.makedirs(_ad, exist_ok=True)
+                            with open(f"{_ad}/advantage_audit_step_{self.global_steps}.json", "w") as _f:
+                                _json.dump(_audit, _f, indent=2)
+                            print(f"[Interleaved] advantage_audit_step_{self.global_steps}.json written", flush=True)
+                        except Exception as _e:
+                            print(f"[Interleaved] advantage audit dump failed: {_e}", flush=True)
+
                         # --- Update Planner LoRA only (Executor frozen = design §11 lambda=1 corner) ---
                         planner_padded, _pad = pad_dataproto_to_divisor(
                             planner_output, self.actor_rollout_wg.world_size)

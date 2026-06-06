@@ -323,12 +323,21 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
 
             planner_output, turn_end_positions, answers = self._assemble_planner_tensors(
                 traces, gen_batch)
-            self._dump_planner_rollout(traces, info_gain_rewards, turn_end_positions, global_steps)
+            self._dump_planner_rollout(traces, planner_msgs, info_gain_rewards,
+                                       turn_end_positions, global_steps)
             return planner_output, turn_end_positions, info_gain_rewards, answers
 
-        def _dump_planner_rollout(self, traces, info_gain_rewards, turn_end_positions, global_steps):
-            """Dump per-sample Planner trace (subtasks / findings / answer / per-turn IG) for
-            inspection — the Planner analogue of the executor's rollout_step_N.json."""
+        def _dump_planner_rollout(self, traces, planner_msgs, info_gain_rewards,
+                                  turn_end_positions, global_steps):
+            """Dump per-sample Planner trace for inspection — the Planner analogue of the executor's
+            rollout_step_N.json. Includes EACH TURN's input/output so the rollout is fully auditable:
+            - turns[t].planner_output_raw : exactly what the Planner generated that turn (reasoning + tags)
+            - turns[t].parsed_kind/payload: how _parse_planner_turn read it (subtask vs answer)
+            - turns[t].executor_finding   : the compact finding injected back (executor's contribution)
+            - final_planner_messages      : the full chat the Planner saw by the end (history is here,
+                                            not in the prompt template)
+            - info_gain_rewards / turn_end_positions: the per-turn IG + token positions fed to scatter.
+            """
             import os, json
             if not (self.config.project_name and self.config.experiment_name):
                 return
@@ -336,15 +345,27 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
             os.makedirs(out_dir, exist_ok=True)
             rows = []
             for i, tr in enumerate(traces):
+                # rebuild per-turn input/output view: planner_texts[t] is turn t's raw output;
+                # findings[t] is the executor finding that followed subtask t (answer turn has none).
+                turns = []
+                for t, raw in enumerate(tr.planner_texts):
+                    is_answer = ("<answer>" in raw and "</answer>" in raw)
+                    turns.append({
+                        "turn": t,
+                        "planner_output_raw": raw,
+                        "parsed_kind": "answer" if is_answer else "subtask",
+                        "payload": (tr.answer if is_answer else (tr.subtasks[t] if t < len(tr.subtasks) else None)),
+                        "executor_finding": tr.findings[t] if t < len(tr.findings) else None,
+                    })
                 rows.append({
                     "idx": i,
                     "question": tr.question,
-                    "subtasks": tr.subtasks,
-                    "findings": tr.findings,
-                    "answer": tr.answer,
                     "num_planner_turns": len(tr.planner_texts),
+                    "answer": tr.answer,
+                    "turns": turns,
                     "info_gain_rewards": [float(x) for x in (info_gain_rewards[i] if i < len(info_gain_rewards) else [])],
                     "turn_end_positions": turn_end_positions[i] if i < len(turn_end_positions) else [],
+                    "final_planner_messages": planner_msgs[i] if i < len(planner_msgs) else None,
                 })
             with open(f"{out_dir}/planner_rollout_step_{global_steps}.json", "w", encoding="utf-8") as f:
                 json.dump(rows, f, indent=2, ensure_ascii=False)
