@@ -113,21 +113,85 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
     from research_agent.prompts.executor import get_executor_prompt
 
     class InterleavedRolloutManager(MultiAgentGenerationManager):
-        """Real interleaved rollout (WIP — iterated on server). Reuses the dual-LoRA helpers
-        of MultiAgentGenerationManager; replaces its one-shot DAG `run_multi_agent_loop`."""
+        """Real interleaved rollout. Reuses the dual-LoRA helpers of MultiAgentGenerationManager;
+        replaces its one-shot DAG `run_multi_agent_loop` with the Planner<->frozen-Executor
+        interleave. Per-turn Planner belief is computed via the SAME actor-worker vectorized path
+        as single-agent IGPO (prealigned_vectorized.compute_vectorized_gt_logprob over
+        actor_rollout_wg) — NOT the in-process gt_computer (that path can't reach the FSDP/vLLM
+        model during training; see design §11). gt_computer is kept only for offline belief smoke.
+
+        ⚠ SERVER-ITERATED: belief collection + tensor assembly run only against the live runtime
+        (GPU, Ray actor worker, real tokenizer). The model-independent core (assemble_planner_sequence)
+        is unit-tested; everything touching DataProto/compute_log_prob is finalized on the server.
+        """
 
         def __init__(self):
             super().__init__(tokenizer=tokenizer, actor_rollout_wg=actor_rollout_wg,
                              config=config, lora_save_dir=lora_save_dir)
             self.max_planner_turns = max_planner_turns
-            self.gt_computer = gt_computer
+            self.gt_computer = gt_computer   # offline belief smoke only; training uses actor path
+
+        # -- GT answer wrapping for belief (mirror igpo_generation lines ~528-572) --------
+        def _build_pseudo_gt(self, ground_truths):
+            """Return (pseudo_resps_with_gt: List[List[int]], gt_idx: List[List[int]]).
+
+            Wraps each ground-truth answer with the no-think PREFIX/SUFFIX and locates the answer
+            token range via offset_mapping — identical to the single-agent IGPO construction so the
+            belief = P(gt_answer | context) is computed over the same span.
+            """
+            from scrl.llm_agent.vectorized_gt_logprob import (
+                DEFAULT_GT_ANSWER_PREFIX, DEFAULT_GT_ANSWER_SUFFIX,
+            )
+            PREFIX, SUFFIX = DEFAULT_GT_ANSWER_PREFIX, DEFAULT_GT_ANSWER_SUFFIX
+            pseudo_resps_with_gt, gt_idx = [], []
+            for gt in ground_truths:
+                gt_text = gt["ground_truth"]
+                if "<|answer_split|>" in gt_text:
+                    gt_text = gt_text.split("<|answer_split|>")[0]
+                gt_text = gt_text.strip()
+                full_text = f"{PREFIX}{gt_text}{SUFFIX}"
+                enc = self.tokenizer(full_text, return_tensors="pt", return_offsets_mapping=True)
+                token_ids = enc["input_ids"].tolist()[0]
+                offsets = enc["offset_mapping"].tolist()[0]
+                pseudo_resps_with_gt.append(token_ids)
+                if not token_ids:
+                    gt_idx.append([0, 0]); continue
+                gt_char_start, gt_char_end = len(PREFIX), len(PREFIX) + len(gt_text)
+                tok_start = tok_end = None
+                for ti, (cs, ce) in enumerate(offsets):
+                    if tok_start is None and ce > gt_char_start:
+                        tok_start = ti
+                    if cs < gt_char_end and ce > 0:
+                        tok_end = ti + 1
+                gt_idx.append([tok_start if tok_start is not None else len(token_ids),
+                               tok_end if tok_end is not None else len(token_ids)])
+            return pseudo_resps_with_gt, gt_idx
+
+        def _planner_belief_pseudo(self, planner_msgs_active, pseudo_resps_active, gen_batch):
+            """Tokenize the active Planner contexts (no tools) and append the GT answer via
+            pseudo_generate_sequences -> one pseudo DataProto for this turn's belief forward."""
+            import torch
+            from verl import DataProto
+            rolled = self.tokenizer.apply_chat_template(
+                planner_msgs_active, add_generation_prompt=True, tokenize=False)
+            tok = self.tokenizer(rolled, return_tensors="pt", padding=True)
+            pad_mask = tok["input_ids"] != self.tokenizer.pad_token_id
+            order = pad_mask.to(torch.int64).argsort(dim=1, stable=True)   # left-pad
+            input_ids = tok["input_ids"].gather(1, order)
+            attn = tok["attention_mask"].gather(1, order)
+            pos = self.tensor_fn.create_position_ids(attn)
+            rollings = DataProto.from_dict(
+                {"input_ids": input_ids, "attention_mask": attn, "position_ids": pos})
+            return self.pseudo_generate_sequences(rollings, pseudo_resps_active)
 
         def run_loop(self, gen_batch, global_steps, ground_truths):
             """Interleaved Planner(LoRA)<->frozen Executor rollout.
 
             Returns (planner_output: DataProto, turn_end_positions: List[List[int]],
-                     beliefs: List[List[float]], answers: List[str]).
-            Consumed by Task 7: per-sample scatter_planner_token_rewards -> (bs,L)
+                     info_gain_rewards: List[List[float]], answers: List[str]).
+            info_gain_rewards[i] holds Planner per-turn IG (from belief diffs, computed by the
+            actor-worker vectorized path). ray_trainer then calls
+            scatter_info_gain_rewards(info_gain_rewards, f1, turn_end_positions, L) -> (bs,L)
             token_level_rewards/turn_boundary_mask -> compute_igpo_turn_advantage.
             """
             import numpy as np  # noqa
@@ -135,14 +199,25 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
             questions = self._extract_questions(gen_batch)
             n = len(questions)
             traces = [InterleavedTrace(question=q) for q in questions]
-            # running planner chat per sample (question prompt + assistant/user turns)
             planner_msgs: List[List[Dict]] = [list(get_planner_prompt(q)) for q in questions]
             active = list(range(n))
+
+            # Belief setup: GT wrapping (per global sample) + per-turn pseudo collection.
+            pseudo_resps_with_gt, gt_idx = self._build_pseudo_gt(ground_truths)
+            pseudo_outputs_per_turn, activate_lists_per_turn = [], []
 
             for t in range(self.max_planner_turns):
                 if not active:
                     break
-                # --- Planner: one generation for each active sample ---
+                # --- Belief Bel_t: P(gt | planner context BEFORE this turn's generation) ---
+                # context after t subtasks+findings; consecutive diffs => IG_t (vectorized after loop).
+                pseudo_resps_active = [pseudo_resps_with_gt[i] for i in active]
+                pseudo_outputs_per_turn.append(
+                    self._planner_belief_pseudo([planner_msgs[i] for i in active],
+                                                pseudo_resps_active, gen_batch))
+                activate_lists_per_turn.append(list(active))
+
+                # --- Planner: one generation per active sample ---
                 batch = self._tokenize_messages_to_batch([planner_msgs[i] for i in active], gen_batch)
                 plan_out = self._generate_with_gpu_padding(batch, lora_adapter_name="planner")
                 texts = self._decode_outputs(plan_out)
@@ -166,33 +241,95 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                         exec_msgs, gen_batch, tools=getattr(self, "tools", None))
                     _, exec_out = self.run_llm_loop(
                         exec_batch, global_steps, lora_adapter_name="executor")
-                    findings = self._decode_outputs(exec_out)   # a:answer + b:evidence (per design §3)
+                    findings = self._decode_outputs(exec_out)   # a:answer + b:evidence (design §3)
                     for j, i in enumerate(subtask_rows):
                         traces[i].findings.append(findings[j])
                         planner_msgs[i].append({"role": "user", "content": findings[j]})
                 active = next_active
 
-            # ---- Belief + tensor assembly (WIP: iterate on server) ----
-            # Per design §4/§5: build each sample's Planner sequence (planner_texts interleaved with
-            # findings observations; response_mask=1 only on planner_texts), record each planner turn's
-            # end-token position into trace.turn_end_positions, and compute Bel_0..Bel_T via
-            # self.gt_computer.compute_all_turns_vectorized(... ground_truth ...). IG_t = Bel diffs.
-            # Then Task 7 calls scatter_planner_token_rewards(beliefs, f1, turn_end_positions, L).
-            planner_output, turn_end_positions, beliefs, answers = self._assemble_planner_tensors(
-                traces, ground_truths, gen_batch)
-            return planner_output, turn_end_positions, beliefs, answers
+            # ---- Belief: single batched actor forward over all collected turns (= IGPO path) ----
+            from scrl.llm_agent.prealigned_vectorized import compute_vectorized_gt_logprob
+            info_gain_type = getattr(self.config, "info_gain_type", "log_prob_diff")
+            if pseudo_outputs_per_turn:
+                vec = compute_vectorized_gt_logprob(
+                    pseudo_outputs_per_turn=pseudo_outputs_per_turn,
+                    activate_lists_per_turn=activate_lists_per_turn,
+                    gt_idx=gt_idx,
+                    actor_rollout_wg=self.actor_rollout_wg,
+                    tokenizer=self.tokenizer,
+                    info_gain_type=info_gain_type,
+                )
+                info_gain_rewards = vec["info_gain_rewards"]
+            else:
+                info_gain_rewards = [[] for _ in range(n)]
 
-        def _assemble_planner_tensors(self, traces, ground_truths, gen_batch):
-            """Assemble the Planner sequence DataProto + turn_end_positions + beliefs.
+            planner_output, turn_end_positions, answers = self._assemble_planner_tensors(
+                traces, gen_batch)
+            return planner_output, turn_end_positions, info_gain_rewards, answers
 
-            WIP — the tensor bookkeeping (concat planner turns + findings observations into one
-            (bs, L) sequence with response_mask, recording turn-end token positions, and the
-            vectorized belief forward) is finalized against the live runtime on the server.
+        def _assemble_planner_tensors(self, traces, gen_batch):
+            """Build the Planner training DataProto from traces (model-independent assembly).
+
+            Per sample: re-tokenize each planner turn + each findings observation, interleave via
+            assemble_planner_sequence (findings masked out of the loss), then pad to a batch.
+            Emits the run_llm_loop output contract (prompts/responses/input_ids/attention_mask/
+            position_ids + agent_grpo_idx) PLUS a `loss_mask` (response-frame, 1 on planner tokens):
+            downstream IGPO uses loss_mask as the response_mask so only planner tokens are credited.
+
+            Returns (planner_output: DataProto, turn_end_positions: List[List[int]], answers: List[str]).
+            ⚠ SERVER-ITERATED: re-tokenizing decoded text (vs reusing generated ids) and the exact
+            downstream mask field name are verified against the live runtime.
             """
-            raise NotImplementedError(
-                "_assemble_planner_tensors: planner-sequence assembly + vectorized belief is the "
-                "server-iteration step (needs live DataProto/tokenizer/model). Control flow above "
-                "(planner<->frozen-executor interleave, findings injection) is complete."
-            )
+            import torch
+            import numpy as np
+            from verl import DataProto
+
+            def _ids(text):
+                return self.tokenizer(text, add_special_tokens=False)["input_ids"]
+
+            resp_rows, mask_rows, tep_rows, prompt_strs, answers = [], [], [], [], []
+            for tr in traces:
+                # planner turns = subtasks (in order) + the answer turn last; one findings per subtask.
+                planner_turn_ids = [_ids(s) for s in tr.planner_texts]
+                findings_ids = [_ids(f) for f in tr.findings]
+                # guard: assemble requires findings == planner_turns - 1; a capped (no-answer) trace
+                # has len(planner_texts) == len(findings); drop the trailing dangling findings.
+                if len(findings_ids) >= len(planner_turn_ids):
+                    findings_ids = findings_ids[: len(planner_turn_ids) - 1]
+                resp, mask, tep = assemble_planner_sequence(planner_turn_ids, findings_ids)
+                resp_rows.append(resp); mask_rows.append(mask); tep_rows.append(tep)
+                prompt_strs.append(self.tokenizer.apply_chat_template(
+                    list(get_planner_prompt(tr.question)), add_generation_prompt=True, tokenize=False))
+                answers.append(tr.answer or "")
+
+            pad_id = self.tokenizer.pad_token_id
+            # prompts: left-pad
+            ptok = self.tokenizer(prompt_strs, return_tensors="pt", padding=True)
+            pmask = ptok["input_ids"] != pad_id
+            porder = pmask.to(torch.int64).argsort(dim=1, stable=True)
+            prompts = ptok["input_ids"].gather(1, porder)
+            prompts_attn = ptok["attention_mask"].gather(1, porder)
+            # responses: right-pad ids + masks to batch max
+            R = max((len(r) for r in resp_rows), default=1)
+            responses = torch.full((len(resp_rows), R), pad_id, dtype=torch.long)
+            resp_attn = torch.zeros((len(resp_rows), R), dtype=prompts_attn.dtype)
+            loss_mask = torch.zeros((len(resp_rows), R), dtype=torch.long)
+            for r, (resp, mask) in enumerate(zip(resp_rows, mask_rows)):
+                L = len(resp)
+                responses[r, :L] = torch.tensor(resp, dtype=torch.long)
+                resp_attn[r, :L] = 1
+                loss_mask[r, :L] = torch.tensor(mask, dtype=torch.long)
+
+            attention_mask = torch.cat((prompts_attn, resp_attn), dim=-1)
+            position_ids = self.tensor_fn.create_position_ids(attention_mask)
+            planner_output = DataProto.from_dict({
+                "prompts": prompts,
+                "responses": responses,
+                "input_ids": torch.cat((prompts, responses), dim=-1),
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "loss_mask": loss_mask,            # response-frame planner-token mask (IGPO response_mask)
+            })
+            return planner_output, tep_rows, answers
 
     return InterleavedRolloutManager()
