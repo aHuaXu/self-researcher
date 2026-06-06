@@ -1145,6 +1145,13 @@ class RayPPOTrainer(object):
                         ], dtype=torch.float32)
 
                         # --- Scatter per-turn IG + final F1 to token rewards (response frame) ---
+                        # Belief is collected for all n samples every turn (uniform blocks), so
+                        # info_gain_rewards[i] has (num_turns-1) entries; truncate to this sample's
+                        # own turns: scatter requires len == len(turn_end_positions[i]) - 1.
+                        info_gain_rewards = [
+                            list(ig)[: max(0, len(turn_end_positions[i]) - 1)]
+                            for i, ig in enumerate(info_gain_rewards)
+                        ]
                         L = planner_output.batch['responses'].shape[1]
                         token_level_rewards, turn_boundary_mask = scatter_info_gain_rewards(
                             info_gain_rewards, f1_scores, turn_end_positions, L)

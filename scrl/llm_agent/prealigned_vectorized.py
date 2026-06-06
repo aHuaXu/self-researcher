@@ -277,8 +277,17 @@ def compute_vectorized_gt_logprob(
     print(f"[PREALIGNED VECTORIZED] Merged: {total_batch_size} total samples (= {num_turns} turns × {num_samples})")
     
     # ========== Step 4: Call compute_log_prob ONCE ==========
+    # Pad to a multiple of world_size: the merged batch = sum of per-turn active counts, which is
+    # NOT generally divisible by the DP world size (e.g. interleaved planner with early-stopping
+    # samples -> 27 rows / 4 workers). compute_log_prob chunks across workers and asserts equal
+    # chunks, so pad then slice back to the true total.
     print(f"[PREALIGNED VECTORIZED] Calling compute_log_prob ONCE...")
-    merged_log_probs_result = actor_rollout_wg.compute_log_prob(merged_batch)
+    from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+    world_size = getattr(actor_rollout_wg, 'world_size', 1) or 1
+    merged_batch_padded, _pad_size = pad_dataproto_to_divisor(merged_batch, world_size)
+    merged_log_probs_result = actor_rollout_wg.compute_log_prob(merged_batch_padded)
+    if _pad_size > 0:
+        merged_log_probs_result = unpad_dataproto(merged_log_probs_result, pad_size=_pad_size)
     merged_old_log_probs = merged_log_probs_result.batch['old_log_probs']
     # This repo's compute_log_prob returns only old_log_probs (no 'entropys'); entropys here is
     # purely diagnostic (gt_entropys_per_turn), not used by the IG computation. Fall back to zeros.

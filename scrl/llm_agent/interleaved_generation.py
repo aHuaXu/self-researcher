@@ -263,12 +263,14 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                 if not active:
                     break
                 # --- Belief Bel_t: P(gt | planner context BEFORE this turn's generation) ---
-                # context after t subtasks+findings; consecutive diffs => IG_t (vectorized after loop).
-                pseudo_resps_active = [pseudo_resps_with_gt[i] for i in active]
+                # Collect for ALL n samples (uniform num_samples-per-turn blocks): the vectorized
+                # extractor assumes one row per GLOBAL sample per turn. Finished samples reuse their
+                # frozen context (post-answer IG ~ 0); the trailing IG beyond a sample's own turns is
+                # truncated at scatter (len(turn_end_positions[i]) - 1). Consecutive diffs => IG_t.
                 pseudo_outputs_per_turn.append(
-                    self._planner_belief_pseudo([planner_msgs[i] for i in active],
-                                                pseudo_resps_active, gen_batch))
-                activate_lists_per_turn.append(list(active))
+                    self._planner_belief_pseudo([planner_msgs[i] for i in range(n)],
+                                                pseudo_resps_with_gt, gen_batch))
+                activate_lists_per_turn.append(list(range(n)))
 
                 # --- Planner: one generation per active sample ---
                 batch = self._tokenize_messages_to_batch([planner_msgs[i] for i in active], gen_batch)
