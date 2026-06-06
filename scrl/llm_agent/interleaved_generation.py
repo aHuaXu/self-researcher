@@ -176,14 +176,24 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
         def _compact_findings(self, exec_full: str) -> str:
             """Compact a full executor transcript into a Planner-injectable finding.
 
-            Uses the executor's <answer> (design §3 part a) and, when present, a capped slice of the
-            reasoning/evidence before it (part b). Bounded by PLANNER_FINDINGS_MAX_CHARS so the
-            accumulating Planner context stays under max_model_len across turns.
+            Priority: (1) the executor's <answer>...</answer>; (2) else its LAST assistant reasoning
+            block (tool_call JSON stripped); (3) else a clean placeholder. Crucially does NOT fall
+            back to the raw transcript tail — that tail is usually a <tool_response> search-result
+            JSON blob, which derails the Planner (observed: dictionary defs / unrelated event lists
+            injected as "findings"). Bounded by PLANNER_FINDINGS_MAX_CHARS.
             """
-            import os
+            import os, re
             cap = int(os.getenv("PLANNER_FINDINGS_MAX_CHARS", "1200"))
-            answer = self._extract_answer(exec_full)   # <answer>..</answer> or fallback tail
-            finding = answer if answer else exec_full
+            m = re.search(r"<answer>(.*?)</answer>", exec_full, re.DOTALL)
+            if m:
+                finding = m.group(1).strip()
+            else:
+                # last assistant block (executor's final reasoning), tool_call/markers stripped
+                blocks = re.split(r"<\|im_start\|>assistant", exec_full)
+                last = (blocks[-1] if blocks else "").split("<|im_end|>")[0]
+                last = re.sub(r"<tool_call>.*?</tool_call>", "", last, flags=re.DOTALL)
+                last = re.sub(r"</?(think|tool_response)>", "", last).strip()
+                finding = last if last else "[executor returned no conclusive finding]"
             if len(finding) > cap:
                 finding = finding[:cap] + "\n...[truncated]"
             return finding
