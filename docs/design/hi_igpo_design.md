@@ -1,360 +1,609 @@
 # Hi-IGPO 设计文档:分层信息增益 + 交替式 Planner-Executor
 
-> 日期:2026-06-19
-> 状态:设计草案(待 review → writing-plans)
+## 1. 目标与范围
 
-## 1. 背景与动机
+Hi-IGPO 的目标是把 IGPO 的 turn-level 信息增益信用分配扩展到 Planner + Executor 分层检索系统。
 
-本项目当前是 DeepResearcher 的改版:Planner + Executor 双 agent(共享 Qwen3-4B base、各自 LoRA),
-Executor 走一次性 DAG(子任务带依赖、分 wave 并行),用 **GRPO(无 critic)** 训练。
+核心问题:
 
-**核心痛点(简历/论文缺乏算法新意):**
+- 单 Agent 在复杂问题上 rollout 长、规划和检索执行耦合。
+- Multi-Agent 如果只共享最终 F1, 很难区分错误来自 Planner 拆解差, 还是 Executor 检索执行差。
+- 直接联合训练 Planner 和 Executor 会引入非平稳性, 早期训练信号容易变噪。
 
-1. **奖励稀疏**:outcome 信号(F1)只在最终答案出现一次。
-2. **信用混淆**:当前 `MultiAgentRewardManager` 让两个 agent **共享同一个最终 F1**:
-   - `reward_planner  = α·rule_p + (1-α)·F1`
-   - `reward_executor = β·rule_e + (1-β)·F1`
-   - `rule_p/rule_e` 只是格式/轮数约束。答错时无法区分是 Planner 拆解差还是 Executor 执行差。
+本设计采用渐进路线:
 
-**机会**:IGPO(arXiv:2510.14967,Information Gain-based Policy Optimization)用"信息增益"给单 agent 多轮
-提供稠密内生奖励,且 IGPO 与本项目**同源**(都基于 verl + Search-R1 + DeepResearcher)。IGPO 原文明确把
-"扩展到多智能体分层规划检索系统"列为开放问题。
+- 先固定 Executor, 主要训练 Planner。
+- Planner 稳定后再做 Planner/Executor 联合训练。
+- 信用分配以外层 macro-turn 的信息增益为主, 并通过折扣累计回报传递长期收益。
 
-## 2. 目标与贡献
+## 2. 分层 Rollout
 
-**一句话**:把 IGPO 的 turn-level 信息增益从单 agent 推广到**交替式分层多 agent**——
-Planner 每提出一个子任务是一个决策步、Executor 每次 tool call 是一个决策步,**两层都用信息增益做信用分配**,
-解决多 agent deep research 的"稀疏奖励 + 信用混淆"。命名:**Hi-IGPO(Hierarchical IGPO)**。
+每个问题生成一条交替式分层轨迹:
 
-**两个算法贡献:**
-1. **交替式分层 IGPO**:把 turn-level IG 用到交替式 Planner-Executor;冻结 Executor 时 Planner 退化为
-   标准单 agent IGPO(见 §5.0),命中 IGPO 原文留的"多智能体分层规划检索"开放问题。
-2. **变长 Planner 的 turn-group 归一化**:把 A²TGPO 的 (prompt, turn-index) 归一化适配到轮数可变的
-   Planner(含 <2 样本回退),解决原生 IGPO 全局归一化下"不同深度 turn 不可比"的偏置(见 §5.2)。
+```text
+H_0 = question
 
-**范围约束(本设计 story 优先,不追 SOTA):**
-- 算力上限:**4×V100 32GB**。小 batch、`grpo_n` 4~8、`max_planner_turns ≤ 5`。
-- 成功标准:一个站得住的新机制 + 一组干净消融,证明优于"共享 F1"基线;小规模能讲清楚机制即可。
+for k = 1..K:
+    Planner_k:
+        input  = question + previous findings
+        output = plan_k / subquestion_k
 
-## 3. 架构:交替式 Planner ↔ Executor
+    Executor_k:
+        input  = question + plan_k + optional previous findings
+        output = search/visit trajectory + finding_k
 
-将"一次性出 DAG"改为**交替循环**,使 Planner 本身成为外层多轮 agent:
+    H_k = H_{k-1} + plan_k + finding_k
 
-```
-P_0 ← belief(question)                      # 还没任何子任务时的信念
-for t = 1 .. T_p (T_p ≤ max_planner_turns):
-    planner: 输入 question + 历史 findings_{<t}
-             → 输出 [子任务_t]  或  [<answer>]
-    if 输出是 <answer>:
-        break
-    executor: 多轮 tool call 执行 子任务_t  → findings_t      # 复用现有 run_llm_loop
-    P_t ← belief(question, findings_{≤t})    # 一次 teacher-forcing forward
-最终 answer → F1(answer, golden)
+Final:
+    Planner 或 Executor 输出 final answer
 ```
 
-- **Planner**:外层多轮 agent(新增的外层循环)。
-- **Executor**:内层多轮 agent(复用现有 `LLMGenerationManager.run_llm_loop`)。
-- **限制**:`T_p ≤ 5` 控成本;Executor 每子任务沿用现有 `max_turns`。
-- 相比 DAG:失去并行、轨迹变长(串行),但换来 Planner 的自适应决策(适时停止/换方向)与原生的分层信用。
-- **最终答案归 Planner**:Executor 只产中间 `findings_t`;Planner 攒够信息后自己输出 `<answer>`(F1 对它算)。
-- **`findings_t` 的内容(定:两者都要)**:Executor 把 `子任务_t` 当成小问题跑搜索循环,返回
-  **(a) 它对该子任务的 `<answer>`(简洁结论)+ (b) 沿途检索到的关键证据**。中间过程信息更全,
-  避免只取简短 `<answer>` 丢信息;`findings_t` 灌回 Planner 上下文(`response_mask=0`,不训),供下一轮决策与 belief。
-- **Executor 输入(定:隔离式 A)**:Executor 执行 `子任务_t` 时**只看 `子任务_t`(+ 原始 question 做锚定),不看历史 findings**。
-  理由:① 契合分解(Planner 持全局、把子任务写自包含;Executor 专注执行一个);② IG 信用更干净——`findings_t`
-  是"这个子任务带来的新信息",避免 Executor 重捞历史信息污染 IG_t 归因;③ 实现简单(Executor 无状态)。
-  需要前置结论时由 Planner 把它写进子任务描述(这是 Planner 要学的、IG 会奖励的能力)。
-- **架构(定:保留双 rollout,不复用单 agent 管线)**:Planner 与 Executor **各产独立 DataProto**(`planner_outputs` /
-  `executor_outputs`)。**不**把 Executor 降级成 `execute_predictions` 里的黑盒工具(那样会丢掉 Executor 的可训轨迹、
-  foreclose Phase 2a)。Phase 2b 只训 Planner、Executor 冻结,但**其 rollout 照样捕获保留**,Phase 2a 将来可直接在其上
-  加 IG/优势,不用改架构。Planner 的 IG 仍复用 `compute_all_turns_vectorized`(belief),但两条 rollout 分开管理。
+初始约束:
 
-## 4. 信念与信息增益(双层共享一条 belief 轨迹)
+- `max_planner_turns` 控制在 3 到 6。
+- Executor 每个 subtask 内允许多轮 search/visit。
+- `finding_k` 应包含简洁结论和关键证据, 不只是短答案。
 
-沿用 IGPO 定义。golden 答案 `a = (a_1..a_L)` 已有(F1 即用它)。第 t 个子任务执行后的信念:
+Executor 输入建议先用隔离式或轻量上下文式。隔离式只给 `question + plan_k`, 历史信息由 Planner 写进 plan, 信用更干净; 上下文式额外给 previous findings, 执行更强但归因更混。
 
-```
-P_t = exp( (1/L) · Σ_j log π_θ(a_j | q, findings_{≤t}, a_{<j}) )
+## 3. 外层信息增益
+
+对每个 macro-turn 计算一次 belief:
+
+```text
+B_0 = Bel(golden_answer | H_0)
+B_k = Bel(golden_answer | H_k)
 ```
 
-- 几何平均消除答案长度影响;
-- **stop-gradient**:P_t 只作奖励标量,不让"提高答案概率"路径直接回传梯度;
-- 子任务 t 的信息增益:`IG_t = P_t − P_{t-1}`;
-- 一条轨迹算 `T_p + 1` 次 belief forward;golden 短,4 卡可负担。
+外层 raw IG:
 
-## 5. 信用分配(优势计算)
-
-### 5.0 关键简化:冻结 Executor ⇒ Phase 2b 退化为单 agent IGPO
-
-主线(Phase 2b)**冻结 Executor**。此时 Planner 单独看就是一个标准的**单 agent 多轮 IGPO**:
-
-| IGPO 单 agent 概念 | 本项目 Phase 2b 对应 |
-|---|---|
-| 一个 turn | Planner 提出一个子任务 `p_t` + 冻结 Executor 执行它 |
-| turn 的 observation / tool_response | 冻结 Executor 的输出 `o_t`(属于环境动态) |
-| turn-level IG 奖励 | `IG_t = Bel_t − Bel_{t-1}` |
-| 末轮 outcome | Planner 输出 `<answer>` → F1 |
-
-**推论:Phase 2b 的优势计算可直接复用 IGPO 的 `compute_grpo_outcome_advantage`,不需要任何自定义"多 agent 优势"数学。**
-之前提的 AT-GRPO 角色分组只在未来"联合训 Planner+Executor"(future work)时才需要,2b 用不上。
-
-### 5.1 优势计算的固定骨架(先归一化、再折扣累加)
-
-三者共用同一骨架,差异只在"归一化的分组维度":
-1. **per-turn 奖励向量**:turn t 的奖励 = `IG_t`(中间步)或 F1(末轮),写到该 turn 末 token 位置。
-2. **先归一化**:对 per-turn 奖励做 `(r − mean)/std`(分组维度见 5.2)。
-3. **IG 与 F1 分开归一化**(`info_gain_norm_mode=separate`):不同 mask 分别统计 IG 部分与 F1 部分,
-   **避免终奖尺度淹没 IG 信号**(IGPO 关键设计)。
-4. **再折扣累加**(turn 级),advantage 广播到该 turn 全部 planner token:
-   ```
-   Ã_{i,t} = Σ_{k≥t} γ^(k-t) · A_{i,k}        (默认 γ=1.0)
-   ```
-
-> 对应 IGPO `compute_grpo_outcome_advantage`(含 `gamma`、`info_gain_norm_mode`)+
-> `_compute_turn_level_advantage`。注意:三者都是"**先归一化 per-turn 奖励、再累加**";
-> "先把 raw reward 累加成 `G_t` 再减基线"既非 IGPO 也非 A²TGPO,因终奖会淹没 IG,**不采用**。
-
-### 5.2 归一化分组维度:`global`(基线) vs `turn_group`(改进,主线)
-
-这是本设计的**第二个算法贡献点**,也是一条干净消融轴。已核对三种方法的实际做法:
-
-| 模式 | 分组维度 | 出处 | 评价 |
-|---|---|---|---|
-| `global` | 按 **prompt**,所有 turn 混池(同一组 mean/std) | **原生 IGPO**(已查代码:按 `index` 分组) | 不同深度 turn 不可比(早期 IG 大、后期小)→ 系统偏置 |
-| `turn_group` | 按 **(prompt, turn-index)**,每个 turn 只和同深度同伴比 | **A²TGPO**(arXiv:2605.06200) | 解决跨时序不可比 + "variable trajectory depth" 漂移 ✅ |
-| anchor-state | 按跨轨迹重复出现的相同 state 分组 | GiGPO(arXiv:2505.10978) | research 中 state(question+findings)几乎不重复 → **不适用** |
-
-- **主线取 `turn_group`**(A²TGPO):每个子任务深度独立基线,契合变长 Planner。
-- **实现注意(变长)**:深 turn 处该 (prompt, turn-index) 组样本可能 <2 → **回退到 `global` 的 mean/std**,
-  避免单样本 std 退化(A²TGPO 处理 variable depth 的工程要点)。
-- **(可选)自适应 turn 级 clipping**(A²TGPO):按归一化 IG 调 clip 区间,informative turn 放宽、
-  uninformative 收窄;作为第二档消融。
-- COMA 单步反事实(每步 M 次替换推演)算力高,归 future work(§10)。
-
-### 5.3 Executor(内层)
-- 主线(Phase 2b)**冻结**,不更新 LoRA,仅复用其执行产生 observation 供 belief 计算。
-- "Executor 内层 turn-level IG 训练 + 联合优化"随 Phase 2a 标记为 **future work**(§10)。
-
-> **⚠ 待讨论(核心流程跑通后再回看):Phase-1 模型当 Executor 的角色不匹配。**
-> Phase-1 训出的是"对**原问题**端到端出答案"的研究 agent,**没专门训"执行一个子任务并返回有用 findings"这个角色**;
-> 略过 Phase 2a 是赌它"够用"(已会多轮检索)。潜在风险:① QA 模型给子任务的 `<answer>` 可能太短/丢信息
-> →靠 `findings_t` 取(a)+(b) 两者缓解(§3);② 子任务文本与训练时的"原问题"分布有偏移,Executor 表现可能打折。
-> **回填选项(若 findings 质量太差导致 IG 信号弱)**:(i) 轻量做 Phase 2a 给 Executor 内层加 IG 训练;
-> 或 (ii) 不训练、只给 Executor 换一套"执行子任务"的 prompt,让产出更适合当 findings。**先把核心交替式流程跑通,再据 IG 信号强弱决定是否回填。**
-
-## 6. 训练流程(两个有效阶段)
-
-| 阶段 | 训练对象 | 奖励 | 状态 |
-|---|---|---|---|
-| **Phase 1:单 agent IGPO** | 单 agent | turn-level IG + F1(移植 IGPO) | 升级现有单 agent GRPO;= 基线 + 冻结 Executor warm start |
-| ~~Phase 2a:Executor IG~~ | — | — | **跳过(future work)** |
-| **Phase 2b:Planner 交替式 IGPO** | **Planner LoRA**(冻结 Executor = Phase-1 模型) | 外层 turn-level IG + F1 | 主线贡献 |
-
-- 跳过 2a 的理由:Phase-1 单 agent 模型已具备多轮搜索能力,直接冻结当 Executor;减少阶段数、降风险、省算力。
-- 冻结 Executor 的理由:规避 MARL 非平稳性——Planner 的 IG 信用基于 Executor 跑出的 belief 轨迹,
-  Executor 不动则信用干净。
-
-## 7. 实现策略:从 IGPO 移植 IG 核心(可执行步骤)
-
-IGPO 与本项目同源(verl + Search-R1 + DeepResearcher),文件结构几乎一一对应。
-**不整库替换,按文件移植**(优势/belief 整段复制;generation 整文件 port 成并行路径,见下)。已核对的关键差异如下。
-
-### 7.0 已核对的源/目标差异
-
-**belief 计算(IGPO 新增,本仓库没有 → 整文件复制):**
-- `scrl/llm_agent/vectorized_gt_logprob.py`,核心:
-  ```text
-  compute_all_turns_vectorized(self, model, original_input_ids, original_attention_mask,
-                               original_position_ids, ground_truth_text,
-                               turn_end_positions, temperature=1.0)
-      -> (gt_log_probs_per_turn, gt_answer_ranges)
-  ```
-  - 单次 forward:把 golden 答案的 T 份拷贝拼到序列尾,用 **4D causal mask** 防跨 turn 串扰;
-    `cur_value = exp(answer_log_probs.mean())` 即 `Bel_t`。
-  - 全程 `torch.no_grad()` → belief 天然是常量(= IGPO 的 stop-gradient)。
-  - 自包含,依赖少,可整文件拷入本仓库 `scrl/llm_agent/`,改 import 即可。
-- `scrl/llm_agent/prealigned_vectorized.py`:把 per-turn IG 奖励对齐到 token 位置(配合
-  `turn_end_positions`)→ 一并复制。
-
-**优势函数(本仓库有同名,但是 vanilla 版 → 替换/扩展):**
-
-| | 本仓库现状 `core_algos.py:111` | IGPO 版(目标) |
-|---|---|---|
-| 签名 | `compute_grpo_outcome_advantage(token_level_rewards, eos_mask, index, epsilon)` | `(... , norm_adv_by_std_in_grpo=True, gamma=1.0, info_gain_norm_mode='joint', curriculum_f1_weight, curriculum_ig_weight)` |
-| 逻辑 | `scores = rewards.sum(-1)` → 单标量广播到所有 token(**无 turn / 无 IG / 无 gamma**) | per-turn 奖励**分组归一化**(IG/F1 separate)→ `_compute_turn_level_advantage()` 折扣累加广播 |
-
-→ 动作:把 IGPO 版 `compute_grpo_outcome_advantage` 与 `_compute_turn_level_advantage`
-移入本仓库 `core_algos.py`(保留旧函数或加 `adv_estimator` 分支),适配 `eos_mask`↔`response_mask` 命名。
-
-> **优势函数的输入表示(本次确认):保持 IGPO 原生 token 级签名,不引入 per-turn dict 适配层。**
-> 即 `(token_level_rewards:(bs,L), response_mask:(bs,L), index)`——IG 写在每个 turn 末 token、F1 写在
-> 最后一个有效 token,turn 边界从张量非零位置 / `turn_boundary_mask` 反推。这样**单 agent 与 Phase 2b
-> 的 Planner 共用同一个 token 级优势函数,逐函数等价于 IGPO**(§5.0)。本设计的 `turn_group`(§5.2)只作为
-> 该函数内部的一个**分组模式扩展**:turn-index 由每行 turn 边界的出现顺序现场推出(第 k 个 IG 边界 = turn k),
-> 同样不需要外部 per-turn 结构。
-
-**生成逻辑(本仓库与 IGPO 已分叉 → 整文件 port 成并行路径,不动现有文件):**
-
-> **设计原则(本次确认):单 agent 流程必须与 IGPO 项目逐函数一致。**
-> 因此生成路径**不 cherry-pick**——已核对两边 `generation.py` 结构分叉显著:
->
-> | | 本仓库 `generation.py` | IGPO `generation.py` |
-> |---|---|---|
-> | 行数 | 590 | 1006(多 ~400 行 IG/pseudo-forward/vectorized 收集) |
-> | `run_llm_loop` 签名 | `(gen_batch, global_steps, lora_adapter_name) -> (Dict, Dict)` | `(gen_batch, global_steps, ground_truths) -> (str_list, tensor, info_gain_rewards)` |
-> | IG 钩子 | 无 | 每轮 `pseudo_generate_sequences` + belief + `info_gain_rewards` |
->
-> 手工拼接 ~400 行还要调和签名/返回,既不小也极易与 IGPO 产生细微偏差,违背"流程一致"前提。
->
-> **取而代之:把 IGPO 的 `generation.py` 整文件搬为 `scrl/llm_agent/igpo_generation.py`(只改 import / 对齐本仓库 verl 的 DataProto·tokenizer 接口,不改其数学与控制流),做成一条 `adv_estimator=igpo` 时才走的并行路径。现有 `scrl/llm_agent/generation.py` 零改动(仍作冻结 Executor 的内层 rollout)。`multi_agent_generation.py`(一次性 DAG)**已废弃删除**——multi-agent 路径改由交替式 `interleaved_generation.py` 承载。**
->
-> - 一致性:单 agent 跑的就是 IGPO 原代码三件套(`igpo_generation.py` + `vectorized_gt_logprob.py` + `compute_igpo_turn_advantage`),可逐函数核对。
-> - 改动面:几乎全是新增文件;现有代码只新增一个"按 `adv_estimator` 选 generation manager"的选择器开关。基线路径回归不破。
-> - 代价:IGPO `generation.py` 依赖本仓库 verl 版本接口,搬来需对齐少量 import / API 漂移(同源,漂移小)。
->
-> **工具层必须替换(已核对):IGPO 只有 `web_search`(走独立 `tools_server`/`MessageClient`),本项目是 `web_search` + `browse_webpage`(进程内直调 `research_agent.tools`)。**
-> 我们要的是 IGPO 的 **IG/belief/rollout 算法**,不是它的工具环境(工具属任务/数据,本项目是联网 research)。
-> 好在两边工具调用**格式一致**(都是 `<tool_call>{name,arguments}</tool_call>` + `<answer>`),且 `parse_response`
-> 返回 `[(is_stop, reasoning, answer/tool_call)]`、`execute_predictions(tool_call_list, total_number)` 返回
-> `{idx,question,think,tool_call,content}` —— **签名与返回结构两边相同**。故 port 时**只替换 `execute_predictions`
-> 与 `parse_response` 两个方法为本项目版本**(保留 browse_webpage、去掉 `self.client`/tools_server 依赖),
-> 其余 IG/belief/控制流原样保留。替换隔离在两个 drop-in 方法里,不动算法。
-
-**config 开关(来自 IGPO `train.sh`):**
-`+algorithm.info_gain_type=log_prob_diff`、`+algorithm.info_gain_norm_mode=separate`、`algorithm.gamma=1.0`。
-
-> 本地 verl `0.2.0.dev`;IGPO 精确版本未取到,以**文件级 diff 为准,注意 API 漂移**(如 `eos_mask` 命名)。
-
-### 7.1 实现顺序(每步可独立验证)
-
-1. **clone 参考库**:`git clone https://github.com/GuoqingWang1/IGPO /tmp/IGPO_ref`(仅作 diff 参考,不进项目)。
-2. **移植 belief**:复制 `vectorized_gt_logprob.py` + `prealigned_vectorized.py` 到 `scrl/llm_agent/`,
-   改 import 跑通。单测:给定固定 context + golden,`Bel_t ∈ (0,1)`、随检索增多上升。
-3. **移植优势**:把 IGPO 的 `compute_grpo_outcome_advantage` + `_compute_turn_level_advantage` 并入
-   `core_algos.py`,适配命名;在 `ray_trainer.py:compute_advantage` 增加 IGPO 分支,
-   传 per-turn 奖励张量(非 sum)+ `gamma` + `info_gain_norm_mode`。
-4. **整文件 port 生成路径**:把 IGPO `generation.py` 搬为 `scrl/llm_agent/igpo_generation.py`(只改 import / 对齐
-   本仓库 verl 接口,不改数学与控制流);在 `ray_trainer` / 生成入口加"按 `adv_estimator=igpo` 选 manager"的选择器。
-   现有 `generation.py` 不动。**目标:单 agent rollout 跑的就是 IGPO 原代码,逐函数可核对。**
-5. **跑通单 agent IGPO(Phase 1)**:小规模 2-step smoke。验证 IG 非零、各 turn advantage 不同、无 NaN;
-   抽一条样本手算 belief 轨迹核对。**此步通过 = IG 核心可信,再进多 agent。**
-6. **新增** `scrl/llm_agent/interleaved_generation.py`:交替式主循环(外层 Planner 循环 + 每轮 belief;
-   内层复用现有 `LLMGenerationManager.run_llm_loop` 跑冻结 Executor)。
-7. **改造** `verl/workers/reward_manager/multi_agent.py`:从"共享 F1"改为输出 **Planner per-turn 奖励向量**
-   (各 turn IG / 末轮 F1),复用步骤 2 的 belief。
-8. **接线 Phase 2b**:Planner LoRA 走步骤 3 的 IGPO 优势(group=prompt index);Executor 冻结。
-9. **config**:`multi_agent.interleaved.enable`、`multi_agent.max_planner_turns`、
-   `algorithm.info_gain_type=log_prob_diff`、`algorithm.info_gain_norm_mode=separate`、`algorithm.gamma`、
-   `algorithm.ig_group_mode={global|turn_group}`(5.2 的归一化分组开关,新增)、
-   `algorithm.adaptive_turn_clip={true|false}`(可选,A²TGPO 自适应 clipping)。
-
-> 关键:**步骤 2–5 先在单 agent 路径打通并验证数值**,把"belief/优势是否正确"与"交替式架构是否跑通"
-> 两类风险解耦,避免在脆弱的多 agent rollout 上同时 debug 数值和架构。
-
-## 8. 实验与消融(论文主线)
-
-固定架构 = 交替式(**一次性 DAG 已废弃,multi-agent 路径即交替生成**),**消融奖励与归一化**(干净对照):
-
-1. **基线 B**:单 agent IGPO(Phase 1)。
-2. **Hi-IGPO + global 归一化**:交替式 + Planner turn-level IG,原生 IGPO 全局归一化。
-3. **Hi-IGPO + turn_group 归一化(主方法)**:在 2 基础上换 A²TGPO 的 (prompt, turn-index) 归一化。
-4. **消融**:`info_gain_norm_mode` separate vs joint;自适应 turn 级 clipping on/off。
-
-> 注:原"DAG + 共享 F1"基线 A 已**移除**(决定放弃 DAG,multi-agent 直接=交替式)。对照主要落在
-> 单 agent IGPO(B)↔ 交替式 Hi-IGPO,以及归一化/separate-joint 的消融轴。
-
-**指标**:hard QA 的 F1/EM;收敛速度 / 数据效率;平均 Planner 轮数(看是否学会适时停止)。
-**规模**:Qwen3-4B,小 batch,`grpo_n` 4~8,各变体从同一 warm start 分叉。
-
-## 9. 风险与回退
-
-- **最大风险**:交替式重写碰现有较脆弱的 multi-agent rollout(OOM / 权重同步 / 长度对齐,见
-  `docs/design/dual_agent_smoke_test.md`)。**回退**:DAG 已废弃、不再作为回退;若 Phase 2b 交替式跑不通,
-  回退到 **Phase 1 单 agent IGPO**(已验证可跑通)作为可发表的最小成果,交替式作为加分项继续 debug。
-- **成本**:串行变长。**对策**:严格限 `T_p`、小 batch、先在 2-step smoke 上验证。
-- **非平稳**:靠冻结 Executor(Phase 2b)规避。
-- **数值**:belief/优势复用 IGPO 已验证实现降低风险;Phase 1 先验证数值正确再进 Phase 2b。
-
-## 10. Future Work(写进论文留白)
-
-- Phase 2a:Executor 内层 turn-level IG 训练 → 联合优化。
-- 跨区间因果信用回流、Shapley 细粒度子任务分摊、熵去噪。
-- 无 ground-truth 的语义信息增益(Self-Induced Outcome Potential / Cycle-Consistent Search 思路)。
-- **超长程深度研究 + 真实浏览(对标 DR-Venus)**:IGPO 团队已把同一信息增益信用分配扩到 **200+ turn 的 deep research**
-  并训出 4B 的 **DR-Venus**(arXiv:2604.19859,代码在 inclusionAI/DR-Venus/RL),在 **BrowseComp / BrowseComp-ZH**
-  等高难 benchmark 上验证有效。我们当前基础 IGPO 仓库是 **snippet-only 多跳 QA** 版;后续可沿 DR-Venus 方向把
-  Hi-IGPO 的分层 IG 用到**带 `browse_webpage` 的长程开放网页研究**(我们已保留 browse 工具,IG 与工具无关 → 天然可延伸),
-  并在 BrowseComp 类 benchmark 上评测。属"换更难任务 / 更长 horizon"的纵深,与本设计的"分层信用"创新正交、可叠加。
-
-## 11. 统一框架:冻结(2b)与联合训练(2a)是同一框架的两个取值
-
-把 Phase 2b 和 Phase 2a 看成**同一个联合训练框架**的两个取值,而不是两套独立设计。
-**rollout 生成流程完全不变**(交替生成 + 每 turn 算 `Bel_t` → `IG_t`);变的只有「IG 怎么分」和「谁更新参数」两个**正交旋钮**:
-
-- **旋钮 1 — IG 分配权重 λ**:planner 拿 `λ·IG_t`,executor 拿 `(1−λ)·IG_t`,各自 scatter 到
-  **自己那条 DataProto**(我们已保留的双 rollout)上,各算各的 group-relative turn advantage。
-- **旋钮 2 — executor 是否进 optimizer**(`freeze_executor`)。
-
-| 配置 | λ | executor 更新? | = |
-|---|---|---|---|
-| **Phase 2b(主线/现在)** | 1.0(IG 全给 planner) | ❌ 冻结 | 当前设计(§5.0) |
-| **Phase 2a(联合,future)** | (0,1) | ✅ | 一般情形 |
-| 退化校验 | 1.0 | — | + 单 agent ⇒ 原生 IGPO |
-
-**关键洞察:冻结是「executor 的 IG 份额无所谓」的角点**——它不进 optimizer,给它的 reward 算了也白算。
-所以代码上 2b 就是 `freeze_executor=True` 让 `scatter_planner_token_rewards` 吃下全部 IG;2a 只要把 λ 调出来、
-给 executor 那条 DataProto 也接上 advantage 即可,**无需重写数据流**。
-
-### 11.1 实证锚:冻结是下界档,不是终点
-**M-GRPO**(arXiv:2511.13288,vertical 多 agent deep research,benchmark = GAIA / XBench-DeepSearch / WebWalkerQA,
-与本项目同赛道)实测:**联合训练 > single-agent GRPO > multi-agent GRPO with frozen sub-agents**。
-即「冻结 Executor 的分布偏移固化」是被测出来的真实瓶颈,而非纯理论担忧。
-**边界条件**:**CODA 双脑**(arXiv:2508.20096)选择冻结 executor 反而好——但其 executor 是经海量 grounding 预训练、
-强泛化的成熟模型。冻结能成立的前提是**执行器本身足够通用**;我们 Phase-1 的 executor 只见过「一体化单 agent」的 plan 分布,
-恰好不满足 → 这正是 Phase 2a 要解的问题。
-
-### 11.2 λ 取什么:从固定标量到反事实
-「按权重分」里的权重本身就是 Phase 2a 的核心研究点,有一条升级谱(不破坏框架):
-```
-固定标量 λ   →   反事实估计 λ_t(CCPO 式,arXiv:2603.21563)   →   可学习 λ
-  省                我们已有 belief 机制,加一次反事实前向即可拆          贵
-```
-- 反事实拆分回答「这一跳 belief 上升,是 planner 问得准还是 executor 查得好」:
-  planner 贡献 `≈ Bel(task_t, findings_t) − Bel(弱化 task_t, findings_t)`;
-  executor 贡献 `≈ Bel(task_t, findings_t) − Bel(task_t, 弱化 findings_t)`。代价:每 turn 多一次 belief 前向。
-- **耦合点(务必同时上)**:`IG_t` 是 (task_t + executor findings) 的**联合产物**。冻结时全归 planner 无碍;
-  **一旦解冻,不拆 IG 就是 credit 串扰**(planner 因 executor 查得好而被奖励,反之亦然)。故「解冻 executor」与「IG 归因拆分」是一对。
-
-### 11.3 Phase 2a 才会撞上的工程坑(现在不做,留 TODO)
-- **executor advantage 的 group 归一化**:executor 每个 subtask 的调用次数不齐,需 M-GRPO 式
-  **trajectory-alignment**(padding/mask 成 fixed-size batch,不破坏 group baseline)。
-- 备选 credit-assignment 路线(与上面 λ 谱并行):**HiPER**(arXiv:2602.16165)的分层优势 HAE
-  (planner 优势 = subgoal 执行段聚合 return,executor = 段内细粒度;证明无偏 + 低方差)。
-
-### 11.4 渐进路线(不 foreclose)
-```
-Phase 2b (现状)   : freeze + λ=1，IG_t 全给 Planner。站得住的 baseline（M-GRPO 已证为下界档）。
-   │  低成本补丁    : ①离线缓存刷新 Executor；或 ②只惩罚"执行失效"的轻量正则（非无差别 KL，避免压制 planner 进化）。
-   ▼
-Phase 2a (目标)   : 解冻 Executor，双通道联合训。λ 先用固定值跑通，需要精度再升级到反事实拆分（11.2）。
-                    依托已保留的双 rollout 架构，rollout 流程不变。
+```text
+r_k = B_k - B_{k-1}
 ```
 
-## 12. 验证状态(2026-06-22:Phase 2b 端到端通过)
+如果使用 log-prob 形式:
 
-服务器 1-step smoke(4×V100)验证 **rollout 合理 + reward/advantage 完全符合预期**:
-- **真实多跳 rollout**:Planner 分解出单 subtask → 冻结 Executor 多轮检索出真实事实 → 注入回 Planner →
-  合成最终答案。例:`top scorer→Alan Shearer` → `£15M 买 Shearer 的俱乐部→Newcastle United` → 答 "Newcastle United"(=GT, f1=1.0);`Kiss of Araby 导演→Phil Rosen` → `Phil Rosen 死亡地→York Haven PA`。
-- **reward/advantage**:F1 散到答案末 token、IG 散到各 turn-end、`turn_group` 组内镜像归一化、
-  相同样本组→adv=0(GRPO 正解)、γ=1 后缀累加 —— 逐项核对正确。`f1/mean=0.281, max=1.0`。
-- **关键修复链**(均已提交):交替式 planner prompt(单 subtask/`<answer>`)→ 末轮 force-answer 预填 `<answer>`
-  → `_compact_findings` 取 `<answer>`/最后 assistant 块(不取原始 tool JSON 尾)→ `search_engine=rag` 单
-  web_search(IGPO 忠实)→ **`SEARXNG_ENGINE_PRIORITY=google,duckduckgo,brave`(弃垃圾源 bing)**。
-- **审计工具**:`planner_rollout_step_N.json`(逐轮 I/O)+ `advantage_audit_step_N.json`(散射位/值/优势)。
-- **训练动态注记**:`agent_grpo.n=2` 时两 rollout 易收敛同一正确答案 → 组内 adv=0 无梯度;真训练建议 n=4~8。
-- **剩余 future**:Phase 1 warm-start;Phase 2a Executor 解冻联合训练(§11);多步真训练 + benchmark 评测。
+```text
+r_k = log P(golden_answer | H_k) - log P(golden_answer | H_{k-1})
+```
 
-## 附:远程同步
+最终答案还有 outcome reward:
 
-按 `CLAUDE.md`:先改本地 → rsync 到 `zjx@10.35.2.238:/home/zjx/self_llm/self-researcher`;
-训练前检查 GPU 空闲;训练中每 30s 监控。
+```text
+r_final = F1(final_answer, golden_answer)
+```
+
+Belief 只作为奖励标量, 需要 stop-gradient。
+
+## 4. 外层累计回报
+
+不要把 raw IG `r_k` 直接当作最终 token advantage。应沿用 IGPO 的顺序:
+
+```text
+raw rewards
+    -> group normalization
+    -> turn-level discounted accumulation
+    -> broadcast to owned tokens
+```
+
+设归一化后的奖励为:
+
+```text
+\hat r_1, \hat r_2, ..., \hat r_K, \hat r_final
+```
+
+从后往前计算外层累计回报:
+
+```text
+G_final = \hat r_final
+G_k = \hat r_k + gamma_outer * G_{k+1}
+```
+
+直观含义:
+
+- 当前 plan/finding 不只因本轮 belief 上升而获奖。
+- 如果它为后续 turn 或最终答案铺路, 后续收益也会通过 `G_k` 回传。
+
+当前 `compute_igpo_turn_advantage` 已实现这一逻辑: 先归一化 per-turn reward, 再从后往前累计, 最后广播到该 turn 的 token span。
+
+## 5. Planner 信用分配
+
+Planner 第 `k` 轮输出 `plan_k / subquestion_k`, 使用外层累计回报:
+
+```text
+Planner plan_k tokens -> G_k
+```
+
+如果 Planner 负责输出最终答案:
+
+```text
+Planner final answer tokens -> G_final
+```
+
+Planner-first 阶段冻结 Executor, Planner 使用 `G_k` 更新。这等价于把冻结 Executor 看成环境工具, Planner 是外层单 Agent。
+
+## 6. Executor 信用分配
+
+Executor 的处理取决于训练样本组织方式。
+
+### 6.1 Executor 按 Macro-Turn 拆样本
+
+如果每个 `Executor_k` 是独立 rollout:
+
+```text
+Executor_k input  = question + plan_k + context
+Executor_k output = search/visit/.../finding_k
+```
+
+Executor 看不到后续 macro-turn。因此给 Executor 的不应是 raw IG `r_k`, 而应是外层累计后的:
+
+```text
+Executor_k tokens -> G_k
+```
+
+第一版最稳:
+
+```text
+Executor_k 所有 assistant tokens -> G_k
+```
+
+更细版本:
+
+```text
+finding turn-end 写 G_k
+search/visit turn-end 写 0
+在 Executor 内部用 gamma_inner 做 discounted accumulation
+```
+
+则内部 credit 近似为:
+
+```text
+finding tokens -> G_k
+visit tokens   -> gamma_inner * G_k
+search tokens  -> gamma_inner^2 * G_k
+```
+
+这样早期 search/visit 也能感知本轮 finding 对外层目标的长期贡献。
+
+### 6.2 Executor 串成长序列
+
+如果所有 macro-turn 的 Executor 输出被串成一条长 Executor trajectory, 则可以把 raw IG `r_k` 写在各 macro-turn boundary, 再由同一个 advantage 函数完成外层 discounted accumulation。
+
+当前更现实的工程形态是按 `Executor_k` 拆样本, 因此主线采用 6.1。
+
+### 6.3 局部 Executor IG
+
+联合训练稳定后, 可给 Executor 内部增加局部 dense reward:
+
+```text
+local_r_{k,j} = Bel(finding_k | executor_history_{\le j})
+               - Bel(finding_k | executor_history_{< j})
+```
+
+它用于衡量内部 search/visit 是否帮助产生本轮 finding。该局部 reward 只建议在以下条件下启用:
+
+- 外层 `G_k` 或 raw `r_k` 为正。
+- 或 judge 判定 `finding_k` 与最终问题相关。
+
+否则可能强化无用甚至错误的检索路径。
+
+## 7. 训练阶段
+
+### 7.0 工具网络环境
+
+Hi-IGPO 的 search/visit 依赖外部网页抓取。训练脚本必须显式设置工具侧代理,
+不能依赖交互式 shell 自动加载 `/etc/profile.d`:
+
+```text
+http_proxy / https_proxy -> 127.0.0.1:7890
+no_proxy                 -> localhost, 127.0.0.1, internal networks
+```
+
+Ray worker 会继承 launcher 的环境变量。若 launcher 未带代理, `browse_webpage`
+对 Wikipedia/BBC 等站点会直连失败, 表现为 `fetch_fail=1, extract_empty=1`;
+此时错误页应被丢弃, 不能作为 evidence 进入 rollout。
+
+Search 侧使用本机 SearXNG 时, engine priority 不能只按“第一个非空结果”信任 Bing。
+实测 Bing 会把 `lowest lying island nation...` 误召回到 Lowe's 商店页面。训练脚本固定采用:
+
+```text
+SEARXNG_ENGINE_PRIORITY = google,bing,duckduckgo,brave
+```
+
+注意 `research_agent.config` 会以 `override=True` 重新加载项目 `.env`; 因此 `.env` 中的
+`SEARXNG_ENGINE_PRIORITY` 必须与训练脚本保持一致, 否则运行时会覆盖 launcher export。
+
+该阶段先只做配置修复, 不在 search wrapper 内增加额外相关性过滤逻辑。
+如果后续仍出现大量跑偏结果, 再单独设计 query rewrite / rerank / guard 方案。
+
+### 7.1 Executor Cold-Start
+
+Executor 需要先具备基本 search/visit/finding 能力。可选来源:
+
+- 单 Agent SFT/RL checkpoint。
+- Teacher rollout 生成的 multi-turn SFT。
+- DR-Venus 风格 agentic SFT warm-start。
+
+目标不是最优, 而是稳定执行子任务并返回可用 finding。
+
+### 7.1.1 Planner SFT Cold-Start
+
+Planner-first RL 之前先做一个小规模 Planner-only SFT。该阶段的目标不是训练检索能力, 而是把 Planner 行为约束到干净的分层协议:
+
+```text
+question + previous executor findings
+-> exactly one of:
+   <subtask>one concrete searchable sub-question</subtask>
+   <answer>short final answer</answer>
+```
+
+Planner 不调用 search/visit, 不输出 `<tool_call>`, 不把自己的搜索过程写进 `<subtask>` 或 `<answer>`。当前 DR-Venus-RL 基座已经强化出单 Agent 自主检索行为, 直接拿它当 Planner 容易复发 `Search for ...`、`Open result`、`</think>` 等单 Agent 轨迹残留。因此 Planner SFT 建议从干净 base/instruct 模型初始化, 再训练 Planner LoRA; Executor 仍使用冻结的 `DR-Venus-4B-RL`。
+
+第一版数据量控制在 1000 条以内:
+
+```text
+DeepResearch-9K L2: 500
+DeepResearch-9K L3: 500
+```
+
+优先选择有明确 short golden answer 的样本。L2 用于学习稳定的两跳拆解与停止, L3 用于覆盖更长依赖链和复杂 query rewrite。暂不全量生成, 避免污染数据规模过大后难以回收。
+
+数据生成流程:
+
+```text
+for each selected sample:
+    input: question, golden_answer
+    1. 使用冻结 Executor 或强 teacher 做离线检索, 得到候选 evidence/finding;
+    2. 使用强 teacher 将 question + golden_answer + evidence 压成 Planner trajectory;
+    3. 轨迹形式为多轮 messages:
+       system: interleaved planner prompt
+       user: original question
+       assistant: <subtask>...</subtask>
+       user: executor finding
+       assistant: <subtask>...</subtask> or <answer>...</answer>
+       ...
+       assistant: <answer>golden-equivalent short answer</answer>
+    4. 通过规则与 answer F1/EM 过滤后写入 SFT 数据。
+```
+
+Teacher 只能生成 Planner 轨迹, 不能让 Planner 自己模拟工具调用。`finding` 必须来自真实检索结果、冻结 Executor 运行结果或可追溯 evidence 摘要, 不使用纯编造 observation。
+
+硬过滤规则:
+
+```text
+reject if any planner assistant turn:
+    - does not contain exactly one complete <subtask>...</subtask> or <answer>...</answer>
+    - contains <tool_call>, <tool_response>, <think>, </think>
+    - contains "Search for", "Open result", raw search/browse instructions
+    - puts numbered multi-step plans inside <subtask>
+    - has empty <answer> or answer too long
+
+reject if any executor finding:
+    - is empty
+    - contains <think>, </think>, <answer>, <tool_call>, <tool_response>
+    - contains raw search process such as "Search for", "Open result"
+    - is mostly failure text or unrelated search snippets
+```
+
+答案过滤:
+
+```text
+normalized EM == 1
+or semantic/token F1 >= 0.8
+```
+
+若 teacher 输出解释句, 先压缩成短答案再重新打分; 仍不达标则丢弃。Planner SFT 的 loss mask 只覆盖 assistant 的 `<subtask>` / `<answer>` token; system、user、executor finding 全部 mask 为 0。
+
+SFT 后先做离线健康检查, 不立刻进入 RL:
+
+```text
+malformed_subtask_rate < 2%
+malformed_answer_rate  < 2%
+answer_format_pass_rate > 95%
+empty_finding_rate      < 2%
+avg_planner_turns       在 2 到 4 内
+final_answer_f1         明显高于未 SFT Planner rollout
+```
+
+只有这些指标通过后, Planner-first RL 才使用该 Planner LoRA 初始化。
+
+### 7.2 Planner-First
+
+冻结 Executor, 只训练 Planner。
+
+Planner 初始化应优先使用 7.1.1 的 Planner SFT LoRA。若直接使用 `DR-Venus-4B-RL` 作为 Planner, 必须先通过 rollout 健康检查; 一旦出现大量 malformed subtask / malformed answer, 应停止 RL, 回到 Planner SFT 或 parser/finding 清洗。
+
+奖励:
+
+```text
+raw outer IG r_k + final F1
+-> normalization
+-> outer discounted return G_k
+```
+
+更新:
+
+```text
+plan_k tokens -> G_k
+final answer tokens -> G_final
+```
+
+这是第一阶段主线, 因为复杂 L3 问题的主要瓶颈通常是:
+
+- 搜什么。
+- 如何拆子问题。
+- 何时停止。
+- 如何利用已有 findings 改写下一步目标。
+
+### 7.2.1 DR-Venus Phase 2b 正式小跑
+
+当前正式小跑以 `scripts/train/hi_igpo_phase2b_drvenus.sh` 为入口, 目标是验证 DR-Venus-RL 基座上的 Planner-first 训练能稳定产生:
+
+- 正常的交替式 Planner/Executor rollout。
+- 非空且可解释的 belief / IG。
+- 合理的 turn-level advantage。
+- 可恢复的中间 checkpoint。
+
+当前 browsefix full run 配置:
+
+```text
+data.train_batch_size = 4
+actor_rollout_ref.actor.ppo_mini_batch_size = 4
+agent_grpo.n = 8
+multi_agent.max_planner_turns = 4
+multi_agent.agents.executor.max_turns = 6
+trainer.total_training_steps = 100
+trainer.save_freq = 5
+trainer.resume_mode = auto
+trainer.remove_previous_ckpt_in_save = true
+multi_agent.freeze_executor = true
+CUDA_VISIBLE_DEVICES = 1,3,4,6
+```
+
+训练侧序列长度配置:
+
+```text
+data.max_response_length = 1536
+max_seq_len_for_training = 7168
+actor_rollout_ref.rollout.max_model_len = 9216
+actor_rollout_ref.rollout.max_num_batched_tokens = 9216
+actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = 7168
+actor_rollout_ref.actor.ppo_max_token_len_per_gpu = 7168
+multi_agent.planner_findings_max_chars = 1000
+```
+
+这些参数分别约束 rollout 生成侧 vLLM 最大上下文、rollout 完成后用于训练的拼接序列长度、rollout log-prob 重算长度和 actor PPO 更新长度。由于 Planner/Executor 多轮交互会不断累积 history, 生成下一轮时 vLLM prompt 也会增长; 同时 Planner 训练序列会把多轮 `plan/subtask` 与 Executor `finding` 交替拼回一个长响应帧。之前正式小跑先后暴露过三类长度/显存问题: `compute_log_prob` 阶段实际 `max_seq_len=7696` 超过 `log_prob_max_token_len_per_gpu=7168`, step 4 生成阶段 `decoder prompt length=6357` 超过 `rollout.max_model_len=6144`, 以及 actor update 阶段在 `loss.backward()` 处 OOM。第三类 OOM 发生时 step 2 最长 Planner response turn-end 已接近 `8930` token, 单样本 backward 峰值过高。因此当前保留 vLLM 生成窗口 `9216`, 但把训练侧序列和 actor/log-prob token 上限降到 `7168`, 同时降低单轮生成长度和注入 Planner 的 finding 长度, 优先保证可持续训练。
+
+Planner 训练序列当前拼接方式:
+
+```text
+[planner_subtask_0][executor_finding_0][planner_subtask_1][executor_finding_1]...[planner_answer]
+```
+
+`executor_finding` 作为 observation 注入, loss mask 为 0; Planner 输出 token 的 loss mask 为 1。当前实现没有额外插入新的特殊分隔 token, 边界主要依赖 Planner/Executor 文本自身的标签、换行和 turn-end 位置记录。
+
+有效 rollout 数约为:
+
+```text
+effective_rollouts_per_step = train_batch_size * agent_grpo.n = 32
+```
+
+本轮保持 `train_batch_size=4` 和 `agent_grpo.n=8`, 暂不继续放大有效 batch。原因是当前瓶颈主要在 search/browse/summary LLM 工具调用, 不是 GPU 显存。`max_planner_turns=4` 用于允许更像正式任务的多轮规划; 最后一轮会 force answer, 因此实际通常是 2 到 3 个子任务机会加最终回答。`executor.max_turns=6` 用于给冻结 Executor 多一轮检索/访问空间。
+
+checkpoint 策略:
+
+```text
+只保留最新 global_step_* checkpoint
+```
+
+`trainer.remove_previous_ckpt_in_save=true` 会让 worker 删除前一次保存的 actor shard; driver 侧额外清理当前实验目录下除最新 `global_step_N` 以外的旧 `global_step_*` 目录, 避免旧 `data.pt` 残留。`latest_checkpointed_iteration.txt` 始终指向最新 checkpoint, `resume_mode=auto` 从该 checkpoint 恢复。
+
+若出现 OOM、搜索服务压力过大或 step time 明显不可接受, 首先回退到:
+
+```text
+multi_agent.max_planner_turns = 3
+multi_agent.agents.executor.max_turns = 5
+agent_grpo.n = 4
+```
+
+运行前必须检查:
+
+- 远程 `models/DR-Venus-4B-RL` 存在。
+- SearXNG / search 服务可用。
+- `CUDA_VISIBLE_DEVICES` 对应 GPU 空闲。
+- `.env` 中 judge / search 相关配置有效。
+
+训练中每 30s 监控:
+
+- 主日志: `deepresearcher_qwen3_4b_drvenus_phase2b.log`。
+- Rollout dump: `outputs/deepresearcher/qwen3_4b_drvenus_phase2b/rollout/planner_rollout_step_*.json`。
+- Advantage audit: `outputs/deepresearcher/qwen3_4b_drvenus_phase2b/advantage_audit_step_*.json`。
+- Checkpoint: `ckpts/deepresearcher/qwen3_4b_drvenus_phase2b_browsefix_full/global_step_*/actor`, 预期只保留一个最新 `global_step_*`。
+
+F1 日志拆分:
+
+```text
+planner/f1/mean                = planner/f1_format/mean, 保持向后兼容
+planner/f1_format/mean         = 带格式惩罚的 F1, 格式坏时为 -2
+planner/f1_semantic/mean       = 只看最终 answer 文本与 GT 的 token F1, 范围 [0, 1]
+planner/format_error_rate      = format-penalized F1 < 0 的样本比例
+```
+
+训练 reward 仍使用 `planner/f1_format`。`planner/f1_semantic` 只用于诊断, 用来区分“答案内容错”和“答案内容可能相关但标签格式坏”。
+
+### 7.2.2 DR-Venus Visit/Browse 兼容策略
+
+DR-Venus 原生工具语义:
+
+```text
+search(query) -> 返回 URL 文本
+visit(url, goal) -> 直接访问给定 URL, 使用 Jina Reader 抓取正文, 再按 goal 摘要
+```
+
+模型策略上应主要从上一轮 `search` 的结果里选择 URL 调用 `visit`; 但 DR-Venus 的 `visit` 工具本身不校验 URL 是否来自上一轮 `search`, 也不依赖 search cache。当前项目的 `browse_webpage` 复用 `web_search` 产生的 `WebPageInfo`/browser 对象, 因此历史实现会在 URL 未精确命中最近 search 结果时直接返回 `[]`, 与 DR-Venus 原生语义不完全一致。
+
+Phase 2b 采用兼容实现:
+
+```text
+for url in url_list:
+    1. 优先复用当前样本最近 search 结果中的 WebPageInfo/browser;
+    2. 如果未命中 search 结果, fallback 到直接抓取该 URL;
+    3. 返回格式仍保持 [{"url": ..., "information": [...]}], 不改变 rollout 消费方。
+```
+
+日志需要区分:
+
+- `cache_hit`: URL 命中 search 结果并复用已有上下文。
+- `direct_fetch`: URL 未命中 search 结果, 走直接抓取 fallback。
+- `fetch_fail`: 直接抓取失败。
+- `extract_empty`: 抓取成功但 ReadingAgent 没抽出有效信息。
+
+这样既保留“search 后 browse”的主路径, 又避免模型生成合法 URL 但因实现过严而得到空工具响应。
+
+抓取失败判断不能只看 browser 对象是否存在。若页面正文实际是 `## Error`、`HTTPSConnectionPool`、`ConnectTimeoutError`、`Max retries exceeded` 等网络错误文本, 应直接标记为 `browser="error"` 并计入 `fetch_fail`, 不再送入 visit extractor。
+
+`visit(url, goal)` 的 goal-directed extraction 必须与普通 `browse_webpage(url_list)` 区分处理。普通 browse 可继续使用本项目分页式 `EXTRACT_NEW_INFO_PROMPT` 和 `<extracted_info>` 解析; 但 DR-Venus 原生 visit 是“整页内容 + 用户 goal -> JSON evidence/summary”, 不应复用分页 prompt 直接把 `goal` 塞成 `sub_question`。否则 thinking 模型容易格式漂移, 产生空 `extracted_info` 或无效片段, 污染 finding 与后续 IG/advantage。
+
+Phase 2b 的 `goal` 路径修复为:
+
+```text
+if goal:
+    1. 抓取 URL 正文, 转 markdown, 截断到 WEBCONTENT_MAXLENGTH;
+    2. 使用 DR-Venus 风格 EXTRACTOR_PROMPT(webpage_content, goal);
+    3. 要求 LLM 输出 JSON: {"rational": ..., "evidence": ..., "summary": ...};
+    4. 从 raw response 中抽取 JSON 对象, 支持 ```json fence 和 thinking 前后缀;
+    5. JSON 解析失败或 evidence/summary 过短时, 缩短正文后重试;
+    6. 成功后写入 page_summary:
+       The useful information in {url} for user goal {goal} as follows:
+       Evidence in page: ...
+       Summary: ...
+```
+
+失败处理只返回明确的工具失败摘要, 不把原文截断伪装成有效 finding。这样可以让训练监控据 `extract_empty` / failure 文案识别工具质量问题, 避免“非空但不可信”的奖励污染。
+
+验收标准:
+
+- `browse_webpage(url_list=["https://example.com"])` 仍能正常返回非空摘要。
+- `browse_webpage(url_list=["https://example.com"], goal=...)` 在 30 秒级别内返回与 goal 相关的 `Evidence` 和 `Summary`, 不出现模板残片如 `Should contain the new information`。
+- Wikipedia 等真实页面如果抓取正文为空或抽取失败, 日志应明确标记失败, 不静默产出空 finding。
+
+### 7.3 Joint V1
+
+Planner-first 稳定后, 开始联合训练。
+
+建议先做交替更新, 降低非平稳性:
+
+```text
+rollout 一批完整 Planner+Executor 轨迹
+计算 outer IG 与 G_k
+固定 Executor, 更新 Planner
+固定 Planner, 更新 Executor
+```
+
+或每 N step 只更新一个 agent。
+
+奖励分配:
+
+```text
+Planner plan_k tokens -> G_k
+Executor_k tokens     -> G_k
+```
+
+第一版不拆 Planner/Executor 对 raw IG 的相对贡献, 先验证 shared outer return 是否能提升。
+
+### 7.4 Joint V2
+
+在 Joint V1 稳定后, 再增加更细分的 credit:
+
+- Executor 内部 local IG。
+- Planner/Executor 的反事实贡献拆分。
+- 不同 agent 的 reward 权重或可学习 credit split。
+
+这些属于增强项, 不应阻塞第一版训练。
+
+## 8. Advantage 计算约定
+
+统一约定:
+
+- 写入 reward tensor 的是 raw reward 或外层已累计的 `G_k`, 具体取决于样本组织。
+- 如果样本本身包含完整外层时间轴, 写 raw `r_k`, 由 advantage 函数累计。
+- 如果样本是单个 `Executor_k`, 写外层累计后的 `G_k`, 因为该样本看不到后续 macro-turn。
+
+Planner:
+
+```text
+完整 Planner trajectory 内含所有 macro-turn
+-> 写 raw r_k 和 final F1
+-> compute_igpo_turn_advantage 得到 G_k
+```
+
+Executor:
+
+```text
+每个 Executor_k 单独训练
+-> 写外层 G_k
+-> 可直接 broadcast, 或在内部 boundary 上做 inner accumulation
+```
+
+不要把同一层的 discounted return 重复累计两次。
+
+## 9. 归一化策略
+
+沿用 IGPO 的关键设计:
+
+- IG reward 和 F1 reward 分开归一化。
+- 同一 prompt 的 rollout group 内做 group-relative advantage。
+
+默认:
+
+```text
+info_gain_norm_mode = separate
+gamma_outer = 0.95 或 1.0
+```
+
+可选改进:
+
+- `global`: 同一 prompt 下所有 turn 的 IG 混合归一化。
+- `turn_group`: 按 `(prompt, turn-index)` 归一化, 缓解不同深度 turn 的尺度不可比。
+
+第一版先用 `global` 对齐 IGPO, 再用 `turn_group` 做消融。
+
+## 10. 判断 Planner-First 是否足够
+
+不要只看最终 F1。建议同时看:
+
+- L3 validation F1/EM 是否 plateau。
+- 平均 macro-turn 数是否下降或稳定。
+- invalid Planner output rate 是否低。
+- repeated subquestion rate 是否低。
+- empty/useless finding rate 是否下降。
+- 每轮平均 IG 是否还有提升。
+- answer-before-evidence 比例是否下降。
+- L1/L2 是否明显退化。
+
+一个实用停止标准:
+
+```text
+连续 N 次 eval, L3 F1 无明显提升;
+invalid/repeat rate 稳定在低位;
+平均 IG per macro-turn 不再上升;
+L1/L2 不明显退化。
+```
+
+满足后进入 Joint V1。
+
+## 11. 风险与回退
+
+主要风险:
+
+- Executor cold-start 不足, Planner reward 被 Executor 噪声污染。
+- Joint training 非平稳, 两个 agent 同时变化导致 credit assignment 变噪。
+- Executor 按 macro-turn 拆样本时, 误把 raw `r_k` 当训练信号, 导致它感知不到后续收益。
+- local IG 过早启用, 强化无用 finding 的内部检索路径。
+
+回退策略:
+
+- 先训 Planner, Executor 冻结。
+- Joint 阶段使用交替更新。
+- Executor 第一版直接吃外层 `G_k`, 不上 local IG。
+- 若 multi-agent 不稳定, 回退到单 Agent IGPO 或 Planner-first 作为主要结果。

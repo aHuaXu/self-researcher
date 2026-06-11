@@ -33,7 +33,7 @@
 
 ## 远程服务器配置
 
-- 服务器: zjx@10.35.2.238
+- 服务器: ssh self-researcher
 - 项目目录: /home/zjx/self_llm/self-researcher
 - Conda 环境: deepresearcher
 - 激活命令: `source /home/zjx/anaconda3/bin/conda activate deepresearcher`
