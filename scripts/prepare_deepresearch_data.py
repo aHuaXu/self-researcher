@@ -75,6 +75,14 @@ def main():
     val2.to_parquet(f"{args.output_dir}/deepresearch_phase2_val.parquet")
     print(f"  Train: {len(train2)}, Val: {len(val2)}")
 
+    # All difficulties: L1 + L2 + L3 (full-coverage evaluation; difficulty kept in extra_info
+    # for per-level (L1/L2/L3) metric breakdown).
+    print("\nBuilding All-levels (L1+L2+L3)...")
+    train_all, val_all = build_split(ds, [1, 2, 3], args.split_ratio, args.seed)
+    train_all.to_parquet(f"{args.output_dir}/deepresearch_all.parquet")
+    val_all.to_parquet(f"{args.output_dir}/deepresearch_all_val.parquet")
+    print(f"  Train: {len(train_all)}, Val: {len(val_all)}")
+
     print("\nDone!")
 
 

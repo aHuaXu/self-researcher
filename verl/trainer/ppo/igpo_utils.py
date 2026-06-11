@@ -3,7 +3,7 @@ from typing import Sequence
 import torch
 
 
-def compute_igpo_token_level_scores(data, tokenizer, info_gain_rewards, val_type="f1"):
+def compute_igpo_token_level_scores(data, tokenizer, info_gain_rewards, val_type="f1", format_penalty=1.0):
     """Build IGPO token-level reward tensor (bs, response_len) from per-sample IG.
 
     Mirrors NaiveRewardManager's decode→score loop, but uses info_gain.compute_score
@@ -37,6 +37,7 @@ def compute_igpo_token_level_scores(data, tokenizer, info_gain_rewards, val_type
             val_type=val_type,
             info_gain_reward=list(ig),
             tokenizer=tokenizer,
+            format_penalty=format_penalty,
         )
         n = min(len(scores), valid_response_length)
         for j in range(n):

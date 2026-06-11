@@ -56,6 +56,15 @@ class InterleavedTrace:
     beliefs: List[float] = field(default_factory=list)       # Bel_0..Bel_T
 
 
+def _truncate_to_first_answer(text: str) -> str:
+    """force-answer 后处理:thinking 模型被预填进 `<answer>` 后,常在吐完首个 `</answer>` 又
+    自发续写第二个 `</think>`/`<answer>`(双标签 → check_tags_balance 失败 → 末轮 f1 被误罚
+    -2.0,且畸形 token 经 _assemble_planner_tensors re-tokenize 进入 planner 训练 response)。
+    截断到第一个 `</answer>`(含);无 `</answer>` 时补一个。模块级纯函数,便于单测。"""
+    i = text.find("</answer>")
+    return text[: i + len("</answer>")] if i != -1 else text + "</answer>"
+
+
 def assemble_planner_sequence(planner_turn_ids, findings_ids):
     """Interleave Planner per-turn token ids with Executor findings into one response frame.
 
@@ -138,6 +147,9 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
             self.max_planner_turns = max_planner_turns
             self.gt_computer = gt_computer   # offline belief smoke only; training uses actor path
             self.planner_findings_max_chars = planner_findings_max_chars
+            # DR-Venus mode (thinking + native search/visit) — inherited from generation.py via
+            # MultiAgentGenerationManager (self.drvenus / self.enable_think set in LLMGenerationManager).
+            self._drvenus = bool(getattr(self, "drvenus", False))
 
         # -- GT answer wrapping for belief (mirror igpo_generation lines ~528-572) --------
         def _build_pseudo_gt(self, ground_truths):
@@ -147,10 +159,14 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
             token range via offset_mapping — identical to the single-agent IGPO construction so the
             belief = P(gt_answer | context) is computed over the same span.
             """
-            from scrl.llm_agent.vectorized_gt_logprob import (
-                DEFAULT_GT_ANSWER_PREFIX, DEFAULT_GT_ANSWER_SUFFIX,
-            )
-            PREFIX, SUFFIX = DEFAULT_GT_ANSWER_PREFIX, DEFAULT_GT_ANSWER_SUFFIX
+            if getattr(self, "_drvenus", False):
+                from scrl.llm_agent.drvenus_format import (
+                    DRVENUS_GT_ANSWER_PREFIX as PREFIX, DRVENUS_GT_ANSWER_SUFFIX as SUFFIX,
+                )
+            else:
+                from scrl.llm_agent.vectorized_gt_logprob import (
+                    DEFAULT_GT_ANSWER_PREFIX as PREFIX, DEFAULT_GT_ANSWER_SUFFIX as SUFFIX,
+                )
             pseudo_resps_with_gt, gt_idx = [], []
             for gt in ground_truths:
                 gt_text = gt["ground_truth"]
@@ -310,15 +326,20 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
                 # <answer>…</answer>.
                 is_last_planner = (t == self.max_planner_turns - 1)
                 active_msgs = [planner_msgs[i] for i in active]
+                # drvenus (thinking): the chat template auto-opens <think>; close it then open
+                # <answer>. no-think: prefill "<answer>" directly.
+                _force_prefill = "\n</think>\n<answer>" if self._drvenus else "<answer>"
                 if is_last_planner:
-                    batch = self._tokenize_planner_prefill(active_msgs, "<answer>")
+                    batch = self._tokenize_planner_prefill(active_msgs, _force_prefill)
                 else:
                     batch = self._tokenize_messages_to_batch(active_msgs, gen_batch)
                 plan_out = self._generate_with_gpu_padding(batch, lora_adapter_name="planner")
                 texts = self._decode_outputs(plan_out)
                 if is_last_planner:
-                    texts = ["<answer>" + tx for tx in texts]
-                    texts = [tx if "</answer>" in tx else tx + "</answer>" for tx in texts]
+                    texts = [_force_prefill + tx for tx in texts]
+                    # force-answer 截断到首个 </answer>(详见模块级 _truncate_to_first_answer):
+                    # 丢弃 thinking 模型在首个 </answer> 后自发续写的第二个 </think>/<answer>。
+                    texts = [_truncate_to_first_answer(tx) for tx in texts]
 
                 next_active, subtask_rows = [], []
                 for k, i in enumerate(active):
@@ -334,9 +355,21 @@ def build_interleaved_rollout_manager(tokenizer, actor_rollout_wg, config, lora_
 
                 # --- Executor (FROZEN): run each subtask, inject findings back ---
                 if subtask_rows:
-                    exec_msgs = [get_executor_prompt(traces[i].subtasks[-1]) for i in subtask_rows]
-                    exec_batch = self._tokenize_messages_to_batch(
-                        exec_msgs, gen_batch, tools=getattr(self, "tools", None))
+                    if self._drvenus:
+                        # DR-Venus native: the frozen Executor uses the same DR-Venus deep-research
+                        # system prompt as single-agent (tools embedded in prompt text -> tools=None),
+                        # so run_llm_loop (inherited from generation.py) drives it in drvenus mode.
+                        from scrl.llm_agent.drvenus_format import DRVENUS_SYSTEM_PROMPT
+                        exec_msgs = [
+                            [{"role": "system", "content": DRVENUS_SYSTEM_PROMPT},
+                             {"role": "user", "content": traces[i].subtasks[-1]}]
+                            for i in subtask_rows
+                        ]
+                        exec_batch = self._tokenize_messages_to_batch(exec_msgs, gen_batch, tools=None)
+                    else:
+                        exec_msgs = [get_executor_prompt(traces[i].subtasks[-1]) for i in subtask_rows]
+                        exec_batch = self._tokenize_messages_to_batch(
+                            exec_msgs, gen_batch, tools=getattr(self, "tools", None))
                     _, exec_out = self.run_llm_loop(
                         exec_batch, global_steps, lora_adapter_name="executor")
                     findings_full = self._decode_outputs(exec_out)   # full executor transcript

@@ -80,9 +80,13 @@ def compute_score(solution_str, ground_truth, val_type='f1') -> float:
         return -1.0
 
     try:
-        answer_match = re.search(r'<answer>(.*?)</answer>', solution_str_lower, re.DOTALL)
-        if answer_match:
-            answer_content = answer_match.group(1).strip()
+        # Take the LAST <answer> match: thinking-model system prompts (e.g. DR-Venus) embed a
+        # literal "<answer></answer>" in their instructions, so a non-greedy search would match
+        # that empty pair first and yield an empty answer. The model's real answer is the last
+        # one (matches DR-Venus run_demo.py extract_final_answer, which scans messages in reverse).
+        answer_matches = re.findall(r'<answer>(.*?)</answer>', solution_str_lower, re.DOTALL)
+        if answer_matches:
+            answer_content = answer_matches[-1].strip()
             answer_content = preprocess_text(answer_content)
         else:
             if has_tool_call:

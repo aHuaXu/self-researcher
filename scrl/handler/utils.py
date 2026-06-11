@@ -61,6 +61,7 @@ def get_response_from_llm(
         model: str,
         stream: Optional[bool] = False,
         temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
         depth: int = 0
 ):
     try:
@@ -71,6 +72,8 @@ def get_response_from_llm(
         }
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         response = client.chat.completions.create(**kwargs)
         content = ""
         if hasattr(response.choices[0].message, 'content') and response.choices[0].message.content:
@@ -94,5 +97,13 @@ def get_response_from_llm(
             }
         if depth < 3:
             time.sleep(1)
-            return get_response_from_llm(messages=messages, client=client, model=model, stream=stream, temperature=temperature, depth=depth+1)
+            return get_response_from_llm(
+                messages=messages,
+                client=client,
+                model=model,
+                stream=stream,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                depth=depth+1,
+            )
         return {"content": ""}

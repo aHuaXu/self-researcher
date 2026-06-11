@@ -1,4 +1,26 @@
 
+DRVENUS_VISIT_EXTRACTOR_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
+
+## Webpage Content
+{webpage_content}
+
+## User Goal
+{goal}
+
+## Task Guidelines
+1. Content scanning for rationale: locate the specific sections or data directly related to the user's goal within the webpage content.
+2. Key extraction for evidence: identify and extract the most relevant information from the content. Preserve original facts, names, numbers, dates, and context when available.
+3. Summary output: organize the useful information into a concise paragraph and judge how it contributes to the goal.
+
+Final output must be valid JSON only:
+{{
+  "rational": "string",
+  "evidence": "string",
+  "summary": "string"
+}}
+"""
+
+
 EXTRACT_NEW_INFO_PROMPT = """You are a helpful AI research assistant. I will provide you:
 * The user's main question. This is a complex question that requires a deep research to answer.
 * A sub-question. The main question has been broken down into a set of sub-questions to help you focus on specific aspects of the main question, and this sub-question is the current focus.
@@ -29,7 +51,7 @@ Important note: Use the same language as the user's main question for the short 
 
 <current_sub_question>
 {sub_question}
-<current_sub_question>
+</current_sub_question>
 
 <webpage_content>
     <page_index>{page_index}</page_index>

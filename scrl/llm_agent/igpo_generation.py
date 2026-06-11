@@ -141,6 +141,9 @@ class GenerationConfig:
     codeact_env_disabled: bool = True
     # info_gain_type: "prob_diff" (probability difference) or "log_prob_diff" (log probability difference)
     info_gain_type: str = "prob_diff"
+    # enable_think: thinking mode. False = this repo's no-think convention (Instruct). True =
+    #   DR-Venus / Qwen3-Thinking (rollout keeps <think>; belief GT wrapper closes </think>).
+    enable_think: bool = False
     
 
 class LLMGenerationManager:
@@ -156,6 +159,10 @@ class LLMGenerationManager:
         self.config = config
         self.is_validation = is_validation
         self.codeact_env_disabled = config.codeact_env_disabled
+        # DR-Venus mode: thinking-only backbone + native (search/visit, user-role <tool_response>)
+        # protocol. enable_think threads into rollout/belief; see scrl/llm_agent/drvenus_format.py.
+        self.enable_think = bool(getattr(config, "enable_think", False))
+        self.drvenus = (self.config.search_engine == "drvenus")
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id
@@ -164,7 +171,14 @@ class LLMGenerationManager:
         # ── Tool layer = this repo's (web_search + browse_webpage), NOT IGPO's tools_server.
         #    IGPO algorithm (run_llm_loop / belief / IG) is kept; only tool defs + system prompt
         #    + parse_response + execute_predictions are this repo's.
-        if self.config.search_engine == "rag":
+        if self.config.search_engine == "drvenus":
+            # DR-Venus native format: tools embedded in the system prompt TEXT (so apply_chat_template
+            # gets tools=None), tool results injected as USER-role <tool_response>, think ON.
+            from scrl.llm_agent.drvenus_format import DRVENUS_SYSTEM_PROMPT
+            self.tools = None
+            self.system_prompt = DRVENUS_SYSTEM_PROMPT
+            self.enable_think = True  # backbone is thinking-only
+        elif self.config.search_engine == "rag":
             self.tools = TOOLS_FOR_WIKI
             self.system_prompt = f"""## Background information
 * Today is {strftime("%Y-%m-%d", gmtime())}
@@ -435,6 +449,13 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         """
         response_contents = self.tokenizer.batch_decode(input_ids)
         results = []
+        if self.drvenus:
+            # DR-Venus native: <think>…</think> + <tool_call>(search/visit)/<answer>; tool names
+            # are mapped onto this repo's web_search/browse_webpage by drvenus_format.
+            from scrl.llm_agent.drvenus_format import parse_assistant_output
+            for content in response_contents:
+                results.append(parse_assistant_output(content))
+            return results
         for content in response_contents:
             if "<answer>" in content and "</answer>" in content:
                 reasoning = content.split("<answer>")[0].strip()
@@ -527,9 +548,16 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 ground_truths_rolling.append(gt)
 
         # Use offset_mapping to precisely calculate ground truth token range
-        # Avoid index offset caused by subword tokenization boundary effects
-        PREFIX = DEFAULT_GT_ANSWER_PREFIX
-        SUFFIX = DEFAULT_GT_ANSWER_SUFFIX
+        # Avoid index offset caused by subword tokenization boundary effects.
+        # DR-Venus (thinking) closes </think> before <answer> in the GT wrapper; no-think uses
+        # this repo's plain wrapper.
+        if self.drvenus:
+            from scrl.llm_agent.drvenus_format import DRVENUS_GT_ANSWER_PREFIX, DRVENUS_GT_ANSWER_SUFFIX
+            PREFIX = DRVENUS_GT_ANSWER_PREFIX
+            SUFFIX = DRVENUS_GT_ANSWER_SUFFIX
+        else:
+            PREFIX = DEFAULT_GT_ANSWER_PREFIX
+            SUFFIX = DEFAULT_GT_ANSWER_SUFFIX
         
         pseudo_resps_with_gt = []
         gt_idx = []
@@ -646,13 +674,20 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                         print(f"Failed to process message: {inner_e}")
                         raise  # Cannot recover, raise exception
     
-            think = True
+            # think-off (this repo's Instruct convention): plain reasoning + <tool_call>/<answer>
+            # (NO <think>). DR-Venus (Qwen3-Thinking) is think-on but its chat template auto-prefills
+            # "<think>" after the assistant generation prompt, so we must NOT manually prefill it
+            # (would double-tag). Hence manual prefill only for non-drvenus when enable_think.
+            think = self.enable_think and not self.drvenus
             _is_last_turn = (step == self.config.max_turns - 1)
 
             if _is_last_turn:
-                # FORCE ANSWER on the final turn: prefill "<answer>" (skip <think>) so the sample
-                # emits a parseable answer instead of another tool_call -> live F1 outcome.
-                rollings_active = [rolling + FORCE_ANSWER_PREFILL for rolling in rollings_active]
+                # FORCE ANSWER on the final turn. drvenus: close the auto-opened <think> then open
+                # <answer>; others: prefill "<answer>" directly.
+                if self.drvenus:
+                    rollings_active = [rolling + "\n</think>\n<answer>" for rolling in rollings_active]
+                else:
+                    rollings_active = [rolling + FORCE_ANSWER_PREFILL for rolling in rollings_active]
             elif think:
                 rollings_active = [rolling + "<think>" for rolling in rollings_active]
             else:
@@ -869,8 +904,26 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                     
             tool_call_list = self.execute_predictions(tool_call_list,len(messages_list))
             print(f"node {node_rank}, turn {step} tool_call_list {len(tool_call_list)} datas")
+            tool_content_max_chars = int(os.getenv("TOOL_CONTENT_MAX_CHARS", "1500"))
             for i in range(len(tool_call_list)):
-                if not self.codeact_env_disabled:  # code act enabled
+                # Bound tool output to prevent multi-turn context from overflowing max_model_len
+                # (mirrors generation.py; igpo_generation previously injected the full tool content).
+                _tool_content = tool_call_list[i]['content']
+                if len(_tool_content) > tool_content_max_chars:
+                    _tool_content = _tool_content[:tool_content_max_chars] + "\n...[truncated]"
+                if self.drvenus:
+                    # DR-Venus native: assistant turn = <think>+<tool_call> (reverse-mapped to
+                    # search/visit), tool result = USER-role <tool_response> block.
+                    from scrl.llm_agent.drvenus_format import render_assistant_toolcall, tool_response_message
+                    _idx = tool_call_list[i]['idx']
+                    messages_list[_idx].append({
+                        "role": "assistant",
+                        "content": render_assistant_toolcall(
+                            tool_call_list[i]['think'], tool_call_list[i]['tool_call']['name'],
+                            tool_call_list[i]['tool_call']['arguments']),
+                    })
+                    messages_list[_idx].append(tool_response_message(_tool_content))
+                elif not self.codeact_env_disabled:  # code act enabled
                     messages_list[tool_call_list[i]['idx']].append(
                         {
                             "role": "assistant", 
@@ -881,7 +934,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                         messages_list[tool_call_list[i]['idx']].append(
                             {
                                 "role": "user", 
-                                "content": "<code_response>" + tool_call_list[i]['content'] + "</code_response>",
+                                "content": "<code_response>" + _tool_content + "</code_response>",
                             }
                         )
                     except:
@@ -909,7 +962,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                             {
                                 "role": "tool", 
                                 "name": tool_call_list[i]['tool_call']['name'],
-                                "content": tool_call_list[i]['content']
+                                "content": _tool_content
                             }
                         )
                     except:

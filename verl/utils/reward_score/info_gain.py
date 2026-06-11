@@ -125,11 +125,71 @@ def _char_pos_to_token_idx(char_pos, offset_mapping):
     return len(offset_mapping) - 1
 
 
-def compute_score(solution_str, ground_truth, data_source, val_type='f1', info_gain_reward=[], tokenizer=None, is_validation=False):
+def _assistant_text(solution_str: str, start: int, end: int) -> str:
+    """The assistant-generated portion of a turn segment [start:end): from start up to
+    the first <|im_end|>. Everything after (the env tool/user response) is excluded, so
+    tool-response text (search snippets with stray angle brackets/tags) does not pollute
+    the per-turn format check."""
+    seg = solution_str[start:end]
+    cut = seg.find("<|im_end|>")
+    return seg if cut == -1 else seg[:cut]
+
+
+def _turn_format_ok(asst_text: str, is_final: bool) -> bool:
+    """Per-turn (DR-Venus eq.4) format validity on this turn's assistant output only:
+    balanced tags AND the expected action tag (final turn → <answer>, else → <tool_call>)."""
+    if not check_tags_balance(asst_text):
+        return False
+    if is_final:
+        return "<answer>" in asst_text and "</answer>" in asst_text
+    return "<tool_call>" in asst_text and "</tool_call>" in asst_text
+
+
+def _answer_f1_from_text(asst_text: str, ground_truth, data_source, val_type='f1') -> float:
+    """Pure F1/EM computed from the <answer> content of the final turn's assistant text,
+    WITHOUT the whole-trajectory format gate (the -2 penalty). Format validity is handled
+    separately and per-turn by the caller. Returns 0.0 when no <answer> is present."""
+    if data_source in ['Factbench', 'politifact', 'liar2']:
+        ground_truth = json.loads(ground_truth)
+        ground_truth = deal_multi_labels(ground_truth)
+    s = asst_text.lower()
+    gt = ground_truth.lower()
+    ground_truths = gt.split("<|answer_split|>")
+    m = re.search(r'<answer>(.*?)</answer>', s, re.DOTALL)
+    if not m:
+        return 0.0
+    answer_content = preprocess_text(m.group(1).strip())
+    max_score = 0.0
+    for g in ground_truths:
+        g = preprocess_text(g)
+        if val_type == 'em':
+            if g == answer_content:
+                return 1.0
+        else:
+            pred_tokens = set(answer_content.split())
+            gt_tokens = set(g.split())
+            if not gt_tokens or not pred_tokens:
+                continue
+            common_tokens = pred_tokens & gt_tokens
+            precision = len(common_tokens) / len(pred_tokens) if pred_tokens else 0
+            recall = len(common_tokens) / len(gt_tokens) if gt_tokens else 0
+            if precision + recall > 0:
+                max_score = max(max_score, 2 * (precision * recall) / (precision + recall))
+    return max_score
+
+
+def compute_score(solution_str, ground_truth, data_source, val_type='f1', info_gain_reward=[], tokenizer=None, is_validation=False, format_penalty=1.0):
     """Token-level reward: IG at each non-final turn-end token, F1 at the final turn.
 
+    Turn-level format penalty (DR-Venus eq.4): each turn is graded independently — a
+    well-formed turn keeps its reward (IG for non-final, pure F1 for final), a malformed
+    turn's reward slot is set to -format_penalty. This replaces the previous whole-trajectory
+    gate (one slip → final outcome=-2 → backward-accumulated over the whole rollout), which
+    biased cold small models toward collapsing to single-turn direct answers.
+
     Returns a list of per-token scores aligned to tokenizer(solution_str) (no special
-    tokens). With is_validation=True returns a dict with f1/em/noformatf1 + scores.
+    tokens). With is_validation=True returns a dict with f1/em/noformatf1 + scores
+    (validation keeps the legacy whole-trajectory metric for comparability).
     """
     if tokenizer is None:
         raise ValueError("tokenizer cannot be None")
@@ -190,40 +250,44 @@ def compute_score(solution_str, ground_truth, data_source, val_type='f1', info_g
 
     chats_size = len(turn_start_positions)
 
-    # No IG (single turn or none provided): F1 on last token only.
-    if info_gain_reward == [] or chats_size == 1:
-        scores[-1] = alpha * f1_score
-        if is_validation:
-            return {"f1": f1_score, "em": em_score, "noformatf1": noformatf1_score, "scores": scores}
-        return scores
+    def _end_tok(turn_end_char):
+        idx = _char_pos_to_token_idx(turn_end_char - 1, offset_mapping) if turn_end_char > 0 else 0
+        return min(idx, tokens_size - 1)
 
-    # Turn-count mismatch: fall back to F1-only.
-    if len(info_gain_reward) != chats_size - 1:
-        print(f"info_gain.py: turn mismatch - chats_size={chats_size}, info_gain_len={len(info_gain_reward)}")
-        scores[-1] = alpha * f1_score
-        if is_validation:
-            return {"f1": f1_score, "em": em_score, "noformatf1": noformatf1_score, "scores": scores}
-        return scores
-
-    for i in range(chats_size):
-        turn_end_char = turn_end_positions[i]
-
-        if turn_end_char > 0:
-            last_token_idx = _char_pos_to_token_idx(turn_end_char - 1, offset_mapping)
-        else:
-            last_token_idx = 0
-
-        last_token_idx = min(last_token_idx, tokens_size - 1)
-
-        if i < chats_size - 1:
-            if i < len(info_gain_reward):
-                ig_value = info_gain_reward[i]
-                if ig_value == 0.0:
-                    ig_value = 1e-10  # keep non-zero so reward!=0 turn detection doesn't skip it
-                scores[last_token_idx] = ig_value
-        else:
-            scores[last_token_idx] = alpha * f1_score
-
+    # Validation keeps the legacy whole-trajectory metric (comparability); val path does not
+    # flow through this function in training (NaiveRewardManager -> format_and_f1).
     if is_validation:
+        scores[-1] = alpha * f1_score
         return {"f1": f1_score, "em": em_score, "noformatf1": noformatf1_score, "scores": scores}
+
+    # Final turn's assistant output → pure F1 (no whole-traj -2 gate) + per-turn format check.
+    final_asst = _assistant_text(solution_str, turn_start_positions[-1], turn_end_positions[-1])
+    train_f1 = _answer_f1_from_text(final_asst, ground_truth, data_source, val_type)
+    fmt_pen = -float(format_penalty)
+
+    # Single turn / no IG / turn-count mismatch: only the final turn reward (format-gated).
+    if info_gain_reward == [] or chats_size == 1 or len(info_gain_reward) != chats_size - 1:
+        if len(info_gain_reward) != chats_size - 1 and info_gain_reward != [] and chats_size != 1:
+            print(f"info_gain.py: turn mismatch - chats_size={chats_size}, info_gain_len={len(info_gain_reward)}")
+        final_ok = _turn_format_ok(final_asst, is_final=True)
+        scores[_end_tok(turn_end_positions[-1])] = (alpha * train_f1) if final_ok else fmt_pen
+        return scores
+
+    # Multi-turn: per-turn format-gated reward (DR-Venus eq.4) — keep IG/F1 on well-formed
+    # turns, replace ONLY a malformed turn's slot with -format_penalty.
+    for i in range(chats_size):
+        is_final = (i == chats_size - 1)
+        asst_i = _assistant_text(solution_str, turn_start_positions[i], turn_end_positions[i])
+        end_tok = _end_tok(turn_end_positions[i])
+        if not _turn_format_ok(asst_i, is_final):
+            scores[end_tok] = fmt_pen
+            continue
+        if is_final:
+            scores[end_tok] = alpha * train_f1
+        else:
+            ig_value = info_gain_reward[i]
+            if ig_value == 0.0:
+                ig_value = 1e-10  # keep non-zero so reward!=0 turn detection doesn't skip it
+            scores[end_tok] = ig_value
+
     return scores

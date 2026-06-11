@@ -1,25 +1,30 @@
 #!/bin/bash
-# Hi-IGPO Phase 1: single-agent IGPO (turn-level info-gain) — Qwen3-4B-Instruct, V100 32GB.
-# 2-step SMOKE config. Validates the full IGPO path: igpo_generation rollout + belief
-# (vectorized GT logprob) + per-turn IG/F1 scatter (info_gain.py) + turn-level advantage.
+# Hi-IGPO warm-start: single-agent IGPO on DR-Venus-4B-SFT (inclusionAI), V100 32GB.
+# DR-Venus backbone = Qwen3-4B-Thinking-2507 (thinking-only). Uses search_engine=drvenus:
+#   - DR-Venus native system prompt + tools (search/visit, mapped to web_search/browse_webpage)
+#   - <think> kept in rollout; tool results injected as USER-role <tool_response>
+#   - belief GT wrapper closes </think> before <answer>
+# See docs/design/hi_igpo_design.md §13.
 #
-# Prereqs: models/Qwen3-4B-Instruct, .env (SERPER_API_KEY [+ LLM/JUDGE key for browse]).
-# Pick idle GPUs (check nvidia-smi first!). Defaults to 2,3,5,7.
+# STAGE 1 (this script): training-path probe. val path (generation.py) is NOT yet wired to
+# DR-Venus format, so run with VAL_BEFORE_TRAIN=false and observe training rollout dumps.
+#
+# Prereqs: models/DR-Venus-4B-SFT, .env (SEARXNG running; browse fix before relying on visit).
+# Pick idle GPUs (check nvidia-smi first!).
 set -euo pipefail
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-# TOOL_CONTENT_MAX_CHARS is sourced from .env (single source of truth, read by generation.py +
-# igpo_generation.py). Do NOT export it here — .env is sourced below and would override it anyway.
+# TOOL_CONTENT_MAX_CHARS sourced from .env (single source of truth).
 export PET_NODE_RANK=${PET_NODE_RANK:-0}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,4,6}   # 选 4 张空闲卡(跑前 nvidia-smi 核实!避开他人任务)
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3,4,6}   # 选 4 张空闲卡(跑前 nvidia-smi 核实!)
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export project_name="deepresearcher"
 IFS=',' read -ra _CUDA_DEVICES_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 NGPU=${#_CUDA_DEVICES_ARR[@]}
-export experiment_name="qwen3_4b_igpo_warmstart"
+export experiment_name="qwen3_4b_drvenus_sft"
 
 BASE=/home/zjx/self_llm/self-researcher
 cd ${BASE}
@@ -42,40 +47,37 @@ export RAY_memory_monitor_refresh_ms=0
 ray start --head
 sleep 2
 
-# IGPO knobs:
-#   algorithm.adv_estimator=igpo                         -> turn-level IG advantage (compute_igpo_turn_advantage)
-#   +algorithm.use_vectorized_gt_logprob=true            -> enable belief (GT logprob) → per-turn IG
-#   +algorithm.info_gain_type=log_prob_diff              -> IG = Δ mean log-prob of golden answer
-#   +algorithm.info_gain_norm_mode=separate              -> IG / F1 normalized separately
-#   algorithm.gamma=1.0                                  -> turn discount
-# (ig_group_mode defaults to 'global' = faithful IGPO; turn_group is a later ablation.)
+# DR-Venus knobs: search_engine=drvenus (native prompt/tools/user-role tool_response),
+#   +algorithm.enable_think=true (thinking backbone; <think> in rollout, belief closes </think>).
+# Longer length budget than the Instruct config: thinking responses are longer.
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=${BASE}/data/deepresearch_phase1.parquet \
     data.val_files=${BASE}/data/deepresearch_phase1_val.parquet \
     data.train_batch_size=4 \
     data.max_prompt_length=3096 \
-    data.max_response_length=1000 \
-    max_seq_len_for_training=5000 \
+    data.max_response_length=2048 \
+    max_seq_len_for_training=7168 \
     algorithm.adv_estimator=igpo \
     +algorithm.use_vectorized_gt_logprob=true \
     +algorithm.info_gain_type=log_prob_diff \
     +algorithm.info_gain_norm_mode=separate \
     +algorithm.format_penalty=1.0 \
+    +algorithm.enable_think=true \
     algorithm.gamma=1.0 \
-    actor_rollout_ref.model.path=${BASE}/models/Qwen3-4B-Instruct \
+    actor_rollout_ref.model.path=${BASE}/models/DR-Venus-4B-SFT \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=5120 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=7168 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.dtype=float16 \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.enable_chunked_prefill=false \
-    actor_rollout_ref.rollout.max_model_len=4200 \
+    actor_rollout_ref.rollout.max_model_len=6144 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
@@ -84,22 +86,23 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     ++actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype=fp16 \
     ++actor_rollout_ref.actor.fsdp_config.mixed_precision.reduce_dtype=fp32 \
     ++actor_rollout_ref.actor.fsdp_config.mixed_precision.buffer_dtype=fp32 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=5120 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=7168 \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.entropy_coeff=0.01 \
     trainer.logger=['console','wandb'] \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
-    +trainer.val_before_train=${VAL_BEFORE_TRAIN:-true} \
+    +trainer.val_before_train=${VAL_BEFORE_TRAIN:-false} \
     trainer.default_hdfs_dir=null \
     trainer.n_gpus_per_node=${NGPU} \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.remove_previous_ckpt_in_save=true \
-    trainer.test_freq=10 \
+    trainer.test_freq=1000 \
+    `# STAGE 1: test_freq high so _validate (generation.py val path, not yet wired to drvenus) is not hit` \
     trainer.resume_mode=auto \
     agent_grpo.n=8 \
-    max_turns=5 \
-    search_engine=rag \
+    max_turns=8 \
+    search_engine=drvenus \
     trainer.total_training_steps=100 \
     trainer.total_epochs=1 2>&1 | tee ${BASE}/${project_name}_${experiment_name}.log

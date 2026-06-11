@@ -33,7 +33,7 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     elif data_source in ['hiyouga/geometry3k']:
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
-    elif data_source in ['nq', "2wiki", "Bamboogle", "hotpotqa", "musique", "tq", "popqa"]:
+    elif data_source in ['nq', "2wiki", "Bamboogle", "hotpotqa", "musique", "tq", "popqa", "deepresearch", "multi_hop_qa"]:
         from . import format_and_f1
         res = format_and_f1.compute_score(solution_str, ground_truth, val_type=val_type)
     else:

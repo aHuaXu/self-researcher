@@ -23,7 +23,8 @@ TOK = CharTokenizer()
 
 
 def test_two_turns_ig_then_f1_at_turn_ends():
-    turn0 = "first turn reasoning"
+    # turn0 must be format-valid (has <tool_call>) so the turn-level format gate keeps its IG.
+    turn0 = 'first turn <tool_call>{"name":"web_search"}</tool_call>'
     turn1 = "second <answer>Paris</answer>"
     solution = turn0 + SEP + turn1
 
@@ -43,7 +44,7 @@ def test_two_turns_ig_then_f1_at_turn_ends():
 
 
 def test_zero_ig_becomes_tiny_nonzero():
-    turn0 = "abc"
+    turn0 = 'abc <tool_call>{"name":"web_search"}</tool_call>'  # format-valid so IG slot is kept
     turn1 = "d <answer>Paris</answer>"
     solution = turn0 + SEP + turn1
     scores = info_gain.compute_score(

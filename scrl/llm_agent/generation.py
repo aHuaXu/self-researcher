@@ -33,6 +33,8 @@ class GenerationConfig:
     experiment_name: str = None,
     search_engine: str = "rag",
     nnodes: int = 1
+    # enable_think: False = no-think (Instruct); True = thinking (DR-Venus/Qwen3-Thinking).
+    enable_think: bool = False
 
 
 # Force-answer prefill: appended after the generation prompt on the FINAL turn so the model is
@@ -132,7 +134,16 @@ class LLMGenerationManager:
             pad_token_id=tokenizer.pad_token_id
         ))
         
-        if self.config.search_engine == "rag":
+        self.enable_think = bool(getattr(self.config, "enable_think", False))
+        self.drvenus = (self.config.search_engine == "drvenus")
+        if self.config.search_engine == "drvenus":
+            # DR-Venus native format (tools embedded in prompt text, user-role <tool_response>,
+            # thinking on). See scrl/llm_agent/drvenus_format.py.
+            from scrl.llm_agent.drvenus_format import DRVENUS_SYSTEM_PROMPT
+            self.tools = None
+            self.system_prompt = DRVENUS_SYSTEM_PROMPT
+            self.enable_think = True
+        elif self.config.search_engine == "rag":
             self.tools = TOOLS_FOR_WIKI
             self.system_prompt =  f"""## Background information 
 * Today is {strftime("%Y-%m-%d", gmtime())}
@@ -402,6 +413,11 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         """
         response_contents = self.tokenizer.batch_decode(input_ids)
         results = []
+        if self.drvenus:
+            from scrl.llm_agent.drvenus_format import parse_assistant_output
+            for content in response_contents:
+                results.append(parse_assistant_output(content))
+            return results
         for content in response_contents:
             if "<answer>" in content and "</answer>" in content:
                 reasoning = content.split("<answer>")[0].strip()
@@ -460,13 +476,17 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             if activate_list == []:
                 break
 
-            rollings_active = self.tokenizer.apply_chat_template(activate_messages_list, add_generation_prompt=True, tools=self.tools, tokenize=False)
             _is_last_turn = (step == self.config.max_turns - 1)
+            rollings_active = self.tokenizer.apply_chat_template(activate_messages_list, add_generation_prompt=True, tools=self.tools, tokenize=False)
             if _is_last_turn:
-                # FORCE ANSWER on the final turn: prefill "<answer>" so still-active samples emit a
-                # parseable answer instead of another tool_call (the prefill rides in the prompt, so
-                # the reconstructed string below contains the full <answer>…</answer>).
-                rollings_active = [r + FORCE_ANSWER_PREFILL for r in rollings_active]
+                # FORCE ANSWER on the final turn (aligns with training path igpo_generation.py).
+                # drvenus (thinking): close the auto-opened <think> then open <answer>; the model
+                # is constrained to emit the answer body. A USER nudge instead made the thinking
+                # model emit an EMPTY final turn (no <answer> -> 0 score). others: prefill "<answer>".
+                if self.drvenus:
+                    rollings_active = [r + "\n</think>\n<answer>" for r in rollings_active]
+                else:
+                    rollings_active = [r + FORCE_ANSWER_PREFILL for r in rollings_active]
             rollings_active = self.tokenizer(rollings_active, return_tensors="pt",padding=True)
 
             pad_mask = rollings_active['input_ids'] != self.tokenizer.pad_token_id
@@ -500,9 +520,8 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             print(f"node {node_rank}, turn {step} gen_output {len(gen_output.batch['responses'])} datas")
 
             if _is_last_turn:
-                # Prompt was prefilled with "<answer>": the generation IS the forced answer. Take it
-                # for ALL still-active samples (prompt already holds the open tag) and finish —
-                # skip parse_response/tool execution this turn.
+                # Prompt was prefilled with "<answer>" (or "</think><answer>" for drvenus): the
+                # generation IS the forced answer. Take it for ALL still-active samples and finish.
                 for i in range(len(activate_list)):
                     message_string_list[activate_list[i]] = (
                         self.tokenizer.decode(rollings_active.batch['input_ids'][i], skip_special_tokens=False).replace("<|endoftext|>", "")
@@ -513,7 +532,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 break
 
             results = self.parse_response(gen_output.batch['responses'])
-            assert len(results) == len(activate_list) # 每一轮更新后，结果数量和当前活跃的query数量一致
+            assert len(results) == len(activate_list)
             activate_list_copy = []
             tool_call_list = []
             for i in range(len(results)):
@@ -522,7 +541,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 else:
                     activate_list_copy.append(activate_list[i])
                     tool_call_list.append((activate_list[i], messages_list[activate_list[i]][1]["content"], results[i][1], results[i][2]))
-                    
+
             if step == self.config.max_turns - 1:
                 print(f"node {node_rank}, turn {step} tool_call_list {len(tool_call_list)} datas")
                 print(f"第{step}轮(最后一轮)结束，跳过工具执行，{len(tool_call_list)}条样本未返回answer")
@@ -533,6 +552,21 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             print(f"node {node_rank}, turn {step} tool_call_list {len(tool_call_list)} datas")
             tool_content_max_chars = int(os.getenv("TOOL_CONTENT_MAX_CHARS", "3000"))
             for i in range(len(tool_call_list)):
+                content = tool_call_list[i]['content']
+                if len(content) > tool_content_max_chars:
+                    content = content[:tool_content_max_chars] + "\n...[truncated]"
+                if self.drvenus:
+                    # DR-Venus native: assistant=<think>+<tool_call> (reverse-mapped), tool=user-role <tool_response>.
+                    from scrl.llm_agent.drvenus_format import render_assistant_toolcall, tool_response_message
+                    _idx = tool_call_list[i]['idx']
+                    messages_list[_idx].append({
+                        "role": "assistant",
+                        "content": render_assistant_toolcall(
+                            tool_call_list[i]['think'], tool_call_list[i]['tool_call']['name'],
+                            tool_call_list[i]['tool_call']['arguments']),
+                    })
+                    messages_list[_idx].append(tool_response_message(content))
+                    continue
                 messages_list[tool_call_list[i]['idx']].append(
                     {
                         "role": "assistant", 
@@ -545,9 +579,6 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                                     ]
                     }
                 )
-                content = tool_call_list[i]['content']
-                if len(content) > tool_content_max_chars:
-                    content = content[:tool_content_max_chars] + "\n...[truncated]"
                 messages_list[tool_call_list[i]['idx']].append(
                     {
                         "role": "tool", 
@@ -565,6 +596,12 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         initial_prompt_list = []
         for i, messages in enumerate(messages_list):
             initial_prompt = self.tokenizer.apply_chat_template(messages[0:2], add_generation_prompt=True, tools=self.tools, tokenize=False)
+            # Thinking models (DR-Venus/Qwen3-Thinking): the chat template appends "<think>\n" to the
+            # generation prompt. If that OPEN tag stays in initial_prompt, response_str loses its first
+            # <think> -> check_tags_balance sees (N-1) open / N close -> every sample scored 0. Keep the
+            # opening <think> inside response_str so the tag count stays balanced. (No-op for no-think.)
+            if initial_prompt.endswith("<think>\n"):
+                initial_prompt = initial_prompt[:-len("<think>\n")]
             initial_prompt_list.append(initial_prompt)
             response_str_list.append(message_string_list[i][len(initial_prompt):])
         

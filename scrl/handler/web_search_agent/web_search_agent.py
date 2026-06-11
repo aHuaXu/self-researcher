@@ -97,10 +97,19 @@ class WebSearchAgent:
     def is_error_page(self, browser: SimpleTextBrowser) -> bool:
         if isinstance(browser.page_title, tuple):
             return True
-        return (browser.page_title is not None and 
-                browser.page_title.startswith("Error ") and 
-                browser.page_content is not None and 
-                browser.page_content.startswith("## Error "))
+        content = browser.page_content or ""
+        title = browser.page_title or ""
+        error_markers = (
+            "## Error",
+            "HTTPSConnectionPool",
+            "ConnectTimeoutError",
+            "ReadTimeout",
+            "Max retries exceeded",
+            "Failed to fetch",
+        )
+        if any(marker in content for marker in error_markers):
+            return True
+        return title.startswith("Error ")
 
     def fetch_content(self, browser: SimpleTextBrowser, url: str):
         try:

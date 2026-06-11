@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import shutil
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -661,6 +662,7 @@ class RayPPOTrainer(object):
             experiment_name=self.config.trainer.experiment_name,
             search_engine=self.config.search_engine,
             nnodes=self.config.trainer.nnodes,
+            enable_think=bool(getattr(self.config.algorithm, 'enable_think', False)),
         )
 
         generation_manager = LLMGenerationManager(
@@ -755,14 +757,35 @@ class RayPPOTrainer(object):
                         em_reward_tensor = self.val_reward_fn(test_batch, val_type='em')
                         llm_reward_tensor = self.val_reward_fn(test_batch, val_type='llm')
                 
-                    except:
-                        print(test_batch)
-                        exit()
+                    except Exception:
+                        # Surface the real error instead of swallowing it. The previous
+                        # `print(test_batch); exit()` masked val-scoring bugs and the exit()
+                        # killed the driver -> WorkerCrashedError cascade across GPU workers.
+                        import traceback
+                        print("[_validate] val_reward_fn raised:", flush=True)
+                        traceback.print_exc()
+                        raise
 
                     reward_tensor_lst.append(reward_tensor)
                     em_reward_tensor_lst.append(em_reward_tensor)
                     llm_reward_tensor_lst.append(llm_reward_tensor)
-                    data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    # Per-difficulty breakdown: when extra_info carries a difficulty (L1/L2/L3),
+                    # append it to the data_source label so the existing per-source aggregation
+                    # emits val/test_score/<source>_L{1,2,3}_{f1,em,llm}. No-op when absent.
+                    _ds = test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0])
+                    _ei = test_batch.non_tensor_batch.get('extra_info', None)
+                    if _ei is not None:
+                        _labeled = []
+                        for _k in range(len(_ds)):
+                            _d = None
+                            try:
+                                _d = _ei[_k].get('difficulty') if isinstance(_ei[_k], dict) else None
+                            except Exception:
+                                _d = None
+                            _labeled.append(f"{_ds[_k]}_L{_d}" if _d is not None else _ds[_k])
+                        data_source_lst.append(_labeled)
+                    else:
+                        data_source_lst.append(_ds)
 
         self._maybe_log_val_generations_to_wandb(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -894,6 +917,20 @@ class RayPPOTrainer(object):
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
 
+        if self.config.trainer.remove_previous_ckpt_in_save:
+            ckpt_root = self.config.trainer.default_local_dir
+            if not os.path.isabs(ckpt_root):
+                ckpt_root = os.path.join(os.getcwd(), ckpt_root)
+            current_folder = os.path.abspath(local_global_step_folder)
+            for name in os.listdir(ckpt_root):
+                if not name.startswith('global_step_'):
+                    continue
+                path = os.path.abspath(os.path.join(ckpt_root, name))
+                if path == current_folder or not os.path.isdir(path):
+                    continue
+                print(f'Remove old checkpoint folder: {path}', flush=True)
+                shutil.rmtree(path, ignore_errors=True)
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
             return 0
@@ -1009,6 +1046,7 @@ class RayPPOTrainer(object):
             experiment_name=self.config.trainer.experiment_name,
             search_engine=self.config.search_engine,
             nnodes=self.config.trainer.nnodes,
+            enable_think=bool(getattr(self.config.algorithm, 'enable_think', False)),
         )
 
         generation_manager = LLMGenerationManager(
@@ -1046,6 +1084,7 @@ class RayPPOTrainer(object):
                 search_engine=self.config.search_engine,
                 nnodes=self.config.trainer.nnodes,
                 info_gain_type=getattr(self.config.algorithm, 'info_gain_type', 'log_prob_diff'),
+                enable_think=bool(getattr(self.config.algorithm, 'enable_think', False)),
             )
             igpo_generation_manager = IGPOGenerationManager(
                 tokenizer=self.tokenizer,
@@ -1114,7 +1153,7 @@ class RayPPOTrainer(object):
                         # =============================================================
                         from verl.trainer.ppo.core_algos import compute_igpo_turn_advantage
                         from verl.trainer.ppo.igpo_utils import scatter_info_gain_rewards
-                        from verl.utils.reward_score.info_gain import compute_f1
+                        from verl.utils.reward_score.info_gain import compute_f1, _answer_f1_from_text
 
                         # --- GRPO expansion: repeat each question n times ---
                         grpo_n = getattr(self.config.agent_grpo, 'n', 1)
@@ -1140,10 +1179,17 @@ class RayPPOTrainer(object):
                                 interleaved_gen.run_loop(gen_batch, self.global_steps, ground_truths)
 
                         # --- Outcome F1 from the Planner's final answer (wrapped to match <answer> format) ---
+                        # f1_scores keeps the format penalty and is used for training reward.
+                        # semantic_f1_scores ignores format balance and is logged for diagnosis only.
                         f1_scores = torch.tensor([
                             compute_f1(f"<answer>{a}</answer>", gt['ground_truth'], ds, val_type='f1')
                             for a, gt, ds in zip(answers, ground_truths, data_sources)
                         ], dtype=torch.float32)
+                        semantic_f1_scores = torch.tensor([
+                            _answer_f1_from_text(f"<answer>{a}</answer>", gt['ground_truth'], ds, val_type='f1')
+                            for a, gt, ds in zip(answers, ground_truths, data_sources)
+                        ], dtype=torch.float32)
+                        format_error_rate = float((f1_scores < 0).float().mean())
 
                         # --- Scatter per-turn IG + final F1 to token rewards (response frame) ---
                         # Belief is collected for all n samples every turn (uniform blocks), so
@@ -1186,6 +1232,9 @@ class RayPPOTrainer(object):
                                     "idx": _i,
                                     "agent_grpo_idx": int(agent_grpo_idx[_i]),
                                     "f1": float(f1_scores[_i]),
+                                    "f1_format": float(f1_scores[_i]),
+                                    "f1_semantic": float(semantic_f1_scores[_i]),
+                                    "format_error": bool(f1_scores[_i] < 0),
                                     "reward_nonzero_pos": _nz,
                                     "reward_nonzero_val": [round(float(token_level_rewards[_i, p]), 4) for p in _nz],
                                     "turn_boundary_pos": _bd,
@@ -1218,6 +1267,11 @@ class RayPPOTrainer(object):
                             metrics[f'planner/{mk}'] = mv
                         metrics['planner/f1/mean'] = float(f1_scores.mean())
                         metrics['planner/f1/max'] = float(f1_scores.max())
+                        metrics['planner/f1_format/mean'] = float(f1_scores.mean())
+                        metrics['planner/f1_format/max'] = float(f1_scores.max())
+                        metrics['planner/f1_semantic/mean'] = float(semantic_f1_scores.mean())
+                        metrics['planner/f1_semantic/max'] = float(semantic_f1_scores.max())
+                        metrics['planner/format_error_rate'] = format_error_rate
                         # Executor is FROZEN in Phase 2b; its rollout DataProto is available for Phase 2a
                         # joint training (keep dual-rollout, design §11) but is not updated here.
 
@@ -1305,7 +1359,8 @@ class RayPPOTrainer(object):
                         # adv section below skips self.reward_fn for IGPO.
                         if _igpo_enabled:
                             batch.batch['token_level_scores'] = compute_igpo_token_level_scores(
-                                batch, self.tokenizer, igpo_info_gain_rewards, val_type='f1'
+                                batch, self.tokenizer, igpo_info_gain_rewards, val_type='f1',
+                                format_penalty=float(self.config.algorithm.get('format_penalty', 1.0)),
                             )
 
                         # balance the number of valid tokens on each dp rank.

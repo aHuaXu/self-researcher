@@ -117,44 +117,42 @@ _REGION_MAP = {
 
 
 def duckduckgo_search(query, top_k, region="us", depth=0):
+    """DDG search with bounded LOOP retry (NOT recursion).
+
+    The previous version recursed on retry AND re-acquired _ddg_semaphore inside the held
+    semaphore -> with DDG_MAX_CONCURRENT=2 two retrying threads each tried to re-acquire ->
+    SELF-DEADLOCK (the whole rollout hung, GPU 0%). Fixed: acquire ONCE, retry in a loop
+    (no re-acquire), cap attempts + per-retry sleep small. `depth` is accepted for API
+    compatibility but ignored (loop replaces recursion).
+    """
     from duckduckgo_search import DDGS
     from duckduckgo_search.exceptions import RatelimitException, TimeoutException
 
     ddg_region = _REGION_MAP.get(region, "wt-wt")
     qid = _query_fingerprint(query)
-    _log_search_event("ddg_start", qid=qid, region=ddg_region, depth=depth, top_k=top_k)
+    max_attempts = int(_os.getenv("DDG_MAX_ATTEMPTS", "2"))
+    _log_search_event("ddg_start", qid=qid, region=ddg_region, depth=0, top_k=top_k)
     _ddg_semaphore.acquire()
     try:
-        results_raw = DDGS(timeout=20).text(
-            query, region=ddg_region, safesearch="off",
-            backend="auto", max_results=top_k,
-        )
-        results = []
-        for r in (results_raw or []):
-            results.append({
-                "title": r.get("title", ""),
-                "link": r.get("href", ""),
-                "snippet": r.get("body", ""),
-            })
-        print(f"search success for {query} (duckduckgo, {len(results)} results)")
-        _log_search_event("ddg_success", qid=qid, count=len(results), depth=depth)
-        return results
-    except RatelimitException:
-        print(f"DuckDuckGo rate limited for query='{query}', retry after 5s")
-        if depth < 3:
-            time.sleep(5)
-            return duckduckgo_search(query, top_k, region, depth + 1)
-    except TimeoutException:
-        print(f"DuckDuckGo timeout for query='{query}', retry after 2s")
-        if depth < 3:
-            time.sleep(2)
-            return duckduckgo_search(query, top_k, region, depth + 1)
-    except Exception as e:
-        print(f"DuckDuckGo search error: {e}")
-        _log_search_event("ddg_error", qid=qid, error=repr(e), depth=depth)
-        if depth < 3:
-            time.sleep(2)
-            return duckduckgo_search(query, top_k, region, depth + 1)
+        for attempt in range(max_attempts):
+            try:
+                results_raw = DDGS(timeout=20).text(
+                    query, region=ddg_region, safesearch="off",
+                    backend="auto", max_results=top_k,
+                )
+                results = [{"title": r.get("title", ""), "link": r.get("href", ""),
+                           "snippet": r.get("body", "")} for r in (results_raw or [])]
+                print(f"search success for {query} (duckduckgo, {len(results)} results)")
+                _log_search_event("ddg_success", qid=qid, count=len(results), depth=attempt)
+                return results
+            except RatelimitException:
+                print(f"DuckDuckGo rate limited for query='{query}' (attempt {attempt+1}/{max_attempts})")
+                if attempt < max_attempts - 1:
+                    time.sleep(2)
+            except (TimeoutException, Exception) as e:
+                _log_search_event("ddg_error", qid=qid, error=repr(e), depth=attempt)
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
     finally:
         _ddg_semaphore.release()
     print(f"search failed for {query} (duckduckgo)")
