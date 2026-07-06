@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
-from verl.utils.dataset import SFTDataset
+from verl.utils.dataset import MultiTurnSFTDataset, SFTDataset
 from verl.utils.fs import copy_to_local
 from verl.utils.tracking import Tracking
 from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, set_ulysses_sequence_parallel_group
@@ -121,22 +121,30 @@ class FSDPSFTTrainer(object):
     def _build_dataloader(self):
         config = self.config
         # build dataset
-        self.train_dataset = SFTDataset(parquet_files=config.data.train_files,
-                                        tokenizer=self.tokenizer,
-                                        prompt_key=config.data.prompt_key,
-                                        prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                                        response_key=config.data.response_key,
-                                        response_dict_keys=config.data.get('response_dict_keys', None),
-                                        max_length=config.data.max_length,
-                                        truncation=config.data.truncation)
-        self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
-                                      tokenizer=self.tokenizer,
-                                      prompt_key=config.data.prompt_key,
-                                      prompt_dict_keys=config.data.get('prompt_dict_keys', None),
-                                      response_key=config.data.response_key,
-                                      response_dict_keys=config.data.get('response_dict_keys', None),
-                                      max_length=config.data.max_length,
-                                      truncation=config.data.truncation)
+        if config.data.get('multiturn', {}).get('enable', False):
+            self.train_dataset = MultiTurnSFTDataset(parquet_files=config.data.train_files,
+                                                     tokenizer=self.tokenizer,
+                                                     config=config.data)
+            self.val_dataset = MultiTurnSFTDataset(parquet_files=config.data.val_files,
+                                                   tokenizer=self.tokenizer,
+                                                   config=config.data)
+        else:
+            self.train_dataset = SFTDataset(parquet_files=config.data.train_files,
+                                            tokenizer=self.tokenizer,
+                                            prompt_key=config.data.prompt_key,
+                                            prompt_dict_keys=config.data.get('prompt_dict_keys', None),
+                                            response_key=config.data.response_key,
+                                            response_dict_keys=config.data.get('response_dict_keys', None),
+                                            max_length=config.data.max_length,
+                                            truncation=config.data.truncation)
+            self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
+                                          tokenizer=self.tokenizer,
+                                          prompt_key=config.data.prompt_key,
+                                          prompt_dict_keys=config.data.get('prompt_dict_keys', None),
+                                          response_key=config.data.response_key,
+                                          response_dict_keys=config.data.get('response_dict_keys', None),
+                                          max_length=config.data.max_length,
+                                          truncation=config.data.truncation)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
