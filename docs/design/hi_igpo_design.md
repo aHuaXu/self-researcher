@@ -237,36 +237,111 @@ question + previous executor findings
    <answer>short final answer</answer>
 ```
 
-Planner 不调用 search/visit, 不输出 `<tool_call>`, 不把自己的搜索过程写进 `<subtask>` 或 `<answer>`。当前 DR-Venus-RL 基座已经强化出单 Agent 自主检索行为, 直接拿它当 Planner 容易复发 `Search for ...`、`Open result`、`</think>` 等单 Agent 轨迹残留。因此 Planner SFT 建议从干净 base/instruct 模型初始化, 再训练 Planner LoRA; Executor 仍使用冻结的 `DR-Venus-4B-RL`。
+Planner 不调用 search/visit, 不输出 `<tool_call>`, 不把自己的搜索过程写进 `<subtask>` 或 `<answer>`。当前 DR-Venus-RL 基座已经强化出单 Agent 自主检索行为, 直接拿它当 Planner 容易复发 `Search for ...`、`Open result`、`</think>` 等单 Agent 轨迹残留。因此 Planner SFT **不能**用 `Qwen3-4B-Instruct` (非 thinking) 做 base, 必须用与 RL 一致的 thinking base (`DR-Venus-4B-RL` / `Qwen3-4B-Thinking-2507`), 再训练 Planner LoRA; Executor 仍使用冻结的 `DR-Venus-4B-RL`。原因见下 §7.1.1.1。
 
-第一版数据量控制在 1000 条以内:
+#### 7.1.1.1 Base 一致性与空 think 蒸馏 (路径 2)
+
+Planner SFT 的 base 必须与 RL rollout 时的 Planner base **完全一致**。当前 Phase 2b RL 配置 (`scripts/train/hi_igpo_phase2b_drvenus.sh`) 是 single thinking base + dual LoRA:
 
 ```text
-DeepResearch-9K L2: 500
+multi_agent.base_model = models/DR-Venus-4B-RL   # Qwen3-4B-Thinking-2507, thinking-only
++algorithm.enable_think = true
+```
+
+backbone 是 `Qwen3-4B-Thinking-2507` (thinking-only), chat template 在 generation prompt 后会自动追加 think 开标签; 模型无法在权重层关闭 think。两个 base (Instruct vs Thinking) 权重不同, LoRA adapter 不通用; chat template 行为也不同 (Instruct 不自动开 think 标签)。因此早期的 `scripts/train/planner_sft_deepresearch.sh` 默认 `MODEL_PATH=Qwen3-4B-Instruct` 是错误的, 必须改回 thinking base。
+
+但 Planner 作为决策角色 (拆子问题 / 何时停 / answer), 不需要显式推理; Executor 才是需要 think 来做 search/browse/抽取的角色。因此采用 **空 think 蒸馏**: SFT target 教 Planner LoRA 在角色层面跳过 think, 即每轮 assistant target 为 think 闭合标签 + 换行 + tag:
+
+```text
+{think_close}\n<subtask>{subtask}</subtask>
+# 或
+{think_close}\n<answer>{answer}</answer>
+```
+
+配合 chat template 自动开的 think 标签 (training 时 `apply_chat_template(enable_thinking=True)` 会在 assistant turn 前加 think 开标签), 组成完整的 `think...think_close subtask`。这是合法的 role-specific 行为蒸馏, 正是 dual-LoRA 的意义: 同 base, 不同 LoRA 表现不同角色 (Planner 空 think, Executor full think)。
+
+分布一致性: SFT 与 RL 同 base、同 chat template、同 think 自动开启, 唯一区别是 SFT 教模型立刻闭合 think 然后输出 tag。Executor LoRA 仍然 full think, 不受影响。
+
+长度预算: 空 think 后每轮 Planner response ~50 token, 4 轮 ~200 + 3×finding (~300 token/finding) ~900 + answer ~30 ≈ 1130 < `max_response_length=1536`, 留出余量。
+
+#### 7.1.1.2 Teacher think 的处理
+
+Teacher (MiniMax-M2.7) 是 reasoning 模型, 仍会产出长 think 块 (1500-1900 token/turn)。路径 2 下 **直接丢弃 teacher think**, 只取解析出的 subtask/answer payload 作为 SFT target 的 tag 内容。这样:
+
+- MiniMax think 长度不再吃 SFT 轨迹预算 (SFT target think 字段为空)。
+- `generate_planner_sft_rollouts.py` 的 `planner_max_tokens` 仍需保留足够预算让 MiniMax 完成 think 并吐出 tag (否则 tag 被截断 → malformed); 但这不再影响 SFT 数据长度。
+- `planner_max_tokens=2048` 维持, 必要时配合 best-of-N rejection sampling 提升 tag yield。
+
+SFT target 的精确格式 (空 think 前缀 + tag) 必须用项目实际 tokenizer 验证后再固化, 见 §7.1.1.3。
+
+#### 7.1.1.3 Tokenizer 验证 (已完成)
+
+用 `scripts/verify_planner_sft_target_format.py` 在 thinking base tokenizer 上验证, 结论:
+
+1. `apply_chat_template(add_generation_prompt=True, enable_thinking=True)` 在 generation prompt 末尾自动追加 assistant think 开标签 (loss mask 0)。
+2. `MultiTurnSFTDataset._message_tokens` 对每个 assistant turn 单独 slice 渲染, 使该 turn 在 slice 内为 loop.last, 模板自动包裹空 think。因此 SFT target 的 assistant content 直接写 bare tag (`<subtask>...</subtask>`) 即可, 模板自动加空 think 前缀; 显式写 think 闭合标签会被模板归一化, 三种写法等价。
+3. loss mask 正确只覆盖 assistant content (闭 think + tag + im_end), system/user/finding 全 mask 0。
+4. 空 think 每 turn ~13-29 loss token, 2-subtask 样本总 153 token / 42 loss token, 远低于 `max_response_length=1536`。
+5. 良性副作用: `_build_sequence` 的 per-turn concat tokens 与 full-render tokens 在 think 包裹上不一致 (per-turn 每 turn 包, full-render 只最后 turn 包), 会触发 `Token mismatch in MultiTurnSFTDataset` warning。训练使用 per-turn tokens (与 RL `assemble_planner_sequence` 一致), warning 为 false alarm, 暂不处理。
+
+基于此, `build_planner_sft_from_rollouts.py` 现有 message 构造无需修改; `planner_sft_deepresearch.sh` 的 `MODEL_PATH` 已从 `Qwen3-4B-Instruct` 改回 `models/DR-Venus-4B-RL`。
+
+第一版先只做 L3 500 条:
+
+```text
 DeepResearch-9K L3: 500
 ```
 
-优先选择有明确 short golden answer 的样本。L2 用于学习稳定的两跳拆解与停止, L3 用于覆盖更长依赖链和复杂 query rewrite。暂不全量生成, 避免污染数据规模过大后难以回收。
+原因是 DeepResearch-9K 的 L2 `final answer` 中存在较多描述型答案, 例如正确实体是
+`Paul "Bear" Bryant`, 但 golden answer 写成一段属性描述。这类样本会让 token F1/EM
+过滤与后续 reward 失真。L3 的 short golden answer 更干净, 且更贴近 Planner 需要解决的
+复杂 query rewrite 和长依赖链问题。L2 后续只在做 canonical answer 清洗后再混入。
+
+当前实现入口:
+
+```text
+scripts/prepare_planner_sft_samples.py
+    从 data/deepresearch_phase2.parquet 固定采样 L3 500,
+    输出 data/planner_sft_seed_l3_500.parquet。
+
+scripts/build_planner_sft_from_rollouts.py
+    将 teacher / frozen-executor 产生的 interleaved rollout dump 清洗成
+    data/planner_sft/train.parquet 与 data/planner_sft/val.parquet。
+
+scripts/generate_planner_sft_rollouts.py
+    使用 MiniMax 作为 teacher Planner / finding summarizer, 但 evidence 仍走
+    本项目 web_search + browse_webpage, 输出 raw rollout JSON 供人工审计和清洗。
+
+scripts/train/planner_sft_deepresearch.sh
+    从 thinking base (DR-Venus-4B-RL) 训练 Planner LoRA, 使用 data.multiturn.enable=true。
+    空 think 蒸馏: SFT target 教 Planner 立刻闭 think 并输出 tag (路径 2)。
+```
+
+注意不要复用 `scripts/train/igpo_drvenus_sft.sh` 做 Planner SFT。该脚本的语义是
+`DR-Venus-4B-SFT -> single-agent IGPO/RL`, 不是监督微调入口。
 
 数据生成流程:
 
 ```text
 for each selected sample:
     input: question, golden_answer
-    1. 使用冻结 Executor 或强 teacher 做离线检索, 得到候选 evidence/finding;
-    2. 使用强 teacher 将 question + golden_answer + evidence 压成 Planner trajectory;
-    3. 轨迹形式为多轮 messages:
+    1. MiniMax teacher Planner 基于 question + previous findings 生成 <subtask>;
+    2. 用真实 web_search(subtask) + browse_webpage(urls, goal=subtask) 获取 evidence;
+    3. MiniMax 仅把真实 search/browse 输出压缩成 executor finding;
+    4. 重复 1-3, 直到 teacher Planner 输出 <answer> 或达到 max_planner_turns;
+    5. 用 golden_answer 做离线 F1/EM 过滤, 不把 golden_answer 暴露给 Planner 生成过程;
+    6. 轨迹形式为多轮 messages (路径 2 空 think 蒸馏, assistant target = think 闭合 + tag, teacher think 丢弃):
        system: interleaved planner prompt
        user: original question
-       assistant: <subtask>...</subtask>
+       assistant: {think_close}\n<subtask>...</subtask>
        user: executor finding
-       assistant: <subtask>...</subtask> or <answer>...</answer>
+       assistant: {think_close}\n<subtask>...</subtask> or {think_close}\n<answer>...</answer>
        ...
-       assistant: <answer>golden-equivalent short answer</answer>
-    4. 通过规则与 answer F1/EM 过滤后写入 SFT 数据。
+       assistant: {think_close}\n<answer>golden-equivalent short answer</answer>
+    7. 通过规则与 answer F1/EM 过滤后写入 SFT 数据。
 ```
 
-Teacher 只能生成 Planner 轨迹, 不能让 Planner 自己模拟工具调用。`finding` 必须来自真实检索结果、冻结 Executor 运行结果或可追溯 evidence 摘要, 不使用纯编造 observation。
+Teacher 只能生成 Planner 轨迹和 evidence compression, 不能让 Planner 自己模拟工具调用。`finding` 必须来自真实检索结果、冻结 Executor 运行结果或可追溯 evidence 摘要, 不使用纯编造 observation。
 
 硬过滤规则:
 
